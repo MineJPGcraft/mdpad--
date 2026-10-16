@@ -284,7 +284,7 @@ mod tests {
     }
 
     /// Runs a headless pass and discards the texture deltas it produced.
-    fn pass(ctx: &egui::Context, mut body: impl FnMut(&egui::Context)) {
+    fn pass(ctx: &egui::Context, body: impl FnMut(&egui::Context)) {
         let output = ctx.run_pass(egui::RawInput::default(), body);
         output.drop_without_applying_deltas();
     }

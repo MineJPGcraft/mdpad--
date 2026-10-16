@@ -1,10 +1,15 @@
 //! Live-render document view.
 //!
-//! The document is drawn as a vertical stack of blocks. Every block is painted in
-//! its **final** form — headings are large, bold text is bold, formulas are
-//! typeset, diagrams are drawn, callouts are tinted panels — and the block the
-//! caret is in becomes an editable `TextEdit` *in place*, with its Markdown
-//! delimiters revealed only for the construct the caret touches.
+//! The document is drawn as a vertical stack of blocks on a page. Every block is
+//! painted in its **final** form — headings are large, bold text is bold,
+//! formulas are typeset, diagrams are drawn, callouts are tinted panels — and
+//! the block the caret is in becomes an editable `TextEdit` *in place*.
+//!
+//! Markdown syntax is never painted in this mode. Delimiters such as `**`,
+//! `[]()` and `$` stay in the buffer but render at transparent colour, and block
+//! markers like `## ` or `- ` are replaced by real bullets, quote bars and
+//! heading styles. That is what makes it feel like Word rather than like a
+//! markup preview: there is nothing to read but the document itself.
 //!
 //! That is the whole trick behind "edit and see it at the same time": there is no
 //! preview pane, because the editable widget and the rendered view are the same
@@ -262,6 +267,7 @@ impl BlockCtx<'_> {
             size,
             bold: true,
             level,
+            italic: false,
         };
         self.inline_ui(ui, block, path, active, visual)
     }
@@ -297,7 +303,14 @@ impl BlockCtx<'_> {
             self.inline_edit(ui, block, path, marker_len, inner_len, visual)
         } else {
             let source = self.doc.text.get(span.clone()).unwrap_or("");
-            let job = inline_job(source, marker_len, inner_len, None, self.theme, visual);
+            let job = inline_job(
+                source,
+                marker_len,
+                inner_len,
+                InlineMode::Wysiwyg,
+                self.theme,
+                visual,
+            );
             let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
             let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
             ui.painter().galley(
@@ -332,8 +345,15 @@ impl BlockCtx<'_> {
         let theme = *self.theme;
         let render = move |ui: &Ui, buf: &dyn TextBuffer, wrap: f32| {
             let text = buf.as_str();
-            let caret = caret_chars(ui, id);
-            let job = inline_job(text, marker_len, inner_len, caret, &theme, visual);
+            let _ = caret_chars(ui, id);
+            let job = inline_job(
+                text,
+                marker_len,
+                inner_len,
+                InlineMode::Wysiwyg,
+                &theme,
+                visual,
+            );
             let _ = wrap;
             ui.ctx().fonts_mut(|f| f.layout_job(job))
         };
@@ -385,7 +405,11 @@ impl BlockCtx<'_> {
         checked: Option<bool>,
         active: bool,
     ) -> Option<EditorAction> {
-        let indent = 12.0 + f32::from(level) * 22.0;
+        // Word-like hanging indent: the bullet sits in the gutter and the text
+        // block starts at a fixed column, so wrapped lines align under the
+        // first character rather than under the marker.
+        const GUTTER: f32 = 26.0;
+        let indent = f32::from(level) * GUTTER;
         let mut action = None;
         ui.horizontal(|ui| {
             ui.add_space(indent);
@@ -399,23 +423,33 @@ impl BlockCtx<'_> {
                             checked: value,
                         });
                     }
-                    ui.add_space(2.0);
                 }
                 None => {
-                    let label = match kind {
-                        ListKind::Unordered => "•".to_owned(),
-                        ListKind::Ordered => format!("{index}."),
+                    let (label, color) = match kind {
+                        ListKind::Unordered => {
+                            // Nested levels get progressively different glyphs,
+                            // as Word does, so depth reads without indent alone.
+                            let glyph = ["•", "◦", "▪"][(level as usize).min(2)];
+                            (glyph.to_owned(), self.theme.palette.text)
+                        }
+                        ListKind::Ordered => {
+                            (format!("{index}."), self.theme.palette.text)
+                        }
                     };
-                    ui.add_space(2.0);
-                    ui.label(
-                        RichText::new(label)
-                            .color(self.theme.palette.text_muted.to_egui())
-                            .size(self.theme.body_size()),
+                    ui.allocate_ui(
+                        egui::vec2(GUTTER - 4.0, self.theme.body_size() * 1.4),
+                        |ui| {
+                            ui.label(
+                                RichText::new(label)
+                                    .color(color.to_egui())
+                                    .size(self.theme.body_size()),
+                            );
+                        },
                     );
-                    ui.add_space(6.0);
                 }
             }
             ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - GUTTER).max(40.0));
                 if let Some(a) = self.inline_ui(
                     ui,
                     block,
@@ -439,14 +473,18 @@ impl BlockCtx<'_> {
         path: &[usize],
         active: bool,
     ) -> Option<EditorAction> {
+        // Word renders a quote as a coloured bar plus italic text. The `> `
+        // characters stay in the source but are hidden by `inline_ui`.
         let bar_w = 3.0;
-        let pad = 12.0;
+        let pad = 14.0;
         let index = ui.painter().add(egui::Shape::Noop);
+        let mut visual = InlineVisual::body(self.theme);
+        visual.italic = true;
         let inner = ui.horizontal(|ui| {
             ui.add_space(bar_w + pad);
             ui.vertical(|ui| {
                 ui.set_width(ui.available_width() - pad);
-                self.inline_ui(ui, block, path, active, InlineVisual::body(self.theme))
+                self.inline_ui(ui, block, path, active, visual)
             })
             .inner
         });
@@ -968,12 +1006,13 @@ impl BlockCtx<'_> {
                     cell,
                     0,
                     cell.len(),
-                    None,
+                    InlineMode::Wysiwyg,
                     self.theme,
                     InlineVisual {
                         size: font.size,
                         bold: is_header,
                         level: 0,
+                        italic: false,
                     },
                 );
                 let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
@@ -1221,6 +1260,9 @@ pub struct InlineVisual {
     /// Heading level, `0` for body text. Used to shrink delimiters relative to
     /// the text they mark.
     pub level: u8,
+    /// Applies italics to plain runs. Block quotes use this so they read the way
+    /// Word renders a quotation rather than looking like ordinary body text.
+    pub italic: bool,
 }
 
 impl InlineVisual {
@@ -1229,31 +1271,58 @@ impl InlineVisual {
             size: theme.typo.body(),
             bold: false,
             level: 0,
+            italic: false,
         }
     }
 }
 
-/// Hidden delimiter formatting: effectively invisible, yet still one character
-/// wide so the caret model stays valid.
+/// Formatting for source characters that must not be seen.
+///
+/// The width matters as much as the colour. The caret model maps buffer
+/// character indices onto galley columns, so a delimiter must still advance the
+/// cursor — collapsing it to exactly zero would make the caret jump around
+/// unpredictably inside a construct. Font size 1pt is the smallest that still
+/// advances, and at that size the glyph is sub-pixel: invisible in practice,
+/// while `**` still costs under two points of width.
+///
+/// Letter spacing is deliberately left at zero. An earlier version subtracted a
+/// multiple of the *body* size here, which dragged whole lines off the left edge
+/// of the page and made the text disappear entirely.
 fn hidden_format(base: &egui::TextFormat) -> egui::TextFormat {
+    const HIDDEN_PT: f32 = 1.0;
     egui::TextFormat {
-        font_id: FontId::new(1.0, base.font_id.family.clone()),
+        font_id: FontId::new(HIDDEN_PT, base.font_id.family.clone()),
         color: Color32::TRANSPARENT,
         ..Default::default()
     }
 }
 
+/// What a [`inline_job`] call is allowed to show.
+///
+/// The distinction matters because the two modes have opposite goals. WYSIWYG
+/// must look like the finished document — no asterisks, no brackets, no hashes,
+/// *ever*, including with the caret parked inside a construct. Source mode must
+/// show the exact bytes that will be saved, because that is its whole purpose.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InlineMode {
+    /// Finished-document appearance. Syntax characters are invisible.
+    Wysiwyg,
+    /// Raw text with syntax highlighting. Everything is visible.
+    Source,
+}
+
 /// Builds the `LayoutJob` for a run of inline Markdown.
 ///
 /// `marker_len` bytes at the start of `text` are the block's own marker (`## `,
-/// `- `, `> `); they stay visible but muted. The following `inner_len` bytes are
-/// the inline content and are scanned for constructs. Delimiters are hidden
-/// unless `caret` is inside their construct.
+/// `- `, `> `). In WYSIWYG mode they are always hidden: the block renderer has
+/// already drawn a real bullet, quote bar or heading style in their place, so
+/// painting the raw characters too would double them up. The following
+/// `inner_len` bytes are the inline content and are scanned for constructs.
 fn inline_job(
     text: &str,
     marker_len: usize,
     inner_len: usize,
-    caret: Option<(usize, usize)>,
+    mode: InlineMode,
     theme: &Theme,
     visual: InlineVisual,
 ) -> egui::text::LayoutJob {
@@ -1263,38 +1332,32 @@ fn inline_job(
     let inner_end = (marker_len + inner_len).min(text_len);
 
     let marker_fmt = egui::TextFormat {
-        font_id: FontId::new(
-            visual.size * 0.86,
-            family_of(visual.bold, false),
-        ),
+        font_id: FontId::new(visual.size, family_of(visual.bold, false)),
         color: theme.palette.text_faint.to_egui(),
         ..Default::default()
     };
     if marker_len > 0 {
-        job.append(&text[..marker_len], 0.0, marker_fmt.clone());
+        let fmt = match mode {
+            InlineMode::Wysiwyg => hidden_format(&marker_fmt),
+            InlineMode::Source => marker_fmt.clone(),
+        };
+        job.append(&text[..marker_len], 0.0, fmt);
     }
 
     let inner = &text[marker_len..inner_end];
     if !inner.is_empty() {
         let scan = Inline::scan_at(inner, marker_len);
-        let revealed: Vec<usize> = match caret {
-            Some((lo, hi)) => scan.revealed(lo, hi),
-            None => Vec::new(),
-        };
         for span in &scan.spans {
             let is_delim = span
                 .construct
                 .and_then(|id| scan.constructs.get(id))
                 .is_some_and(|c| c.is_delimiter(&span.range));
-            let shown = match span.construct {
-                Some(id) => revealed.contains(&id),
-                None => false,
-            };
-            let fmt = if is_delim && !shown {
-                hidden_format(&marker_fmt)
-            } else if is_delim {
-                // Revealed for editing: visible, but quieter than the content.
-                egui::TextFormat {
+            let fmt = match mode {
+                // WYSIWYG: delimiters vanish, whatever the caret is doing.
+                InlineMode::Wysiwyg if is_delim => hidden_format(&marker_fmt),
+                // Source mode: delimiters stay visible, quieter than content so
+                // the structure reads as secondary.
+                InlineMode::Source if is_delim => egui::TextFormat {
                     font_id: FontId::new(
                         visual.size * 0.9,
                         family_of(visual.bold, span.style.code),
@@ -1305,9 +1368,8 @@ fn inline_job(
                         .lerp(theme.palette.accent, 0.35)
                         .to_egui(),
                     ..Default::default()
-                }
-            } else {
-                content_format(span.style, theme, visual)
+                },
+                _ => content_format(span.style, theme, visual),
             };
             // `scan_at` reported offsets in *document* coordinates (they start at
             // `marker_len`), so they must be sliced from the whole block source —
@@ -1333,14 +1395,14 @@ fn inline_job(
 
 /// Inline highlighting for source mode.
 ///
-/// The caret range covers the whole line, so every delimiter is "revealed" and
-/// stays visible — source mode must show the real text, highlighting only.
+/// Source mode must show the real text, so every delimiter stays visible and the
+/// job only adds syntax colouring on top.
 pub fn source_inline_job(line: &str, theme: &Theme) -> egui::text::LayoutJob {
     inline_job(
         line,
         0,
         line.len(),
-        Some((0, line.len())),
+        InlineMode::Source,
         theme,
         InlineVisual::body(theme),
     )
@@ -1359,6 +1421,11 @@ fn content_format(style: InlineStyle, theme: &Theme, visual: InlineVisual) -> eg
         fmt.font_id = FontId::new(visual.size, family_of(true, style.code));
     }
     if style.em {
+        fmt.italics = true;
+    }
+    // A block-level italic (quote) applies to runs that did not ask for their
+    // own emphasis, but must not override explicit bold-italic or code.
+    if visual.italic && !style.code && !style.math && !style.mdx {
         fmt.italics = true;
     }
     if style.strike {
@@ -1541,15 +1608,143 @@ mod tests {
             src,
             3,
             src.len() - 3,
-            None,
+            InlineMode::Wysiwyg,
             &theme,
             InlineVisual {
                 size: 16.0,
                 bold: true,
                 level: 2,
+                italic: false,
             },
         );
         assert_eq!(job.text, src);
+    }
+
+    #[test]
+    fn wysiwyg_hides_the_block_marker() {
+        // `## ` must not be painted: the heading style already conveys the
+        // level, and showing the hashes was the "still looks like Markdown"
+        // complaint.
+        let theme = Theme::dark();
+        let src = "## Title";
+        let job = inline_job(
+            src,
+            3,
+            src.len() - 3,
+            InlineMode::Wysiwyg,
+            &theme,
+            InlineVisual::body(&theme),
+        );
+        let marker: String = job
+            .sections
+            .iter()
+            .filter(|s| s.format.color == Color32::TRANSPARENT)
+            .filter_map(|s| job.text.get(s.byte_range.start.0..s.byte_range.end.0))
+            .collect();
+        assert_eq!(marker, "## ", "block marker was left visible");
+    }
+
+    #[test]
+    fn wysiwyg_hides_emphasis_delimiters() {
+        let theme = Theme::dark();
+        let src = "plain **bold** more";
+        let job = inline_job(
+            src,
+            0,
+            src.len(),
+            // Caret deliberately parked inside the bold run: WYSIWYG must still
+            // hide the asterisks. This is the behaviour the user asked for.
+            InlineMode::Wysiwyg,
+            &theme,
+            InlineVisual::body(&theme),
+        );
+        let mut hidden = String::new();
+        for s in &job.sections {
+            if s.format.color == Color32::TRANSPARENT {
+                hidden.push_str(job.text.get(s.byte_range.start.0..s.byte_range.end.0).unwrap_or(""));
+            }
+        }
+        assert!(
+            hidden.contains("**"),
+            "asterisks stayed visible with the caret inside; got {hidden:?}"
+        );
+    }
+
+    #[test]
+    fn content_is_never_hidden() {
+        // Guard against over-correcting: real text must remain visible.
+        let theme = Theme::dark();
+        let src = "**bold**";
+        let job = inline_job(
+            src,
+            0,
+            src.len(),
+            InlineMode::Wysiwyg,
+            &theme,
+            InlineVisual::body(&theme),
+        );
+        assert!(
+            job.sections
+                .iter()
+                .any(|s| s.format.color != Color32::TRANSPARENT),
+            "everything went invisible"
+        );
+    }
+
+    #[test]
+    fn source_mode_still_reveals_delimiters() {
+        // The counterpart guarantee: source mode must show the real syntax, or
+        // the "view source" button would be useless.
+        let theme = Theme::dark();
+        let src = "**bold**";
+        let job = source_inline_job(src, &theme);
+        let visible: String = job
+            .sections
+            .iter()
+            .filter(|s| s.format.color != Color32::TRANSPARENT)
+            .filter_map(|s| job.text.get(s.byte_range.start.0..s.byte_range.end.0))
+            .collect();
+        assert!(
+            visible.contains("**"),
+            "source mode hid the asterisks; got {visible:?}"
+        );
+    }
+
+    #[test]
+    fn block_markers_still_occupy_width() {
+        // Hidden sections must still advance, otherwise the caret cannot be
+        // positioned consistently against the buffer.
+        let base = egui::TextFormat {
+            font_id: FontId::new(16.0, FontFamily::Proportional),
+            ..Default::default()
+        };
+        let f = hidden_format(&base);
+        assert!(
+            f.font_id.size < 2.0,
+            "hidden text still takes up real width: {}pt",
+            f.font_id.size
+        );
+        assert_eq!(f.color, Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn quote_visual_italicises_plain_runs() {
+        let theme = Theme::dark();
+        let mut visual = InlineVisual::body(&theme);
+        assert!(!visual.italic);
+        visual.italic = true;
+        let plain = InlineStyle::default();
+        assert!(
+            content_format(plain, &theme, visual).italics,
+            "quote text was not italicised"
+        );
+
+        // Code spans keep their own look instead of inheriting italics.
+        let code = InlineStyle {
+            code: true,
+            ..InlineStyle::default()
+        };
+        assert!(!content_format(code, &theme, visual).italics);
     }
 
     #[test]
@@ -1574,5 +1769,134 @@ mod tests {
             a,
             cache_key(Engine::Mermaid, "graph TD;A-->B", true, 15.0)
         );
+    }
+}
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+    use egui::RawInput;
+
+    const SAMPLE: &str = "# 标题\n\n这是一段正文，用来验证文字确实被画出来了。\n\n- 列表项一\n- 列表项二\n\n> 引用内容\n";
+
+    /// Regression guard for the "text is invisible" bug.
+    ///
+    /// Delimiters are hidden with a 1pt transparent font. The negative letter
+    /// spacing that once accompanied it was computed from the *body* font size,
+    /// so every hidden character subtracted ~14pt and dragged whole lines off
+    /// the left edge of the page. This asserts the rendered job stays a sane
+    /// width: close to the visible text, and never absurdly wide or negative.
+    #[test]
+    fn hidden_delimiters_do_not_destroy_line_width() {
+        let ctx = egui::Context::default();
+        let out = ctx.run_pass(RawInput::default(), |ctx| {
+            install_fonts_for_test(ctx);
+            let theme = Theme::dark();
+            let plain = "bold";
+            let marked = "**bold**";
+            let a = layout_width(ctx, plain, &theme);
+            let b = layout_width(ctx, marked, &theme);
+            assert!(a > 10.0, "plain text measured {a}");
+            assert!(
+                b > 0.0,
+                "marked-up text measured {b} — it was laid out off-page"
+            );
+            // The four hidden asterisks may add a little width, but must not add
+            // anything close to a body-size em per character.
+            assert!(
+                b < a + 24.0,
+                "hidden delimiters added {}pt for four characters",
+                b - a
+            );
+        });
+        // Laying out glyphs grows the font atlas; a headless test has no GPU to
+        // upload it to, so the deltas must be dropped explicitly.
+        out.drop_without_applying_deltas();
+    }
+
+    fn layout_width(ctx: &egui::Context, text: &str, theme: &Theme) -> f32 {
+        let job = inline_job(
+            text,
+            0,
+            text.len(),
+            InlineMode::Wysiwyg,
+            theme,
+            InlineVisual::body(theme),
+        );
+        ctx.fonts_mut(|f| f.layout_job(job)).size().x
+    }
+
+    fn install_fonts_for_test(ctx: &egui::Context) {
+        let _ = crate::fonts::install(ctx);
+    }
+
+    /// Renders a whole document headlessly and returns the shapes drawn for
+    /// text, so a test can assert the glyphs actually land on screen.
+    #[test]
+    fn document_text_lands_inside_the_viewport() {
+        let ctx = egui::Context::default();
+        let out = ctx.run_pass(
+            RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1200.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                install_fonts_for_test(ctx);
+                let theme = Theme::dark();
+                let doc = Document::from_file(
+                    std::path::PathBuf::from("t.md"),
+                    SAMPLE,
+                );
+                let mut view = ViewState::default();
+                let opts = RenderOpts {
+                    show_gutter: false,
+                    measure: 600.0,
+                };
+                // `CentralPanel::show` needs a parent `Ui`, which a headless pass
+                // does not have; build one directly over the screen rect.
+                let mut ui = egui::Ui::new(
+                    ctx.clone(),
+                    egui::Id::unique("repro"),
+                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(1200.0, 900.0),
+                    )),
+                );
+                ui.set_width(1200.0);
+                let _ = document_ui(&mut ui, &mut view, &doc, &theme, &opts);
+            },
+        );
+        // Walk every tessellated vertex. Glyphs that landed outside the window
+        // are exactly what "no text visible" looks like from the outside.
+        let mut visible = 0usize;
+        let mut outside = 0usize;
+        for clipped in ctx.tessellate(out.shapes.clone(), out.pixels_per_point) {
+            let mesh = match clipped.primitive {
+                egui::epaint::Primitive::Mesh(m) => m,
+                _ => continue,
+            };
+            for v in mesh.vertices {
+                if !(v.pos.x.is_finite() && v.pos.y.is_finite()) {
+                    continue;
+                }
+                if (-200.0..1400.0).contains(&v.pos.x) && (-200.0..1100.0).contains(&v.pos.y) {
+                    visible += 1;
+                } else {
+                    outside += 1;
+                }
+            }
+        }
+        assert!(
+            visible > 50,
+            "almost nothing was drawn on screen (visible={visible})"
+        );
+        assert!(
+            outside < visible,
+            "most geometry landed off-screen: visible={visible} outside={outside}"
+        );
+        out.drop_without_applying_deltas();
     }
 }

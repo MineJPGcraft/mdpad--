@@ -363,7 +363,7 @@ mod tests {
     /// epaint asserts that texture deltas are applied before they are dropped,
     /// so a test that lays out glyphs (and therefore grows the font atlas) must
     /// take responsibility for them.
-    fn pass(ctx: &egui::Context, mut body: impl FnMut(&egui::Context)) {
+    fn pass(ctx: &egui::Context, body: impl FnMut(&egui::Context)) {
         let output = ctx.run_pass(egui::RawInput::default(), body);
         output.drop_without_applying_deltas();
     }

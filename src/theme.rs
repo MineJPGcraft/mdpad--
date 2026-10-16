@@ -38,6 +38,12 @@ pub struct Palette {
     pub table_border: Rgba,
     pub rule: Rgba,
     pub todo_done: Rgba,
+    /// The area behind the page in page view. Word shows a neutral grey
+    /// desktop so the white page reads as a physical sheet.
+    pub desk: Rgba,
+    /// The page itself, plus its drop shadow.
+    pub paper: Rgba,
+    pub paper_shadow: Rgba,
 }
 
 impl Palette {
@@ -65,6 +71,9 @@ impl Palette {
             table_border: Rgba::hex(0x3A414C),
             rule: Rgba::hex(0x3A414C),
             todo_done: Rgba::hex(0x4ADE80),
+            desk: Rgba::hex(0x0D0F12),
+            paper: Rgba::hex(0x1B1E24),
+            paper_shadow: Rgba::new(0, 0, 0, 0x66),
         }
     }
 
@@ -92,6 +101,9 @@ impl Palette {
             table_border: Rgba::hex(0xD8DDE5),
             rule: Rgba::hex(0xD8DDE5),
             todo_done: Rgba::hex(0x1A7F37),
+            desk: Rgba::hex(0xD6D9DE),
+            paper: Rgba::hex(0xFFFFFF),
+            paper_shadow: Rgba::new(0, 0, 0, 0x28),
         }
     }
 }
@@ -332,7 +344,9 @@ impl Theme {
             egui::Visuals::light()
         };
         let p = &self.palette;
-        visuals.panel_fill = to_egui_color(p.bg);
+        // The central panel is the desk the page sits on, not the page itself —
+        // using the darker `bg` here would flatten the paper against it.
+        visuals.panel_fill = to_egui_color(p.desk);
         visuals.window_fill = to_egui_color(p.surface);
         visuals.extreme_bg_color = to_egui_color(if self.dark {
             Rgba::hex(0x101216)

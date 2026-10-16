@@ -354,75 +354,137 @@ impl App {
 
     // -- panels ------------------------------------------------------------
 
+    /// The ribbon.
+    ///
+    /// Structured like Word's: named groups, each a vertical stack of controls
+    /// with a caption underneath. This is not decoration — it gives the eye a
+    /// place to rest and makes the feature set legible at a glance, which a
+    /// single row of loose buttons does not.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let _ = &ctx;
         egui::Panel::top("mdp-toolbar")
-            .exact_size(40.0)
+            .exact_size(84.0)
             .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(6.0);
-                    if ui
-                        .button("新建")
-                        .on_hover_text("Ctrl+N")
-                        .clicked()
-                    {
-                        self.new_document();
-                    }
-                    if ui.button("打开").on_hover_text("Ctrl+O").clicked() {
-                        self.open_document();
-                    }
-                    if ui
-                        .button(if self.doc.dirty { "保存 •" } else { "保存" })
-                        .on_hover_text("Ctrl+S")
-                        .clicked()
-                    {
-                        self.save();
-                    }
-                    ui.menu_button("另存为 / 导出", |ui| {
-                        if ui.button("另存为 …").clicked() {
-                            self.save_as();
-                            ui.close();
-                        }
-                        if ui.button("导出为 HTML").clicked() {
-                            self.export_html();
-                            ui.close();
-                        }
-                    });
-                    ui.separator();
-
-                    self.format_buttons(ui);
-                    ui.separator();
-                    self.insert_menus(ui);
-                    ui.separator();
-
-                    if ui
-                        .button("撤销")
-                        .on_hover_text("Ctrl+Z")
-                        .clicked()
-                    {
-                        self.undo();
-                    }
-                    if ui.button("示例").on_hover_text("载入覆盖全部特性的示例文档").clicked() {
-                        self.load_sample();
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(6.0);
-                        if ui
-                            .button(if self.theme.dark { "浅色" } else { "深色" })
-                            .on_hover_text("切换主题")
-                            .clicked()
-                        {
-                            self.config.dark = !self.config.dark;
-                            self.theme = theme_from(&self.config);
-                            self.theme.apply_egui_visuals(&ctx);
-                            self.view.invalidate();
-                        }
-                        self.settings_menu(ui);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        // Row 1: the document commands, laid out left to right.
+                        ui.horizontal(|ui| {
+                            if ui.button("新建").on_hover_text("Ctrl+N").clicked() {
+                                self.new_document();
+                            }
+                            if ui.button("打开").on_hover_text("Ctrl+O").clicked() {
+                                self.open_document();
+                            }
+                            if ui
+                                .button(if self.doc.dirty { "保存 •" } else { "保存" })
+                                .on_hover_text("Ctrl+S")
+                                .clicked()
+                            {
+                                self.save();
+                            }
+                            ui.menu_button("另存为 / 导出", |ui| {
+                                if ui.button("另存为 …").clicked() {
+                                    self.save_as();
+                                    ui.close();
+                                }
+                                if ui.button("导出为 HTML").clicked() {
+                                    self.export_html();
+                                    ui.close();
+                                }
+                            });
+                            ui.menu_button("撤销", |ui| {
+                                if ui.button("撤销本次修改").clicked() {
+                                    self.undo();
+                                    ui.close();
+                                }
+                                if ui.button("载入示例文档").clicked() {
+                                    self.load_sample();
+                                    ui.close();
+                                }
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .button(if self.theme.dark { "浅色" } else { "深色" })
+                                        .on_hover_text("切换主题")
+                                        .clicked()
+                                    {
+                                        self.config.dark = !self.config.dark;
+                                        self.theme = theme_from(&self.config);
+                                        self.theme.apply_egui_visuals(&ctx);
+                                        self.view.invalidate();
+                                    }
+                                    self.settings_menu(ui);
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                        // Row 2: the grouped feature ribbon.
+                        let theme = self.theme;
+                        ui.horizontal_top(|ui| {
+                            Self::group(ui, &theme, "字体", |ui| {
+                                self.format_buttons(ui);
+                            });
+                            ui.add_space(6.0);
+                            Self::group(ui, &theme, "段落", |ui| {
+                                ui.horizontal(|ui| {
+                                    self.insert_menus(ui);
+                                });
+                            });
+                            ui.add_space(6.0);
+                            Self::group(ui, &theme, "样式", |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.button("正文").clicked() {
+                                        self.wrap_active("", "");
+                                    }
+                                    if ui.button("标题 1").clicked() {
+                                        self.insert_block("# 标题\n");
+                                    }
+                                    if ui.button("标题 2").clicked() {
+                                        self.insert_block("## 标题\n");
+                                    }
+                                    if ui.button("引用").clicked() {
+                                        self.insert_block("> 引用内容\n");
+                                    }
+                                });
+                            });
+                            ui.add_space(6.0);
+                            Self::group(ui, &theme, "插入", |ui| {
+                                ui.horizontal(|ui| {
+                                    self.advanced_inserts(ui);
+                                });
+                            });
+                        });
                     });
                 });
             });
+    }
+
+    /// One labelled ribbon group: a bordered panel with a caption below.
+    ///
+    /// Takes the theme rather than `&mut self` so callers can pass closures that
+    /// capture `self` — the body needs it to dispatch button clicks, and a
+    /// method borrowing `self` mutably would collide with that capture.
+    fn group(ui: &mut egui::Ui, theme: &Theme, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+        let frame = egui::Frame::new()
+            .fill(theme.palette.surface.to_egui())
+            .stroke(egui::Stroke::new(1.0, theme.palette.border_soft.to_egui()))
+            .corner_radius(3.0)
+            .inner_margin(6.0)
+            .outer_margin(2.0);
+        frame.show(ui, |ui| {
+            ui.vertical(|ui| {
+                body(ui);
+                ui.add_space(1.0);
+                ui.label(
+                    RichText::new(title)
+                        .size(10.0)
+                        .color(theme.palette.text_faint.to_egui()),
+                );
+            });
+        });
     }
 
     fn format_buttons(&mut self, ui: &mut egui::Ui) {
@@ -521,7 +583,7 @@ impl App {
             );
         });
 
-        ui.menu_button("插入 ▾", |ui| {
+        ui.menu_button("高级 ▾", |ui| {
             if ui.button("Mermaid 图表").clicked() {
                 self.insert_block(
                     "```mermaid\nflowchart TD\n  A[开始] --> B{判断}\n  B -->|是| C[处理]\n  B -->|否| D[结束]\n```\n",
@@ -573,6 +635,79 @@ impl App {
             if ui.button("Markdoc：叶子标签").clicked() {
                 self.doc.flavor = Flavor::Markdoc;
                 self.insert_block("{% callout type=\"note\" /%}\n");
+                ui.close();
+            }
+        });
+    }
+
+    /// The contents of the ribbon's 插入 group: the block types that produce
+    /// rich output rather than plain text.
+    fn advanced_inserts(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("图表", |ui| {
+            if ui.button("Mermaid 流程图").clicked() {
+                self.insert_block(
+                    "```mermaid\nflowchart TD\n  A[开始] --> B{判断}\n  B -->|是| C[处理]\n  B -->|否| D[结束]\n```\n",
+                );
+                ui.close();
+            }
+            if ui.button("Mermaid 时序图").clicked() {
+                self.insert_block(
+                    "```mermaid\nsequenceDiagram\n  Alice->>Bob: 请求\n  Bob-->>-Alice: 响应\n```\n",
+                );
+                ui.close();
+            }
+            if ui.button("PlantUML 时序图").clicked() {
+                self.insert_block(
+                    "```plantuml\n@startuml\nAlice -> Bob: 请求\nBob --> Alice: 响应\n@enduml\n```\n",
+                );
+                ui.close();
+            }
+            if ui.button("PlantUML 类图").clicked() {
+                self.insert_block(
+                    "```plantuml\n@startuml\nclass Order {\n  +id: String\n  +total(): Int\n}\nclass Item\nOrder \"1\" *-- \"0..*\" Item\n@enduml\n```\n",
+                );
+                ui.close();
+            }
+        });
+        ui.menu_button("公式", |ui| {
+            if ui.button("行内公式").clicked() {
+                self.wrap_active("$", "$");
+                ui.close();
+            }
+            if ui.button("块级公式").clicked() {
+                self.insert_block("$$\n\\int_{0}^{1} x^2 \\, dx = \\frac{1}{3}\n$$\n");
+                ui.close();
+            }
+        });
+        ui.menu_button("表格", |ui| {
+            if ui.button("三列表格").clicked() {
+                self.insert_block("| 列 A | 列 B | 列 C |\n|:--|:-:|--:|\n| 1 | 2 | 3 |\n");
+                ui.close();
+            }
+        });
+        ui.menu_button("代码", |ui| {
+            if ui.button("代码块").clicked() {
+                self.insert_block("```rust\nfn main() {}\n```\n");
+                ui.close();
+            }
+        });
+        ui.menu_button("MDX", |ui| {
+            if ui.button("import 语句").clicked() {
+                self.doc.flavor = Flavor::Mdx;
+                self.insert_block("import Tabs from '@theme/Tabs';\n");
+                ui.close();
+            }
+            if ui.button("JSX 区块").clicked() {
+                self.doc.flavor = Flavor::Mdx;
+                self.insert_block(
+                    "<Callout type=\"tip\">\n\n这里是 JSX 组件内的 Markdown。\n\n</Callout>\n",
+                );
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Markdoc 条件标签").clicked() {
+                self.doc.flavor = Flavor::Markdoc;
+                self.insert_block("{% if $show %}\n条件成立时显示。\n{% /if %}\n");
                 ui.close();
             }
         });
@@ -702,46 +837,75 @@ impl App {
             });
     }
 
+    /// The document surface.
+    ///
+    /// Page view mirrors Word: a sheet centred on a neutral desk with a drop
+    /// shadow and generous margins, rather than text pasted onto the panel
+    /// background. Alignment is pinned to top-down at every level: the ambient
+    /// layout centres its children, and a sheet as tall as the viewport would
+    /// then be centred too, pushing the top and bottom halves of the text clean
+    /// off screen.
     fn document_surface(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme;
+        let geo = PageGeometry::resolve(ui.available_width());
         egui::CentralPanel::default_margins().show(ui, |ui| {
-            let margin = 24.0;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let avail = ui.available_width();
-                    let measure = if self.config.measure <= 0.0 {
-                        (avail - margin * 2.0).max(280.0)
-                    } else {
-                        self.config.measure.min((avail - margin * 2.0).max(280.0))
-                    };
-                    let offset = ((avail - measure) * 0.5).max(0.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(offset);
-                        ui.vertical(|ui| {
-                            ui.set_width(measure);
-                            if self.source_mode {
-                                self.source_pane(ui);
-                            } else {
-                                let opts = RenderOpts {
-                                    show_gutter: self.config.show_gutter,
-                                    measure,
-                                };
-                                if let Some(action) = edit::document_ui(
-                                    ui,
-                                    &mut self.view,
-                                    &self.doc,
-                                    &self.theme,
-                                    &opts,
-                                ) {
-                                    self.handle_action(action);
-                                }
-                            }
-                            ui.add_space(120.0);
-                        });
+                    ui.horizontal_top(|ui| {
+                        ui.add_space(geo.gutter);
+                        let (rect, _) = ui.allocate_exact_size(
+                            // `available_height` can be zero on the first frame,
+                            // before the window reports its size. A sheet of zero
+                            // height would clip all of its content away.
+                            egui::vec2(geo.width, ui.available_height().max(320.0)),
+                            egui::Sense::hover(),
+                        );
+                        // Shadow first, then the sheet, so the shadow reads as
+                        // falling behind the page rather than on top of it.
+                        paint_shadow(ui, rect, &theme);
+                        ui.painter()
+                            .rect_filled(rect, 3.0, theme.palette.paper.to_egui());
+
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .max_rect(rect)
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                            |ui| {
+                                ui.add_space(geo.pad_top);
+                                ui.horizontal_top(|ui| {
+                                    ui.add_space((geo.width - geo.content) * 0.5);
+                                    ui.vertical(|ui| {
+                                        ui.set_width(geo.content);
+                                        if self.source_mode {
+                                            self.source_pane(ui);
+                                        } else {
+                                            let opts = RenderOpts {
+                                                show_gutter: self.config.show_gutter,
+                                                measure: geo.content,
+                                            };
+                                            if let Some(action) = edit::document_ui(
+                                                ui,
+                                                &mut self.view,
+                                                &self.doc,
+                                                &self.theme,
+                                                &opts,
+                                            ) {
+                                                self.handle_action(action);
+                                            }
+                                        }
+                                        // Trailing space so the sheet runs on past
+                                        // the last paragraph, as a real page does.
+                                        ui.add_space(geo.pad_bottom);
+                                    });
+                                });
+                            },
+                        );
                     });
                 });
         });
     }
+
 
     /// The raw Markdown editor used by source mode.
     fn source_pane(&mut self, ui: &mut egui::Ui) {
@@ -911,6 +1075,76 @@ impl eframe::App for App {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Geometry of the page view, resolved from the available width.
+///
+/// Split out as a pure function so the layout rules can be tested without a
+/// window: these numbers decide where every glyph lands, and getting one wrong
+/// pushes the whole document off screen with no error to report it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageGeometry {
+    /// Width of the sheet.
+    pub width: f32,
+    /// Horizontal space to leave on each side so the sheet is centred.
+    pub gutter: f32,
+    /// Width of the text column inside the sheet's side padding.
+    pub content: f32,
+    /// Space above the first block.
+    pub pad_top: f32,
+    /// Space below the last block, so the sheet runs on like a real page.
+    pub pad_bottom: f32,
+}
+
+impl PageGeometry {
+    /// Ideal sheet width, scaled from A4 at 96dpi.
+    const IDEAL_WIDTH: f32 = 794.0;
+    const SIDE_PAD: f32 = 64.0;
+    /// Below this the window is too narrow for a sheet with any margin.
+    const MIN_WIDTH: f32 = 280.0;
+
+    /// Resolves the geometry for an available width of `avail`.
+    ///
+    /// Every field is clamped to a positive value. A zero or negative width
+    /// makes the sheet lay its children out outside its own rect, which shows up
+    /// as a blank page rather than as an error worth chasing.
+    pub fn resolve(avail: f32) -> Self {
+        let avail = if avail.is_finite() {
+            avail
+        } else {
+            Self::IDEAL_WIDTH
+        };
+        let width = Self::IDEAL_WIDTH.min(avail - 24.0).max(Self::MIN_WIDTH);
+        let gutter = ((avail - width) * 0.5).max(0.0);
+        let content = (width - Self::SIDE_PAD * 2.0).max(160.0);
+        Self {
+            width,
+            gutter,
+            content,
+            pad_top: 56.0,
+            pad_bottom: 220.0,
+        }
+    }
+}
+
+/// Paints the page drop shadow.
+///
+/// egui has no shadow primitive, so the effect is faked with a few progressively
+/// larger, more transparent rounded rects around the sheet. Four layers is
+/// enough to read as a soft edge without the banding a hard offset would give.
+fn paint_shadow(ui: &egui::Ui, rect: egui::Rect, theme: &Theme) {
+    let base = theme.palette.paper_shadow;
+    for (i, spread) in [2.0f32, 5.0, 9.0, 15.0].into_iter().enumerate() {
+        // Alpha falls off with distance, so the layers blend outward.
+        let alpha = (base.a as f32 * [0.30, 0.22, 0.14, 0.08][i]) as u8;
+        let grow = rect.expand(spread);
+        ui.painter().rect_stroke(
+            grow,
+            4.0 + spread,
+            egui::Stroke::new(spread * 2.0, base.with_alpha(alpha).to_egui()),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
 
 fn theme_from(config: &Config) -> Theme {
     let mut theme = Theme::for_mode(config.dark);
@@ -1501,6 +1735,67 @@ Markdoc 使用 `{% %}` 标签：
 
 以上全部内容都在同一份 Markdown 文本中，且**完全离线**渲染。
 "#;
+
+#[cfg(test)]
+mod page_tests {
+    use super::PageGeometry;
+
+    /// Regression guard for "the page rendered blank".
+    ///
+    /// A zero or negative content width makes the sheet lay its text out
+    /// outside its own rect, so nothing is visible — with no error to explain
+    /// it. Every field must stay positive and finite for any plausible window.
+    #[test]
+    fn geometry_is_always_usable() {
+        for avail in [
+            0.0f32, 1.0, 100.0, 280.0, 640.0, 1024.0, 1920.0, 3840.0,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            let g = PageGeometry::resolve(avail);
+            for (name, v) in [
+                ("width", g.width),
+                ("content", g.content),
+                ("pad_top", g.pad_top),
+                ("pad_bottom", g.pad_bottom),
+            ] {
+                assert!(v.is_finite(), "{name} not finite for avail={avail}");
+                assert!(v > 0.0, "{name} was {v} for avail={avail}");
+            }
+            assert!(g.gutter >= 0.0, "negative gutter for avail={avail}");
+        }
+    }
+
+    #[test]
+    fn content_fits_inside_the_sheet() {
+        for avail in [320.0f32, 800.0, 1400.0, 2560.0] {
+            let g = PageGeometry::resolve(avail);
+            assert!(
+                g.content <= g.width,
+                "content column {} exceeds the sheet {} at avail={avail}",
+                g.content,
+                g.width
+            );
+        }
+    }
+
+    #[test]
+    fn wide_windows_centre_the_sheet() {
+        let g = PageGeometry::resolve(1600.0);
+        // Equal gutters mean the sheet sits in the middle of the window.
+        let left = g.gutter;
+        let right = 1600.0 - g.gutter - g.width;
+        assert!((left - right).abs() < 1.0, "not centred: {left} vs {right}");
+        assert_eq!(g.width, PageGeometry::IDEAL_WIDTH);
+    }
+
+    #[test]
+    fn narrow_windows_shrink_rather_than_overflow() {
+        let g = PageGeometry::resolve(360.0);
+        assert!(g.width <= 360.0, "sheet overflowed a narrow window");
+        assert!(g.content >= 160.0, "text column got unreadably narrow");
+    }
+}
 
 #[cfg(test)]
 mod tests {

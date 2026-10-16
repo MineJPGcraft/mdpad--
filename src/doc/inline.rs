@@ -52,8 +52,6 @@ pub struct Style {
     pub math: bool,
     /// MDX `{expr}` or JSX — rendered in monospace with a tinted background.
     pub mdx: bool,
-    /// Inside a construct that is currently being edited (delimiters revealed).
-    pub revealed: bool,
 }
 
 impl Style {
@@ -100,7 +98,7 @@ impl Construct {
     }
 
     /// `true` when the caret at byte `at` sits inside the construct, meaning its
-    /// delimiters should be revealed for editing.
+    /// delimiters belong to.
     pub fn contains(&self, at: usize) -> bool {
         let end = self.close.as_ref().map(|c| c.end).unwrap_or(self.inner.end);
         at >= self.open.start && at <= end
@@ -156,18 +154,6 @@ impl Inline {
             s.push_str(span.text(source));
         }
         s
-    }
-
-    /// Construct ids whose delimiters should be revealed for a caret/selection
-    /// covering `[lo, hi)`.
-    pub fn revealed(&self, lo: usize, hi: usize) -> Vec<usize> {
-        let selection = lo..hi.max(lo + 1);
-        self.constructs
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.intersects(&selection))
-            .map(|(i, _)| i)
-            .collect()
     }
 
     /// The innermost construct containing `at`, if any.
@@ -279,8 +265,7 @@ fn scan_into(text: &str, base: usize, style: &mut Style, depth: u8, out: &mut In
                     depth,
                 });
                 push_span(out, base + plain_start, base + i, *style, None);
-                let mut inner_style = *style;
-                inner_style.revealed |= style.revealed;
+                let inner_style = *style;
                 // The backslash itself is the construct's opening delimiter and
                 // must still occupy a span, otherwise the span list would leave
                 // a hole and the widget text would stop matching the source.
@@ -344,7 +329,7 @@ fn scan_into(text: &str, base: usize, style: &mut Style, depth: u8, out: &mut In
                     let mut inner_style = *style;
                     apply_kind(&mut inner_style, kind);
                     // The inner text inherits the delimiter visibility of the whole
-                    // construct, resolved later by the renderer via `revealed`.
+                    // construct, resolved later by the renderer.
                     scan_into(inner_text, base + inner_start, &mut inner_style, depth + 1, out);
 
                     push_span(out, close.start, close.end, *style, Some(id));
@@ -370,7 +355,7 @@ fn scan_into(text: &str, base: usize, style: &mut Style, depth: u8, out: &mut In
                     kind,
                     open: base + i..base + bracket + 1,
                     // The closing delimiter is the whole `](dest "title")` tail,
-                    // so it can be hidden and revealed as one unit.
+                    // so it can be hidden as one unit.
                     close: Some(base + parsed.text_end..base + parsed.close_end),
                     inner: base + bracket + 1..base + parsed.text_end,
                     href: Some(parsed.href.clone()),
@@ -973,13 +958,26 @@ mod tests {
     }
 
     #[test]
-    fn revealed_tracks_the_caret() {
+    fn construct_at_finds_the_innermost_match() {
         let src = "a **b** c";
         let i = Inline::scan(src);
-        // Caret inside `b`.
-        assert_eq!(i.revealed(5, 5), vec![0]);
-        // Caret far away.
-        assert!(i.revealed(0, 0).is_empty());
+        // Inside `b` the strong construct is found.
+        assert!(i.construct_at(5).is_some());
+        // Before or after it there is nothing.
+        assert!(i.construct_at(0).is_none());
+        assert!(i.construct_at(src.len()).is_none());
+    }
+
+    #[test]
+    fn nested_constructs_report_the_deepest_one() {
+        let src = "[**a**](u)";
+        let i = Inline::scan(src);
+        let inner = i.construct_at(4).expect("construct at offset 4");
+        assert!(
+            matches!(inner.kind, InlineKind::Strong),
+            "expected the strong run, got {:?}",
+            inner.kind
+        );
     }
 
     #[test]
