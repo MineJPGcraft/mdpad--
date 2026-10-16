@@ -27,10 +27,6 @@ pub struct Config {
     pub line_height: f32,
     /// Syntax used when inserting a *new* callout.
     pub callout_syntax: String,
-    /// Show the per-block type gutter.
-    pub show_gutter: bool,
-    /// Show the block gutter's borders.
-    pub show_gutter_border: bool,
     /// Start in source mode.
     pub source_mode: bool,
     /// Recently opened files, most recent first.
@@ -51,8 +47,6 @@ impl Default for Config {
             measure: 760.0,
             line_height: 1.62,
             callout_syntax: "GitHub".to_owned(),
-            show_gutter: true,
-            show_gutter_border: false,
             source_mode: false,
             recent: Vec::new(),
             last_dir: None,
@@ -195,6 +189,17 @@ mod tests {
         let json = r#"{"dark":false,"futureSetting":42}"#;
         let cfg: Config = serde_json::from_str(json).expect("must ignore unknown keys");
         assert!(!cfg.dark);
+    }
+
+    #[test]
+    fn config_files_written_by_older_versions_still_load() {
+        // `showGutter` / `showGutterBorder` were never read by the renderer; they
+        // are gone now, and an existing config file must not be rejected for
+        // still carrying them.
+        let json = r#"{"dark":false,"showGutter":true,"showGutterBorder":true}"#;
+        let cfg: Config = serde_json::from_str(json).expect("legacy keys must be ignored");
+        assert!(!cfg.dark);
+        assert_eq!(cfg.callout_syntax(), CalloutSyntax::GitHub);
     }
 
     #[test]

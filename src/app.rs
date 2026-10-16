@@ -27,6 +27,8 @@ const UNDO_LIMIT: usize = 200;
 struct Snapshot {
     text: String,
     path: Option<PathBuf>,
+    flavor: Flavor,
+    crlf: bool,
 }
 
 pub struct App {
@@ -68,6 +70,7 @@ impl App {
             Document::new()
         };
         let source_buffer = doc.text.clone();
+        let source_mode = config.source_mode;
         let ready = if first_run {
             format!("已载入示例文档 · {} · 右下角可切换源码模式", fonts_summary(&fonts))
         } else {
@@ -82,7 +85,7 @@ impl App {
             view: ViewState::default(),
             fonts,
             source_buffer,
-            source_mode: false,
+            source_mode,
             undo: Vec::new(),
             force_quit: false,
             last_title: String::new(),
@@ -97,6 +100,8 @@ impl App {
         self.undo.push(Snapshot {
             text: self.doc.text.clone(),
             path: self.doc.path.clone(),
+            flavor: self.doc.flavor,
+            crlf: self.doc.crlf,
         });
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
@@ -104,20 +109,47 @@ impl App {
     }
 
     fn undo(&mut self) {
+        self.commit_active_edit();
         let Some(snapshot) = self.undo.pop() else {
             self.note("没有可撤销的操作");
             return;
         };
         self.doc.path = snapshot.path;
-        self.doc.set_text(snapshot.text);
+        self.doc.flavor = snapshot.flavor;
+        self.doc.crlf = snapshot.crlf;
+        self.doc.dirty = true;
+        self.doc.text = snapshot.text;
+        self.doc.revision = self.doc.revision.wrapping_add(1);
+        self.doc.reparse();
         self.after_document_change();
-                }
+    }
 
     /// Refreshes derived state after the document text changed.
     fn after_document_change(&mut self) {
         self.source_buffer = self.doc.text.clone();
         self.view.end_session();
         self.view.invalidate();
+    }
+
+    fn commit_active_edit(&mut self) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+        let session = self.view.active.take()?;
+        self.view.focus_requested = false;
+        if session.revision != self.doc.revision {
+            return None;
+        }
+        let Some(block) = resolve_path(&self.doc.blocks, &session.path).cloned() else {
+            self.source_buffer = self.doc.text.clone();
+            return None;
+        };
+        let old_span = block.span;
+        let current = self.doc.text.get(old_span.clone()).unwrap_or("");
+        let new_span = old_span.start..old_span.start + session.buffer.len();
+        if current != session.buffer {
+            self.checkpoint();
+            self.doc.replace_span(old_span.clone(), &session.buffer);
+        }
+        self.after_document_change();
+        Some((old_span, new_span))
     }
 
     fn note(&mut self, text: impl Into<String>) {
@@ -133,6 +165,7 @@ impl App {
     // -- file actions ------------------------------------------------------
 
     fn new_document(&mut self) {
+        self.commit_active_edit();
         if self.doc.dirty && !self.confirm_discard() {
             return;
         }
@@ -143,6 +176,7 @@ impl App {
     }
 
     fn open_document(&mut self) {
+        self.commit_active_edit();
         if self.doc.dirty && !self.confirm_discard() {
             return;
         }
@@ -175,13 +209,15 @@ impl App {
     }
 
     fn save(&mut self) {
+        self.commit_active_edit();
         match self.doc.path.clone() {
-            Some(path) => self.write_to(path),
+            Some(path) => self.write_to(path, None),
             None => self.save_as(),
         }
     }
 
     fn save_as(&mut self) {
+        self.commit_active_edit();
         let default_name = self.doc.display_name();
         let Some(path) = rfd::FileDialog::new()
             .set_title("另存为")
@@ -194,11 +230,11 @@ impl App {
         else {
             return;
         };
-        self.doc.flavor = Flavor::from_path(&path);
-        self.write_to(path);
+        let flavor = Flavor::from_path(&path);
+        self.write_to(path, Some(flavor));
     }
 
-    fn write_to(&mut self, path: PathBuf) {
+    fn write_to(&mut self, path: PathBuf, new_flavor: Option<Flavor>) {
         let mut body = self.doc.text.clone();
         if self.doc.crlf && !body.contains("\r\n") {
             body = crate::doc::model::to_crlf(&body);
@@ -206,6 +242,14 @@ impl App {
         match std::fs::write(&path, body) {
             Ok(()) => {
                 self.doc.path = Some(path.clone());
+                if let Some(flavor) = new_flavor
+                    && self.doc.flavor != flavor
+                {
+                    self.doc.flavor = flavor;
+                    self.doc.revision = self.doc.revision.wrapping_add(1);
+                    self.doc.reparse();
+                    self.view.invalidate();
+                }
                 self.doc.dirty = false;
                 self.config.push_recent(&path);
                 self.note(format!("已保存 {}", path.display()));
@@ -226,6 +270,7 @@ impl App {
     }
 
     fn export_html(&mut self) {
+        self.commit_active_edit();
         let html = render_html(&self.doc);
         let default_name = self
             .doc
@@ -254,6 +299,7 @@ impl App {
     // -- source mode -------------------------------------------------------
 
     fn toggle_source(&mut self, ctx: &egui::Context) {
+        self.commit_active_edit();
         self.source_mode = !self.source_mode;
         self.config.source_mode = self.source_mode;
         if self.source_mode {
@@ -278,6 +324,10 @@ impl App {
 
     /// Loads a built-in sample that exercises every supported construct.
     fn load_sample(&mut self) {
+        self.commit_active_edit();
+        if self.doc.dirty && !self.confirm_discard() {
+            return;
+        }
         self.checkpoint();
         self.doc = Document::from_file(PathBuf::from("示例.md"), SAMPLE);
         self.after_document_change();
@@ -297,11 +347,22 @@ impl App {
             .start
             .saturating_sub(block.span.start)
             .min(block.span.len());
-        let (Some(_), Some(session)) = (Some(()), self.view.active.as_ref()) else {
+        let Some(session) = self.view.active.as_ref() else {
             return;
         };
         let buffer = session.buffer.clone();
-        let inner_end = (marker_len + block.inline_span.len()).min(buffer.len());
+        let marker_len = crate::doc::model::clamp_boundary(&buffer, marker_len);
+        let trailing = self
+            .doc
+            .text
+            .get(block.inline_span.end..block.span.end)
+            .unwrap_or("");
+        let trailing_len = if !trailing.is_empty() && buffer.ends_with(trailing) {
+            trailing.len()
+        } else {
+            0
+        };
+        let inner_end = buffer.len().saturating_sub(trailing_len);
         if marker_len > inner_end {
             return;
         }
@@ -325,22 +386,38 @@ impl App {
 
     /// Inserts a new block after the active one, or at the end of the document.
     fn insert_block(&mut self, template: &str) {
-        let at = match self.view.active.as_ref() {
-            Some(session) => {
-                let blocks = &self.doc.blocks;
-                resolve_path(blocks, &session.path)
-                    .map(|b| b.span.end)
-                    .unwrap_or(self.doc.text.len())
-            }
-            None => self.doc.text.len(),
-        };
+        let active_span = self.view.active.as_ref().and_then(|session| {
+            resolve_path(&self.doc.blocks, &session.path).map(|block| block.span.clone())
+        });
+        let committed = self.commit_active_edit();
+        let at = match (active_span, committed) {
+            (Some(_), Some((_, new))) => new.end,
+            (Some(old), None) => old.end,
+            (None, _) => self.doc.text.len(),
+        }
+        .min(self.doc.text.len());
         let mut insert = String::new();
         // Separate from the previous block unless it already ends with a blank line.
+        let at = crate::doc::model::clamp_boundary(&self.doc.text, at);
         let before = &self.doc.text[..at];
-        if !before.is_empty() && !before.ends_with("\n\n") {
-            insert.push('\n');
+        if !before.is_empty() {
+            if !before.ends_with('\n') {
+                insert.push('\n');
+            }
+            if !before.ends_with("\n\n") {
+                insert.push('\n');
+            }
         }
-        insert.push_str(template);
+        insert.push_str(template.trim_end_matches('\n'));
+        let after = &self.doc.text[at..];
+        if after.is_empty() {
+            insert.push('\n');
+        } else {
+            let existing_newlines = after.bytes().take_while(|b| *b == b'\n').count();
+            for _ in existing_newlines..2 {
+                insert.push('\n');
+            }
+        }
         self.checkpoint();
         self.doc.replace_span(at..at, &insert);
         self.after_document_change();
@@ -744,7 +821,10 @@ impl App {
             ui.add(egui::Slider::new(&mut self.config.line_height, 1.1..=2.4).show_value(false));
             ui.label("栏宽（0 = 自适应）");
             ui.add(egui::Slider::new(&mut self.config.measure, 0.0..=1200.0).show_value(true));
-            ui.checkbox(&mut self.config.show_gutter, "显示块类型标记");
+            ui.label("图表字号");
+            ui.add(
+                egui::Slider::new(&mut self.config.diagram_font_scale, 0.7..=1.6).show_value(true),
+            );
             ui.checkbox(&mut self.config.source_wrap, "源码模式自动换行");
             ui.separator();
             // Font status matters here: without a CJK face Chinese text renders
@@ -862,24 +942,25 @@ impl App {
                         // than the document and clip the page mid-way down.
                         let top = ui.available_rect_before_wrap().top();
                         let width = geo.width;
+                        let content_width = geo.content_width(self.config.measure);
                         let inner_left = ui.available_rect_before_wrap().left()
-                            + (geo.width - geo.content) * 0.5;
+                            + (geo.width - content_width) * 0.5;
 
                         let mut content = ui.new_child(
                             egui::UiBuilder::new()
                                 .max_rect(egui::Rect::from_min_size(
                                     egui::pos2(inner_left, top + geo.pad_top),
-                                    egui::vec2(geo.content, f32::INFINITY),
+                                    egui::vec2(content_width, f32::INFINITY),
                                 ))
                                 .layout(egui::Layout::top_down(egui::Align::Min)),
                         );
-                        content.set_width(geo.content);
+                        content.set_width(content_width);
                         if self.source_mode {
                             self.source_pane(&mut content);
                         } else {
                             let opts = RenderOpts {
-                                show_gutter: self.config.show_gutter,
-                                measure: geo.content,
+                                measure: content_width,
+                                diagram_scale: self.config.diagram_font_scale,
                             };
                             if let Some(action) =
                                 edit::document_ui(
@@ -934,8 +1015,7 @@ impl App {
             ui.ctx().fonts_mut(|f| f.layout_job(job))
         };
 
-        let before = self.source_buffer.clone();
-        let resp = ui.add(
+        ui.add(
             egui::TextEdit::multiline(&mut self.source_buffer)
                 .id(egui::Id::unique("mdp-source"))
                 .frame(egui::Frame::NONE)
@@ -946,9 +1026,9 @@ impl App {
                 ))
                 .layouter(&mut layouter),
         );
-        let _ = (resp, before);
         // The buffer is authoritative while source mode is active.
         if self.source_buffer != self.doc.text {
+            self.checkpoint();
             let text = self.source_buffer.clone();
             self.doc.set_text(text);
             self.view.invalidate();
@@ -961,6 +1041,33 @@ impl App {
     }
 
     fn handle_action(&mut self, action: EditorAction) {
+        let target = match &action {
+            EditorAction::Focus { path, .. } => {
+                resolve_path(&self.doc.blocks, path).map(|block| block.span.start)
+            }
+            _ => None,
+        };
+        let toggling_active = matches!(&action, EditorAction::Focus { path, .. }
+            if self.view.active.as_ref().is_some_and(|session| session.path == *path));
+        let committed = match action {
+            EditorAction::Commit { .. } => None,
+            _ => self.commit_active_edit(),
+        };
+        let rebase = |mut span: std::ops::Range<usize>| {
+            if let Some((old, new)) = &committed {
+                let offset = |at: usize| {
+                    if at <= old.start {
+                        at
+                    } else if at >= old.end {
+                        new.end + (at - old.end)
+                    } else {
+                        new.start + (at - old.start).min(new.len())
+                    }
+                };
+                span = offset(span.start)..offset(span.end);
+            }
+            span
+        };
         match action {
             EditorAction::Commit { span, text } => {
                 if self.doc.text.get(span.clone()).map(str::to_owned).as_deref() != Some(&text) {
@@ -970,7 +1077,19 @@ impl App {
                 self.view.end_session();
                 self.source_buffer = self.doc.text.clone();
             }
-            EditorAction::Focus { path, caret: _ } => {
+            EditorAction::Focus { mut path, caret: _ } => {
+                if toggling_active {
+                    return;
+                }
+                if committed.is_some()
+                    && let Some(target) = target
+                {
+                    let at = rebase(target..target).start;
+                    let Some(updated) = path_at_byte(&self.doc.blocks, at) else {
+                        return;
+                    };
+                    path = updated;
+                }
                 let block = resolve_path(&self.doc.blocks, &path).cloned();
                 if let Some(block) = block {
                     self.view.begin_session(path, &self.doc, &block);
@@ -980,6 +1099,7 @@ impl App {
                 open_url(&url);
             }
             EditorAction::ToggleTask { span, checked } => {
+                let span = rebase(span);
                 let current = self.doc.text.get(span.clone()).unwrap_or("").to_owned();
                 let updated = set_task_state(&current, checked);
                 if updated != current {
@@ -989,6 +1109,7 @@ impl App {
                 }
             }
             EditorAction::ConvertCallout { span, syntax } => {
+                let span = rebase(span);
                 let source = self.doc.text.get(span.clone()).unwrap_or("").to_owned();
                 match convert_callout(&source, syntax) {
                     Some(converted) => {
@@ -1001,6 +1122,7 @@ impl App {
                 }
             }
             EditorAction::DeleteBlock { span } => {
+                let span = rebase(span);
                 self.checkpoint();
                 self.doc.replace_span(span, "");
                 self.source_buffer = self.doc.text.clone();
@@ -1010,45 +1132,40 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let has_focus = ctx.memory(|m| m.focused().is_some());
-        let events: Vec<egui::Key> = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => Some((*key, *modifiers)),
-                    _ => None,
-                })
-                .map(|(k, _)| k)
-                .collect()
-        });
-        let modifiers = ctx.input(|i| i.modifiers);
-        let _ = events;
-
-        if modifiers.command {
-            if ctx.input(|i| i.key_pressed(egui::Key::S)) {
-                self.save();
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::O)) {
-                self.open_document();
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::N)) {
-                self.new_document();
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::Z)) && !has_focus {
-                self.undo();
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::Slash)) {
-                self.toggle_source(ctx);
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::B)) && !has_focus {
+        let consume = |modifiers, key| {
+            ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)))
+        };
+        if consume(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S) {
+            self.save_as();
+        } else if consume(egui::Modifiers::COMMAND, egui::Key::S) {
+            self.save();
+        }
+        if consume(egui::Modifiers::COMMAND, egui::Key::O) {
+            self.open_document();
+        }
+        if consume(egui::Modifiers::COMMAND, egui::Key::N) {
+            self.new_document();
+        }
+        if !has_focus && consume(egui::Modifiers::COMMAND, egui::Key::Z) {
+            self.undo();
+        }
+        if consume(egui::Modifiers::COMMAND, egui::Key::Backslash)
+            || consume(egui::Modifiers::COMMAND, egui::Key::Slash)
+        {
+            self.toggle_source(ctx);
+        }
+        if consume(egui::Modifiers::COMMAND, egui::Key::E) {
+            self.export_html();
+        }
+        if self.view.active.is_some() {
+            if consume(egui::Modifiers::COMMAND, egui::Key::B) {
                 self.wrap_active("**", "**");
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::I)) && !has_focus {
+            if consume(egui::Modifiers::COMMAND, egui::Key::I) {
                 self.wrap_active("*", "*");
+            }
+            if consume(egui::Modifiers::COMMAND, egui::Key::K) {
+                self.wrap_active("[", "](https://example.com)");
             }
         }
     }
@@ -1061,6 +1178,37 @@ impl App {
             self.last_title = title;
         }
     }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if self.force_quit || !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        self.commit_active_edit();
+        if self.doc.dirty && !self.confirm_discard() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        } else {
+            self.force_quit = true;
+        }
+    }
+}
+
+fn path_at_byte(blocks: &[crate::doc::model::Block], byte: usize) -> Option<Vec<usize>> {
+    for (index, block) in blocks.iter().enumerate() {
+        if block.span.start <= byte && byte < block.span.end {
+            let children = match &block.kind {
+                BlockKind::Callout(callout) => callout.body.as_slice(),
+                BlockKind::MdxJsx { children, .. } => children,
+                BlockKind::MarkdocTag { body, .. } => body,
+                _ => &[],
+            };
+            let mut path = vec![index];
+            if let Some(child_path) = path_at_byte(children, byte) {
+                path.extend(child_path);
+            }
+            return Some(path);
+        }
+    }
+    None
 }
 
 impl eframe::App for App {
@@ -1073,6 +1221,7 @@ impl eframe::App for App {
         self.theme.typo.measure = self.config.measure;
 
         let ctx = ui.ctx().clone();
+        self.handle_close_request(&ctx);
         self.shortcuts(&ctx);
         self.toolbar(ui);
         self.status_bar(ui);
@@ -1085,6 +1234,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.commit_active_edit();
         let _ = self.config.save();
     }
 }
@@ -1139,6 +1289,16 @@ impl PageGeometry {
             content,
             pad_top: 56.0,
             pad_bottom: 220.0,
+        }
+    }
+
+    /// Applies the user's reading-column preference within the available sheet.
+    /// Zero and invalid values mean the adaptive page width.
+    pub fn content_width(self, requested: f32) -> f32 {
+        if requested.is_finite() && requested > 0.0 {
+            self.content.min(requested.max(160.0))
+        } else {
+            self.content
         }
     }
 }
@@ -1812,12 +1972,210 @@ mod page_tests {
         assert!(g.width <= 360.0, "sheet overflowed a narrow window");
         assert!(g.content >= 160.0, "text column got unreadably narrow");
     }
+
+    #[test]
+    fn reading_column_setting_changes_the_content_width() {
+        let page = PageGeometry::resolve(1400.0);
+        assert_eq!(page.content_width(400.0), 400.0);
+        assert_eq!(page.content_width(1200.0), page.content);
+        assert_eq!(page.content_width(0.0), page.content);
+        assert_eq!(page.content_width(1.0), 160.0);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::doc::model::{CalloutSyntax, CalloutVariant};
+
+    fn test_app(source: &str) -> App {
+        App {
+            config: Config::default(),
+            theme: Theme::dark(),
+            doc: Document::from_file("test.md".into(), source),
+            view: ViewState::default(),
+            fonts: FontReport::default(),
+            source_buffer: source.to_owned(),
+            source_mode: false,
+            undo: Vec::new(),
+            force_quit: false,
+            last_title: String::new(),
+            status_note: None,
+        }
+    }
+
+    fn edit_first_block(app: &mut App, text: &str) {
+        let block = app.doc.blocks[0].clone();
+        app.view.begin_session(vec![0], &app.doc, &block);
+        app.view.active.as_mut().unwrap().buffer = text.to_owned();
+    }
+
+    #[test]
+    fn switching_to_source_keeps_pending_edits() {
+        let mut app = test_app("original");
+        edit_first_block(&mut app, "新的内容");
+        app.toggle_source(&egui::Context::default());
+        assert_eq!(app.doc.text, "新的内容");
+        assert_eq!(app.source_buffer, app.doc.text);
+        assert!(app.doc.dirty);
+    }
+
+    #[test]
+    fn focusing_another_block_keeps_edits_and_tracks_its_new_position() {
+        let mut app = test_app("first\n\nsecond");
+        edit_first_block(&mut app, "edited\n\nan extra paragraph");
+        app.handle_action(EditorAction::Focus { path: vec![1], caret: 0 });
+        assert_eq!(app.doc.text, "edited\n\nan extra paragraph\n\nsecond");
+        assert_eq!(app.view.active.as_ref().unwrap().buffer, "second");
+    }
+
+    #[test]
+    fn toggling_a_task_keeps_edits_and_updates_the_correct_range() {
+        let mut app = test_app("first\n\n- [ ] task\n");
+        let span = app.doc.blocks[1].span.clone();
+        edit_first_block(&mut app, "更长的第一段");
+        app.handle_action(EditorAction::ToggleTask { span, checked: true });
+        assert_eq!(app.doc.text, "更长的第一段\n\n- [x] task\n");
+    }
+
+    #[test]
+    fn inserting_a_block_keeps_pending_edits() {
+        let mut app = test_app("first\n\nsecond");
+        edit_first_block(&mut app, "edited");
+        app.insert_block("# inserted\n");
+        assert_eq!(app.doc.text, "edited\n\n# inserted\n\nsecond");
+    }
+
+    #[test]
+    fn formatting_after_inserting_chinese_does_not_split_utf8() {
+        let mut app = test_app("ab");
+        edit_first_block(&mut app, "中文");
+        app.wrap_active("**", "**");
+        assert_eq!(app.view.active.as_ref().unwrap().buffer, "**中文**");
+    }
+
+    #[test]
+    fn undo_restores_document_flavor_and_line_endings() {
+        let mut app = test_app("old");
+        app.doc = Document::from_file("old.mdx".into(), "old\r\n");
+        app.checkpoint();
+        app.doc = Document::from_file("new.md".into(), "new\n");
+        app.undo();
+        assert_eq!(app.doc.path, Some("old.mdx".into()));
+        assert_eq!(app.doc.flavor, Flavor::Mdx);
+        assert!(app.doc.crlf);
+    }
+
+    #[test]
+    fn undo_keeps_restored_edits_dirty_after_a_save() {
+        let mut app = test_app("original");
+        app.set_text("saved content".to_owned());
+        app.doc.dirty = false;
+        app.undo();
+        assert_eq!(app.doc.text, "original");
+        assert!(app.doc.dirty);
+    }
+
+    #[test]
+    fn formatting_preserves_heading_suffix_after_changing_its_length() {
+        let mut app = test_app("# ab ###\n");
+        edit_first_block(&mut app, "# 中文 ###");
+        app.wrap_active("**", "**");
+        assert_eq!(app.view.active.as_ref().unwrap().buffer, "# **中文** ###");
+    }
+
+    #[test]
+    fn inserting_after_a_line_without_a_newline_starts_a_separate_block() {
+        let mut app = test_app("first");
+        app.insert_block("# inserted\n");
+        assert_eq!(app.doc.text, "first\n\n# inserted\n");
+        assert!(matches!(app.doc.blocks[1].kind, BlockKind::Heading { .. }));
+    }
+
+    #[test]
+    fn previewing_the_active_code_block_commits_its_buffer() {
+        let mut app = test_app("```rust\nold\n```\n");
+        edit_first_block(&mut app, "```rust\nnew\n```\n");
+        app.handle_action(EditorAction::Focus { path: vec![0], caret: 0 });
+        assert_eq!(app.doc.text, "```rust\nnew\n```\n");
+        assert!(app.view.active.is_none());
+    }
+
+    #[test]
+    fn failed_save_as_preserves_the_current_document_identity() {
+        let mut app = test_app("original");
+        app.doc.dirty = true;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("missing-save-directory-{}", std::process::id()))
+            .join("new.mdx");
+        app.write_to(path, Some(Flavor::Mdx));
+        assert_eq!(app.doc.path, Some("test.md".into()));
+        assert_eq!(app.doc.flavor, Flavor::Markdown);
+        assert!(app.doc.dirty);
+    }
+
+    #[test]
+    fn save_includes_the_active_buffer_and_preserves_crlf() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("pending-save-{}.md", std::process::id()));
+        let mut app = test_app("original");
+        app.doc = Document::from_file(path.clone(), "old\r\n");
+        edit_first_block(&mut app, "中文\nnext");
+        app.save();
+        let saved = std::fs::read_to_string(&path).expect("saved file");
+        std::fs::remove_file(&path).expect("remove test file");
+        assert_eq!(saved, "中文\r\nnext\r\n");
+        assert!(!app.doc.dirty);
+        assert_eq!(app.source_buffer, app.doc.text);
+    }
+
+    #[test]
+    fn source_shortcut_uses_the_key_event_modifiers_and_keeps_pending_edits() {
+        let mut app = test_app("original");
+        edit_first_block(&mut app, "edited");
+        let context = egui::Context::default();
+        context.run_pass(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Backslash,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND | egui::Modifiers::CTRL,
+                }],
+                ..Default::default()
+            },
+            |context| app.shortcuts(context),
+        ).drop_without_applying_deltas();
+        assert!(app.source_mode);
+        assert_eq!(app.source_buffer, "edited");
+    }
+
+    #[test]
+    fn formatting_shortcuts_work_while_the_block_has_keyboard_focus() {
+        let mut app = test_app("original");
+        edit_first_block(&mut app, "中文");
+        let context = egui::Context::default();
+        context.run_pass(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::B,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND | egui::Modifiers::CTRL,
+                }],
+                ..Default::default()
+            },
+            |context| {
+                context.memory_mut(|memory| memory.request_focus(egui::Id::unique("editing")));
+                app.shortcuts(context);
+            },
+        ).drop_without_applying_deltas();
+        assert_eq!(app.view.active.as_ref().unwrap().buffer, "**中文**");
+    }
 
     #[test]
     fn sample_parses_and_exercises_every_feature() {

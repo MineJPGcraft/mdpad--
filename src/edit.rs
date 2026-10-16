@@ -34,6 +34,12 @@ use crate::gfx_egui::{self, EguiMeasure};
 use crate::tex;
 use crate::theme::Theme;
 
+/// Horizontal padding inside a table cell, in points.
+///
+/// Shared by the layout and the tests, because a cell that is padded on one side
+/// and flush on the other is a defect that no type error catches.
+const TABLE_PAD_X: f32 = 10.0;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -129,8 +135,19 @@ pub enum EditorAction {
 /// Layout options the app passes down.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderOpts {
-    pub show_gutter: bool,
+    /// Width of the reading column, in points.
     pub measure: f32,
+    /// Extra scale applied to diagram text, on top of the UI zoom.
+    pub diagram_scale: f32,
+}
+
+impl Default for RenderOpts {
+    fn default() -> Self {
+        Self {
+            measure: 760.0,
+            diagram_scale: 1.0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,10 +180,19 @@ pub fn document_ui(
     for (i, block) in doc.blocks.iter().enumerate() {
         let path = vec![i];
         if let Some(a) = ctx.block_ui(ui, block, &path) {
-            action = Some(a);
+            merge_action(&mut action, a);
         }
     }
     action
+}
+
+fn merge_action(current: &mut Option<EditorAction>, next: EditorAction) {
+    if matches!(next, EditorAction::Commit { .. })
+        && current.as_ref().is_some_and(|action| !matches!(action, EditorAction::Commit { .. }))
+    {
+        return;
+    }
+    *current = Some(next);
 }
 
 /// Per-frame rendering context threaded through the recursive renderer.
@@ -219,6 +245,12 @@ impl BlockCtx<'_> {
             .active
             .as_ref()
             .is_some_and(|s| s.path == path);
+
+        if active
+            && matches!(&block.kind, BlockKind::Table { .. } | BlockKind::MarkdocTag { .. })
+        {
+            return self.code_edit(ui, block, path);
+        }
 
         match &block.kind {
             BlockKind::Heading { level, .. } => self.heading_ui(ui, block, path, *level, active),
@@ -321,11 +353,11 @@ impl BlockCtx<'_> {
         }
 
         if active {
-            self.inline_edit(ui, block, path, marker_len, inner_len, visual)
+            self.inline_edit(ui, block, path, visual)
         } else {
             let source = self.doc.text.get(span.clone()).unwrap_or("");
             let mut math = Vec::new();
-            let job = inline_job(
+            let mut job = inline_job(
                 source,
                 marker_len,
                 inner_len,
@@ -334,6 +366,7 @@ impl BlockCtx<'_> {
                 visual,
                 Some(&mut math),
             );
+            job.wrap.max_width = ui.available_width().min(self.opts.measure).max(1.0);
             let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
             let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
             // `painter.galley` consumes the `Arc`, but the math overlay needs it
@@ -366,26 +399,47 @@ impl BlockCtx<'_> {
         ui: &mut Ui,
         block: &Block,
         path: &[usize],
-        marker_len: usize,
-        inner_len: usize,
         visual: InlineVisual,
     ) -> Option<EditorAction> {
         let id = block_id(ui, path);
         let theme = *self.theme;
+        let original_marker = self
+            .doc
+            .text
+            .get(block.span.start..block.inline_span.start)
+            .unwrap_or("")
+            .to_owned();
+        let original_trailing = self
+            .doc
+            .text
+            .get(block.inline_span.end..block.span.end)
+            .unwrap_or("")
+            .to_owned();
         let render = move |ui: &Ui, buf: &dyn TextBuffer, wrap: f32| {
             let text = buf.as_str();
             let _ = caret_chars(ui, id);
-            let mut math = Vec::new();
-            let job = inline_job(
+            let marker_len = if !original_marker.is_empty() && text.starts_with(&original_marker) {
+                original_marker.len()
+            } else {
+                0
+            };
+            let trailing_len = if !original_trailing.is_empty() && text.ends_with(&original_trailing)
+            {
+                original_trailing.len()
+            } else {
+                0
+            };
+            let inner_len = text.len().saturating_sub(marker_len + trailing_len);
+            let mut job = inline_job(
                 text,
-                marker_len,
+                marker_len.min(text.len()),
                 inner_len,
                 InlineMode::Wysiwyg,
                 &theme,
                 visual,
-                Some(&mut math),
+                None,
             );
-            let _ = wrap;
+            job.wrap.max_width = wrap.max(1.0);
             ui.ctx().fonts_mut(|f| f.layout_job(job))
         };
 
@@ -407,17 +461,13 @@ impl BlockCtx<'_> {
             self.state.focus_requested = false;
         }
 
-        let commit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-            || resp.lost_focus()
+        let commit = resp.lost_focus()
             || ui.input(|i| i.key_pressed(egui::Key::Escape));
 
         if commit {
             let text = self.state.active.as_ref()?.buffer.clone();
             let span = block.span.clone();
             return Some(EditorAction::Commit { span, text });
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.state.end_session();
         }
         None
     }
@@ -488,7 +538,7 @@ impl BlockCtx<'_> {
                     active,
                     InlineVisual::body(self.theme),
                 ) {
-                    action = Some(a);
+                    merge_action(&mut action, a);
                 }
             });
         });
@@ -644,7 +694,7 @@ impl BlockCtx<'_> {
                         let mut child_path = path.to_vec();
                         child_path.push(i);
                         if let Some(a) = self.block_ui(ui, child, &child_path) {
-                            action = Some(a);
+                            merge_action(&mut action, a);
                         }
                     }
                 }
@@ -751,7 +801,7 @@ impl BlockCtx<'_> {
 
                 if active {
                     if let Some(a) = self.code_edit(ui, block, path) {
-                        action = Some(a);
+                        merge_action(&mut action, a);
                     }
                 } else if let Some(engine) = engine {
                     self.diagram_view(ui, engine, code, block);
@@ -815,12 +865,21 @@ impl BlockCtx<'_> {
 
     /// Renders a Mermaid / PlantUML fence, using the cache.
     fn diagram_view(&mut self, ui: &mut Ui, engine: Engine, code: &str, block: &Block) {
-        let key = cache_key(engine, code, self.theme.dark, self.theme.typo.body());
+        let zoom = self.theme.typo.scale;
+        let scale = zoom * self.opts.diagram_scale;
+        // The cache key has to carry every input that changes the drawing, or a
+        // settings change would keep showing the pre-change render forever.
+        let key = cache_key(
+            engine,
+            code,
+            self.theme.dark,
+            self.theme.typo.body(),
+            self.opts.diagram_scale,
+        );
         if !self.state.diagram_cache.contains_key(&key) {
             let measure = EguiMeasure::new(ui.ctx());
-            let diagram_theme = self.theme.diagram_theme();
-            let mut diagram_theme = diagram_theme;
-            diagram_theme.font_scale = self.theme.typo.scale;
+            let mut diagram_theme = self.theme.diagram_theme();
+            diagram_theme.font_scale = scale;
             let render = diagram::render(
                 code,
                 engine,
@@ -1049,19 +1108,24 @@ impl BlockCtx<'_> {
                 );
                 let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
                 let align = align.get(c).copied().unwrap_or(Align::None);
-                let available = widths[c] - pad_x * 2.0;
+                // The column spans `widths[c]`; the padding is taken off once, on
+                // the side the text is pushed away from. Subtracting it twice left
+                // right- and centre-aligned cells floating one padding too far from
+                // the edge their neighbours were aligned to.
+                let inner = (widths[c] - pad_x * 2.0).max(0.0);
                 let tx = match align {
-                    Align::Center => x + (widths[c] - galley.size().x) * 0.5,
-                    Align::Right => x + available - galley.size().x,
+                    Align::Center => x + pad_x + (inner - galley.size().x) * 0.5,
+                    Align::Right => x + pad_x + (inner - galley.size().x),
                     _ => x + pad_x,
                 };
                 let ty = rect.min.y + (line_h - galley.size().y) * 0.5;
-                let color = if is_header {
-                    self.theme.palette.text
-                } else {
-                    self.theme.palette.text
-                };
-                painter.galley(egui::pos2(tx, ty), galley, color.to_egui());
+                // Header and body share one ink colour; the header reads as a
+                // header through its bold face and tinted cell background.
+                painter.galley(
+                    egui::pos2(tx, ty),
+                    galley,
+                    self.theme.palette.text.to_egui(),
+                );
                 x += widths[c];
             }
         };
@@ -1135,7 +1199,7 @@ impl BlockCtx<'_> {
                         let mut child_path = path.to_vec();
                         child_path.push(i);
                         if let Some(a) = self.block_ui(ui, child, &child_path) {
-                            action = Some(a);
+                            merge_action(&mut action, a);
                         }
                     }
                 }
@@ -1224,7 +1288,7 @@ impl BlockCtx<'_> {
                         let mut child_path = path.to_vec();
                         child_path.push(i);
                         if let Some(a) = self.block_ui(ui, child, &child_path) {
-                            action = Some(a);
+                            merge_action(&mut action, a);
                         }
                     }
                 }
@@ -1415,8 +1479,8 @@ fn inline_job(
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let text_len = text.len();
-    let marker_len = marker_len.min(text_len);
-    let inner_end = (marker_len + inner_len).min(text_len);
+    let marker_len = crate::doc::model::clamp_boundary(text, marker_len);
+    let inner_end = crate::doc::model::clamp_boundary(text, marker_len.saturating_add(inner_len));
 
     let marker_fmt = egui::TextFormat {
         font_id: FontId::new(visual.size, family_of(visual.bold, false)),
@@ -1699,13 +1763,18 @@ pub fn char_to_byte(text: &str, char_index: usize) -> usize {
     }
 }
 
-fn cache_key(engine: Engine, code: &str, dark: bool, size: f32) -> u64 {
+/// Cache key for a diagram render.
+///
+/// `scale` is folded into the size so that changing the diagram font scale in the
+/// settings re-renders instead of serving the previous drawing forever.
+fn cache_key(engine: Engine, code: &str, dark: bool, size: f32, scale: f32) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (engine == Engine::PlantUml).hash(&mut h);
     code.hash(&mut h);
     dark.hash(&mut h);
     size.to_bits().hash(&mut h);
+    scale.to_bits().hash(&mut h);
     h.finish()
 }
 
@@ -1726,6 +1795,186 @@ fn candidate_hint(syntax: CalloutSyntax) -> String {
 mod tests {
     use super::*;
     use crate::doc::model::Document;
+
+    fn editor_frame(
+        context: &egui::Context,
+        doc: &Document,
+        state: &mut ViewState,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 900.0));
+        context.run_pass(
+            egui::RawInput { screen_rect: Some(screen), events, ..Default::default() },
+            |context| {
+                let mut ui = egui::Ui::new(
+                    context.clone(),
+                    egui::Id::unique("editor-regression"),
+                    egui::UiBuilder::new()
+                        .max_rect(screen)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                document_ui(
+                    &mut ui,
+                    state,
+                    doc,
+                    &Theme::dark(),
+                    &RenderOpts { measure: 320.0, ..RenderOpts::default() },
+                );
+            },
+        )
+    }
+
+    #[test]
+    fn editing_chinese_after_an_ascii_paragraph_does_not_panic() {
+        let context = egui::Context::default();
+        crate::fonts::install(&context);
+        let doc = Document::from_file("test.md".into(), "ab");
+        let mut state = ViewState::default();
+        state.begin_session(vec![0], &doc, &doc.blocks[0]);
+        state.active.as_mut().unwrap().buffer = "中文".to_owned();
+        editor_frame(&context, &doc, &mut state, Vec::new()).drop_without_applying_deltas();
+        assert_eq!(state.active.as_ref().unwrap().buffer, "中文");
+    }
+
+    #[test]
+    fn editable_math_keeps_character_offsets_equal_to_the_buffer() {
+        let context = egui::Context::default();
+        crate::fonts::install(&context);
+        let source = "before $x^2$ after";
+        let doc = Document::from_file("test.md".into(), source);
+        let mut state = ViewState::default();
+        state.begin_session(vec![0], &doc, &doc.blocks[0]);
+        let output = editor_frame(&context, &doc, &mut state, Vec::new());
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == source)
+        }));
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn table_and_markdoc_source_editors_accept_keyboard_input() {
+        for source in ["| A | B |\n|---|---|\n| a | b |\n", "{% callout /%}\n"] {
+            let context = egui::Context::default();
+            crate::fonts::install(&context);
+            let doc = Document::from_file("test.md".into(), source);
+            let mut state = ViewState::default();
+            state.begin_session(vec![0], &doc, &doc.blocks[0]);
+            editor_frame(&context, &doc, &mut state, Vec::new()).drop_without_applying_deltas();
+            editor_frame(
+                &context,
+                &doc,
+                &mut state,
+                vec![egui::Event::Text("新增".to_owned())],
+            )
+            .drop_without_applying_deltas();
+            assert!(state.active.as_ref().unwrap().buffer.contains("新增"), "{source}");
+        }
+    }
+
+    /// Paints a three-column table whose columns are left-, centre- and
+    /// right-aligned, and returns where each cell's text landed plus the table's
+    /// painted right edge.
+    ///
+    /// The right edge comes from the table's own background rectangle rather than
+    /// from a formula: the vertical separators are clipped on a narrow sheet, so
+    /// the background is the only trustworthy reference for "the column's edge".
+    fn table_cell_positions() -> (Vec<(String, f32, f32)>, f32) {
+        let source = "| AAAAAAAAAAAAA | B | C |\n|:--|:-:|--:|\n| a | b | c |\n";
+        let context = egui::Context::default();
+        crate::fonts::install(&context);
+        let doc = Document::from_file("test.md".into(), source);
+        let mut state = ViewState::default();
+        let output = editor_frame(&context, &doc, &mut state, Vec::new());
+        let painted = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.job.text.clone(),
+                    text.pos.x,
+                    text.galley.rect.width(),
+                )),
+                _ => None,
+            })
+            .collect();
+        // The table's background is the widest rectangle on the sheet; the drop
+        // shadows and card fills are narrower.
+        let right_edge = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) => Some(rect.rect.right()),
+                _ => None,
+            })
+            .fold(f32::NEG_INFINITY, f32::max);
+        output.drop_without_applying_deltas();
+        (painted, right_edge)
+    }
+
+    #[test]
+    fn every_table_alignment_keeps_the_same_padding_on_both_sides() {
+        let (painted, border) = table_cell_positions();
+        let cell = |label: &str| {
+            painted
+                .iter()
+                .find(|(text, _, _)| text == label)
+                .map(|(_, x, width)| (*x, *width))
+                .unwrap_or_else(|| panic!("the {label:?} cell was not painted"))
+        };
+        assert!(border.is_finite(), "the table background was not painted");
+        let (_left_x, left_w) = cell("a");
+        let (_center_x, center_w) = cell("b");
+        let (right_x, right_w) = cell("c");
+        // The right-aligned cell is the one under test: its ink must stop one
+        // padding short of the table's right edge. Before the fix it stopped at the
+        // edge itself, because the paint position forgot to subtract the padding
+        // that the left column honours.
+        let right_padding = border - (right_x + right_w);
+        assert!(
+            (right_padding - TABLE_PAD_X).abs() < 0.5,
+            "right-aligned cell had {right_padding} padding, expected {TABLE_PAD_X} \
+             (border {border}, ink {}..{}, other columns {left_w} / {center_w})",
+            right_x,
+            right_x + right_w
+        );
+    }
+
+    #[test]
+    fn long_paragraphs_wrap_in_both_rendered_and_editable_views() {
+        let source = "a long paragraph with many words ".repeat(30);
+        let doc = Document::from_file("test.md".into(), &source);
+        for active in [false, true] {
+            let context = egui::Context::default();
+            crate::fonts::install(&context);
+            let mut state = ViewState::default();
+            if active {
+                state.begin_session(vec![0], &doc, &doc.blocks[0]);
+            }
+            let output = editor_frame(&context, &doc, &mut state, Vec::new());
+            let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == source => Some(text),
+                _ => None,
+            }).expect("paragraph was painted");
+            assert!(text.galley.rows.len() > 1, "active={active}");
+            assert!(text.galley.size().x <= 320.1, "active={active}: {:?}", text.galley.size());
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn focus_and_checkbox_actions_survive_a_simultaneous_blur_commit() {
+        for next in [
+            EditorAction::Focus { path: vec![0], caret: 0 },
+            EditorAction::ToggleTask { span: 0..8, checked: true },
+        ] {
+            let mut action = Some(next.clone());
+            merge_action(&mut action, EditorAction::Commit { span: 10..20, text: "edited".into() });
+            assert!(!matches!(action, Some(EditorAction::Commit { .. })));
+            let mut action = Some(EditorAction::Commit { span: 10..20, text: "edited".into() });
+            merge_action(&mut action, next);
+            assert!(!matches!(action, Some(EditorAction::Commit { .. })));
+        }
+    }
 
     #[test]
     fn char_to_byte_handles_cjk() {
@@ -2025,17 +2274,20 @@ mod tests {
 
     #[test]
     fn cache_keys_distinguish_inputs() {
-        let a = cache_key(Engine::Mermaid, "graph TD;A-->B", true, 15.0);
-        let b = cache_key(Engine::Mermaid, "graph TD;A-->B", false, 15.0);
-        let c = cache_key(Engine::PlantUml, "graph TD;A-->B", true, 15.0);
-        let d = cache_key(Engine::Mermaid, "graph TD;A-->C", true, 15.0);
+        let a = cache_key(Engine::Mermaid, "graph TD;A-->B", true, 15.0, 1.0);
+        let b = cache_key(Engine::Mermaid, "graph TD;A-->B", false, 15.0, 1.0);
+        let c = cache_key(Engine::PlantUml, "graph TD;A-->B", true, 15.0, 1.0);
+        let d = cache_key(Engine::Mermaid, "graph TD;A-->C", true, 15.0, 1.0);
         for (i, x) in [b, c, d].iter().enumerate() {
             assert_ne!(a, *x, "collision at index {i}");
         }
+        // The diagram font scale is an input too: changing it in the settings must
+        // produce a different key, otherwise the old drawing is cached forever.
+        assert_ne!(a, cache_key(Engine::Mermaid, "graph TD;A-->B", true, 15.0, 1.3));
         // Stability across calls matters for cache hits.
         assert_eq!(
             a,
-            cache_key(Engine::Mermaid, "graph TD;A-->B", true, 15.0)
+            cache_key(Engine::Mermaid, "graph TD;A-->B", true, 15.0, 1.0)
         );
     }
 }
@@ -2120,10 +2372,7 @@ mod repro_tests {
                     SAMPLE,
                 );
                 let mut view = ViewState::default();
-                let opts = RenderOpts {
-                    show_gutter: false,
-                    measure: 600.0,
-                };
+                let opts = RenderOpts { measure: 600.0, ..RenderOpts::default() };
                 // `CentralPanel::show` needs a parent `Ui`, which a headless pass
                 // does not have; build one directly over the screen rect.
                 let mut ui = egui::Ui::new(
