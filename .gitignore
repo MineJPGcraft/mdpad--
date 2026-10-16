@@ -1,0 +1,9 @@
+/target
+*.pdb
+*.ilk
+
+# Local config written by the app at runtime.
+mdpad-config.json
+
+# Scratch files from verification runs.
+ui-check.png
