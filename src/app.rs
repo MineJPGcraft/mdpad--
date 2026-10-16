@@ -854,53 +854,70 @@ impl App {
                 .show(ui, |ui| {
                     ui.horizontal_top(|ui| {
                         ui.add_space(geo.gutter);
-                        let (rect, _) = ui.allocate_exact_size(
-                            // `available_height` can be zero on the first frame,
-                            // before the window reports its size. A sheet of zero
-                            // height would clip all of its content away.
-                            egui::vec2(geo.width, ui.available_height().max(320.0)),
-                            egui::Sense::hover(),
-                        );
-                        // Shadow first, then the sheet, so the shadow reads as
-                        // falling behind the page rather than on top of it.
-                        paint_shadow(ui, rect, &theme);
-                        ui.painter()
-                            .rect_filled(rect, 3.0, theme.palette.paper.to_egui());
 
-                        ui.scope_builder(
+                        // Draw the content first, into a scope whose height is
+                        // unconstrained, then paint the sheet behind it using the
+                        // height the content actually needed. Sizing the sheet
+                        // from `available_height` instead would leave it shorter
+                        // than the document and clip the page mid-way down.
+                        let top = ui.available_rect_before_wrap().top();
+                        let width = geo.width;
+                        let inner_left = ui.available_rect_before_wrap().left()
+                            + (geo.width - geo.content) * 0.5;
+
+                        let mut content = ui.new_child(
                             egui::UiBuilder::new()
-                                .max_rect(rect)
+                                .max_rect(egui::Rect::from_min_size(
+                                    egui::pos2(inner_left, top + geo.pad_top),
+                                    egui::vec2(geo.content, f32::INFINITY),
+                                ))
                                 .layout(egui::Layout::top_down(egui::Align::Min)),
-                            |ui| {
-                                ui.add_space(geo.pad_top);
-                                ui.horizontal_top(|ui| {
-                                    ui.add_space((geo.width - geo.content) * 0.5);
-                                    ui.vertical(|ui| {
-                                        ui.set_width(geo.content);
-                                        if self.source_mode {
-                                            self.source_pane(ui);
-                                        } else {
-                                            let opts = RenderOpts {
-                                                show_gutter: self.config.show_gutter,
-                                                measure: geo.content,
-                                            };
-                                            if let Some(action) = edit::document_ui(
-                                                ui,
-                                                &mut self.view,
-                                                &self.doc,
-                                                &self.theme,
-                                                &opts,
-                                            ) {
-                                                self.handle_action(action);
-                                            }
-                                        }
-                                        // Trailing space so the sheet runs on past
-                                        // the last paragraph, as a real page does.
-                                        ui.add_space(geo.pad_bottom);
-                                    });
-                                });
-                            },
                         );
+                        content.set_width(geo.content);
+                        if self.source_mode {
+                            self.source_pane(&mut content);
+                        } else {
+                            let opts = RenderOpts {
+                                show_gutter: self.config.show_gutter,
+                                measure: geo.content,
+                            };
+                            if let Some(action) =
+                                edit::document_ui(
+                                    &mut content,
+                                    &mut self.view,
+                                    &self.doc,
+                                    &self.theme,
+                                    &opts,
+                                )
+                            {
+                                self.handle_action(action);
+                            }
+                        }
+
+                        // Height so far, plus the trailing margin that lets the
+                        // sheet run on past the last paragraph like a real page.
+                        let used = content.min_rect().height();
+                        let sheet_h = (geo.pad_top + used + geo.pad_bottom)
+                            // Never smaller than the viewport: a short document
+                            // should still fill the window, as Word's does.
+                            .max(ui.available_height().max(320.0));
+
+                        let sheet = egui::Rect::from_min_size(
+                            egui::pos2(ui.available_rect_before_wrap().left(), top),
+                            egui::vec2(width, sheet_h),
+                        );
+                        // Shadow and sheet go on the background layer so they
+                        // sit behind everything the content just drew.
+                        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                            egui::Order::Background,
+                            egui::Id::unique("mdp-page"),
+                        ));
+                        paint_shadow(&painter, sheet, &theme);
+                        painter.rect_filled(sheet, 3.0, theme.palette.paper.to_egui());
+
+                        // Reserve the space the sheet occupies so the scroll area
+                        // grows with the document rather than clipping it.
+                        ui.allocate_exact_size(egui::vec2(width, sheet_h), egui::Sense::hover());
                     });
                 });
         });
@@ -1131,13 +1148,13 @@ impl PageGeometry {
 /// egui has no shadow primitive, so the effect is faked with a few progressively
 /// larger, more transparent rounded rects around the sheet. Four layers is
 /// enough to read as a soft edge without the banding a hard offset would give.
-fn paint_shadow(ui: &egui::Ui, rect: egui::Rect, theme: &Theme) {
+fn paint_shadow(painter: &egui::Painter, rect: egui::Rect, theme: &Theme) {
     let base = theme.palette.paper_shadow;
     for (i, spread) in [2.0f32, 5.0, 9.0, 15.0].into_iter().enumerate() {
         // Alpha falls off with distance, so the layers blend outward.
         let alpha = (base.a as f32 * [0.30, 0.22, 0.14, 0.08][i]) as u8;
         let grow = rect.expand(spread);
-        ui.painter().rect_stroke(
+        painter.rect_stroke(
             grow,
             4.0 + spread,
             egui::Stroke::new(spread * 2.0, base.with_alpha(alpha).to_egui()),

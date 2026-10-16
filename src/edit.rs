@@ -181,15 +181,36 @@ struct BlockCtx<'a> {
 impl BlockCtx<'_> {
     /// Renders one block. Returns an action if the user did something.
     fn block_ui(&mut self, ui: &mut Ui, block: &Block, path: &[usize]) -> Option<EditorAction> {
-        // Generous vertical rhythm, larger before headings.
+        // Vertical rhythm.
+        //
+        // Word's paragraph spacing is generous, and a Markdown document needs
+        // more than most because blocks are visually distinct: a 6pt gap made
+        // callouts, code cards and the JSX/Markdoc blocks look welded together.
+        // The space is added *before* each block so the first paragraph does not
+        // inherit a gap from the top of the page.
         let before = match &block.kind {
-            BlockKind::Heading { level, .. } if *level <= 2 => 14.0,
-            BlockKind::Heading { .. } => 10.0,
-            BlockKind::Rule => 12.0,
+            // Headings need to stand clear of the text they introduce.
+            BlockKind::Heading { level, .. } if *level <= 2 => 26.0,
+            BlockKind::Heading { .. } => 20.0,
+            BlockKind::Rule => 20.0,
+            // Nothing is shown above front matter, so no leading gap.
             BlockKind::FrontMatter { .. } => 0.0,
-            _ => 6.0,
+            // Boxes get more air than plain paragraphs, or their borders touch.
+            BlockKind::Callout(_)
+            | BlockKind::Code { .. }
+            | BlockKind::Math { .. }
+            | BlockKind::MdxEsm { .. }
+            | BlockKind::MdxJsx { .. }
+            | BlockKind::MarkdocTag { .. }
+            | BlockKind::Html { .. } => 14.0,
+            _ => 10.0,
         };
-        if self.level == 0 {
+        // Inside a container (callout, JSX, Markdoc) the padding is the
+        // container's job, so nested blocks must not each add their own leading
+        // gap — otherwise the first child sits flush against the container's
+        // header while later ones drift away from it.
+        let nested = self.level > 0;
+        if !nested {
             ui.add_space(before);
         }
 
@@ -303,6 +324,7 @@ impl BlockCtx<'_> {
             self.inline_edit(ui, block, path, marker_len, inner_len, visual)
         } else {
             let source = self.doc.text.get(span.clone()).unwrap_or("");
+            let mut math = Vec::new();
             let job = inline_job(
                 source,
                 marker_len,
@@ -310,14 +332,21 @@ impl BlockCtx<'_> {
                 InlineMode::Wysiwyg,
                 self.theme,
                 visual,
+                Some(&mut math),
             );
             let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
             let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
+            // `painter.galley` consumes the `Arc`, but the math overlay needs it
+            // to resolve cursor positions, so keep a handle.
+            let placed = Arc::clone(&galley);
             ui.painter().galley(
                 rect.min,
                 galley,
                 self.theme.palette.text.to_egui(),
             );
+            // Typeset inline formulas over the text now that the galley knows
+            // where each placeholder landed.
+            paint_inline_math(ui.ctx(), ui.painter(), &placed, &math);
             if resp.clicked() {
                 return Some(EditorAction::Focus {
                     path: path.to_vec(),
@@ -346,6 +375,7 @@ impl BlockCtx<'_> {
         let render = move |ui: &Ui, buf: &dyn TextBuffer, wrap: f32| {
             let text = buf.as_str();
             let _ = caret_chars(ui, id);
+            let mut math = Vec::new();
             let job = inline_job(
                 text,
                 marker_len,
@@ -353,6 +383,7 @@ impl BlockCtx<'_> {
                 InlineMode::Wysiwyg,
                 &theme,
                 visual,
+                Some(&mut math),
             );
             let _ = wrap;
             ui.ctx().fonts_mut(|f| f.layout_job(job))
@@ -1014,6 +1045,7 @@ impl BlockCtx<'_> {
                         level: 0,
                         italic: false,
                     },
+                    None,
                 );
                 let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
                 let align = align.get(c).copied().unwrap_or(Align::None);
@@ -1071,13 +1103,14 @@ impl BlockCtx<'_> {
         children: &[Block],
     ) -> Option<EditorAction> {
         let accent = Rgba::hex(0xC792EA);
-        let pad = 10.0;
+        const PAD_X: f32 = 12.0;
+        const PAD_Y: f32 = 10.0;
         let index = ui.painter().add(egui::Shape::Noop);
         let mut action = None;
         let inner = ui.horizontal(|ui| {
-            ui.add_space(pad);
+            ui.add_space(PAD_X);
             ui.vertical(|ui| {
-                ui.set_width(ui.available_width() - pad);
+                ui.set_width((ui.available_width() - PAD_X).max(40.0));
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("<{name}>"))
@@ -1095,7 +1128,9 @@ impl BlockCtx<'_> {
                     }
                 });
                 if !self_closing && !children.is_empty() {
-                    ui.add_space(2.0);
+                    // A clear gap under the opening tag, so the children read as
+                    // the component's body rather than as part of the tag line.
+                    ui.add_space(10.0);
                     for (i, child) in children.iter().enumerate() {
                         let mut child_path = path.to_vec();
                         child_path.push(i);
@@ -1104,12 +1139,18 @@ impl BlockCtx<'_> {
                         }
                     }
                 }
+                // Bottom padding, so the body never touches the card's edge.
+                ui.add_space(PAD_Y);
             });
         });
         let rect = inner.response.rect;
         ui.painter().set(
             index,
-            egui::Shape::rect_filled(rect.expand2(egui::vec2(pad, 6.0)), 8.0, accent.with_alpha(0x14).to_egui()),
+            egui::Shape::rect_filled(
+                rect.expand2(egui::vec2(PAD_X, PAD_Y)),
+                8.0,
+                accent.with_alpha(0x14).to_egui(),
+            ),
         );
         action
     }
@@ -1131,13 +1172,14 @@ impl BlockCtx<'_> {
             MarkdocTagKind::Comment => self.theme.palette.text_faint,
             _ => Rgba::hex(0x4ADE80),
         };
-        let pad = 10.0;
+        const PAD_X: f32 = 12.0;
+        const PAD_Y: f32 = 10.0;
         let index = ui.painter().add(egui::Shape::Noop);
         let mut action = None;
         let inner = ui.horizontal(|ui| {
-            ui.add_space(pad);
+            ui.add_space(PAD_X);
             ui.vertical(|ui| {
-                ui.set_width(ui.available_width() - pad);
+                ui.set_width((ui.available_width() - PAD_X).max(40.0));
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(match kind {
@@ -1177,7 +1219,7 @@ impl BlockCtx<'_> {
                     });
                 });
                 if kind != MarkdocTagKind::Comment && !body.is_empty() {
-                    ui.add_space(2.0);
+                    ui.add_space(10.0);
                     for (i, child) in body.iter().enumerate() {
                         let mut child_path = path.to_vec();
                         child_path.push(i);
@@ -1186,12 +1228,18 @@ impl BlockCtx<'_> {
                         }
                     }
                 }
+                // Bottom padding, matching the top.
+                ui.add_space(PAD_Y);
             });
         });
         let rect = inner.response.rect;
         ui.painter().set(
             index,
-            egui::Shape::rect_filled(rect.expand2(egui::vec2(pad, 6.0)), 6.0, accent.with_alpha(0x12).to_egui()),
+            egui::Shape::rect_filled(
+                rect.expand2(egui::vec2(PAD_X, PAD_Y)),
+                6.0,
+                accent.with_alpha(0x12).to_egui(),
+            ),
         );
         let _ = block;
         action
@@ -1205,30 +1253,40 @@ impl BlockCtx<'_> {
         body: &str,
         accent: Rgba,
     ) -> Option<EditorAction> {
-        let pad = 10.0;
+        // The padding must be *inside* the allocated rect. Painting the card
+        // with `rect.expand2(..)` while the layout reserved only `rect` made
+        // neighbouring cards overlap: each one bled into the next block's space
+        // and the two borders ended up touching.
+        const PAD_X: f32 = 12.0;
+        const PAD_Y: f32 = 10.0;
+
         let index = ui.painter().add(egui::Shape::Noop);
         let inner = ui.horizontal(|ui| {
-            ui.add_space(pad);
+            ui.add_space(PAD_X);
             ui.vertical(|ui| {
-                ui.set_width(ui.available_width() - pad);
+                ui.set_width((ui.available_width() - PAD_X).max(40.0));
                 ui.label(
                     RichText::new(label)
                         .size(self.theme.typo.small())
                         .color(accent.to_egui()),
                 );
-                ui.add_space(2.0);
+                ui.add_space(4.0);
                 let job = code_job(body.trim_end(), self.theme, "");
                 let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
                 let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
                 ui.painter()
                     .galley(rect.min, galley, self.theme.palette.text.to_egui());
+                // Trailing pad keeps the code clear of the card's bottom edge.
+                ui.add_space(PAD_Y);
             });
         });
-        let rect = inner.response.rect;
         ui.painter().set(
             index,
             egui::Shape::rect_filled(
-                rect.expand2(egui::vec2(pad, 6.0)),
+                // Expand only to the left and up by the padding already consumed
+                // as layout space; the right and bottom are covered by the
+                // explicit padding added above.
+                inner.response.rect.expand2(egui::vec2(PAD_X, PAD_Y)),
                 6.0,
                 self.theme.palette.surface_alt.fade(0.5).to_egui(),
             ),
@@ -1318,6 +1376,34 @@ pub enum InlineMode {
 /// already drawn a real bullet, quote bar or heading style in their place, so
 /// painting the raw characters too would double them up. The following
 /// `inner_len` bytes are the inline content and are scanned for constructs.
+/// A run of inline math that needs to be painted over the text layout.
+///
+/// `LayoutJob` only accepts text, but real math needs rules for fractions,
+/// radicals and overlines. The span is therefore filled with a single
+/// placeholder character, and the typeset result is painted on top once the
+/// galley has told us where that character ended up.
+#[derive(Clone, Debug)]
+pub struct InlineMathSpan {
+    /// Character offset of the placeholder within the job's text.
+    pub char_index: usize,
+    /// The LaTeX source to typeset.
+    pub source: String,
+    /// Font size the formula should be laid out at.
+    pub size: f32,
+    /// Colour for the formula.
+    pub color: Rgba,
+}
+
+/// Builds the `LayoutJob` for a run of inline Markdown.
+///
+/// `marker_len` bytes at the start of `text` are the block's own marker (`## `,
+/// `- `, `> `). In WYSIWYG mode they are always hidden: the block renderer has
+/// already drawn a real bullet, quote bar or heading style in their place, so
+/// painting the raw characters too would double them up. The following
+/// `inner_len` bytes are the inline content and are scanned for constructs.
+///
+/// When `math_spans` is given, WYSIWYG-mode `$…$` runs are replaced by a
+/// placeholder and appended there so the caller can typeset over them.
 fn inline_job(
     text: &str,
     marker_len: usize,
@@ -1325,6 +1411,7 @@ fn inline_job(
     mode: InlineMode,
     theme: &Theme,
     visual: InlineVisual,
+    mut math_spans: Option<&mut Vec<InlineMathSpan>>,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let text_len = text.len();
@@ -1352,6 +1439,38 @@ fn inline_job(
                 .construct
                 .and_then(|id| scan.constructs.get(id))
                 .is_some_and(|c| c.is_delimiter(&span.range));
+
+            // In WYSIWYG, a math run is typeset over the text flow rather than
+            // printed as source. `tex::render` output is drawing primitives, not
+            // glyphs, so the job gets a zero-ink placeholder that marks where
+            // the formula belongs; the caller paints over it afterwards.
+            if mode == InlineMode::Wysiwyg && span.style.math && !is_delim {
+                if let Some(out) = math_spans
+                    .as_deref_mut()
+                {
+                    let source = span.text(text).trim().to_owned();
+                    let char_index = job.text.chars().count();
+                    let size = visual.size;
+                    let color = theme.palette.text;
+                    out.push(InlineMathSpan {
+                        char_index,
+                        source,
+                        size,
+                        color,
+                    });
+                    job.append(
+                        MATH_PLACEHOLDER,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: FontId::new(size * 0.6, family_of(false, false)),
+                            color: Color32::TRANSPARENT,
+                            ..Default::default()
+                        },
+                    );
+                    continue;
+                }
+            }
+
             let fmt = match mode {
                 // WYSIWYG: delimiters vanish, whatever the caret is doing.
                 InlineMode::Wysiwyg if is_delim => hidden_format(&marker_fmt),
@@ -1393,6 +1512,50 @@ fn inline_job(
     job
 }
 
+/// The character that stands in for an inline formula in the text job.
+///
+/// U+FFFC OBJECT REPLACEMENT CHARACTER: it has exactly one char index, so the
+/// mapping back to a screen position stays trivial, and no font is expected to
+/// have a visible glyph for it.
+const MATH_PLACEHOLDER: &str = "\u{FFFC}";
+
+/// Typesets the collected [`InlineMathSpan`]s over a laid-out galley.
+///
+/// Runs *after* the galley exists, because that is the only way to know where a
+/// placeholder landed. The placeholder is painted over, so it must be invisible
+/// in the first place.
+pub fn paint_inline_math(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    galley: &egui::Galley,
+    spans: &[InlineMathSpan],
+) {
+    // `pos_from_cursor` already returns absolute coordinates, so the galley's own
+    // placement is baked into the rect and needs no further offset.
+    if spans.is_empty() {
+        return;
+    }
+    let measure = EguiMeasure::new(ctx);
+    for span in spans {
+        if span.source.is_empty() {
+            continue;
+        }
+        // The placeholder's rect gives the insertion point and the row's
+        // baseline; the formula is drawn from that origin.
+        let cc = egui::text::CCursor::new(egui::text::CharIndex(span.char_index));
+        let rect = galley.pos_from_cursor(cc).min;
+        let laid = crate::tex::render(&span.source, span.size, span.color, &measure);
+        if laid.prims.is_empty() {
+            continue;
+        }
+        // Centre the formula on the placeholder's row so it sits on the same
+        // baseline as the surrounding text rather than at the top of the row.
+        let row_h = galley.rect.height().max(laid.size[1]);
+        let baseline_y = rect.y - (row_h - laid.size[1]) * 0.5;
+        gfx_egui::paint(ctx, painter, egui::pos2(rect.x, baseline_y), &laid.prims);
+    }
+}
+
 /// Inline highlighting for source mode.
 ///
 /// Source mode must show the real text, so every delimiter stays visible and the
@@ -1405,6 +1568,7 @@ pub fn source_inline_job(line: &str, theme: &Theme) -> egui::text::LayoutJob {
         InlineMode::Source,
         theme,
         InlineVisual::body(theme),
+        None,
     )
 }
 
@@ -1616,8 +1780,109 @@ mod tests {
                 level: 2,
                 italic: false,
             },
+            None,
         );
         assert_eq!(job.text, src);
+    }
+
+    #[test]
+    fn inline_math_is_typeset_rather_than_printed() {
+        // Regression guard: `$E = mc^2$` used to be painted as literal source
+        // text, because `tex::render` was never called on the inline path.
+        let theme = Theme::dark();
+        let src = "before $E = mc^2$ after";
+        let mut math = Vec::new();
+        let job = inline_job(
+            src,
+            0,
+            src.len(),
+            InlineMode::Wysiwyg,
+            &theme,
+            InlineVisual::body(&theme),
+            Some(&mut math),
+        );
+        assert_eq!(math.len(), 1, "no formula was recognised in {src:?}");
+        assert_eq!(math[0].source, "E = mc^2");
+        // The formula must not also be printed as text.
+        assert!(
+            !job.text.contains("E = mc^2"),
+            "formula leaked into the text job: {:?}",
+            job.text
+        );
+        let ph = MATH_PLACEHOLDER.chars().next().unwrap();
+        assert_eq!(
+            job.text.chars().filter(|c| *c == ph).count(),
+            1,
+            "expected exactly one placeholder in {:?}",
+            job.text
+        );
+    }
+
+    #[test]
+    fn inline_math_placeholders_are_indexed_correctly() {
+        // Two formulas on one line: each placeholder index must point at its own
+        // character, or the formulas get painted over each other.
+        let theme = Theme::dark();
+        let src = "a $x$ b $y$ c";
+        let mut math = Vec::new();
+        let job = inline_job(
+            src,
+            0,
+            src.len(),
+            InlineMode::Wysiwyg,
+            &theme,
+            InlineVisual::body(&theme),
+            Some(&mut math),
+        );
+        assert_eq!(math.len(), 2, "expected two formulas");
+        let chars: Vec<char> = job.text.chars().collect();
+        let ph = MATH_PLACEHOLDER.chars().next().unwrap();
+        for (i, span) in math.iter().enumerate() {
+            assert_eq!(
+                chars.get(span.char_index),
+                Some(&ph),
+                "span {i} does not point at its placeholder (job = {:?})",
+                job.text
+            );
+        }
+        assert_ne!(math[0].char_index, math[1].char_index);
+    }
+
+    #[test]
+    fn source_mode_keeps_math_as_source() {
+        // Source mode must show `$…$` verbatim; it is the raw text view.
+        let theme = Theme::dark();
+        let src = "E = $x^2$";
+        let job = source_inline_job(src, &theme);
+        assert!(
+            job.text.contains("$x^2$"),
+            "source mode lost the dollar signs: {:?}",
+            job.text
+        );
+    }
+
+    #[test]
+    fn inline_math_keeps_surrounding_text_intact() {
+        // The placeholder swap must not disturb the rest of the line.
+        let theme = Theme::dark();
+        let src = "**bold** and $x$";
+        let mut math = Vec::new();
+        let job = inline_job(
+            src,
+            0,
+            src.len(),
+            InlineMode::Wysiwyg,
+            &theme,
+            InlineVisual::body(&theme),
+            Some(&mut math),
+        );
+        assert_eq!(math.len(), 1);
+        assert!(
+            job.text.contains("bold"),
+            "emphasis text was lost: {:?}",
+            job.text
+        );
+        assert!(job.text.contains(" and "), "connector lost: {:?}", job.text);
     }
 
     #[test]
@@ -1634,6 +1899,7 @@ mod tests {
             InlineMode::Wysiwyg,
             &theme,
             InlineVisual::body(&theme),
+            None,
         );
         let marker: String = job
             .sections
@@ -1657,6 +1923,7 @@ mod tests {
             InlineMode::Wysiwyg,
             &theme,
             InlineVisual::body(&theme),
+            None,
         );
         let mut hidden = String::new();
         for s in &job.sections {
@@ -1682,6 +1949,7 @@ mod tests {
             InlineMode::Wysiwyg,
             &theme,
             InlineVisual::body(&theme),
+            None,
         );
         assert!(
             job.sections
@@ -1822,6 +2090,7 @@ mod repro_tests {
             InlineMode::Wysiwyg,
             theme,
             InlineVisual::body(theme),
+            None,
         );
         ctx.fonts_mut(|f| f.layout_job(job)).size().x
     }
