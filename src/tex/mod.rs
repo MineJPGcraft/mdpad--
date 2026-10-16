@@ -22,4 +22,8 @@
 pub mod layout;
 pub mod parse;
 
+// `MathRender` is the return type of [`render`]. Nothing inside the binary
+// names it directly (callers just use the value), but re-exporting it is what
+// makes this module's API coherent.
+#[allow(unused_imports)]
 pub use layout::{render, MathRender};

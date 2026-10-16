@@ -24,6 +24,10 @@ pub mod model;
 pub mod plantuml;
 
 pub use layout::{layout, DiagramRender};
+// The parsed IR is this module's central type: the front-ends return it and
+// `layout` consumes it. It is re-exported so callers never need to know which
+// submodule a type lives in.
+#[allow(unused_imports)]
 pub use model::Diagram;
 
 use crate::gfx::{Family, Measure, Rgba};

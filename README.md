@@ -1,0 +1,245 @@
+# MarkdownPad
+
+纯 Rust 实现的离线所见即所得 Markdown 编辑器，基于 egui 0.37。
+**单栏实时渲染——写的时候就是成品的样子，不需要点预览。**
+
+---
+
+## 运行
+
+```bash
+cargo run --release
+```
+
+或直接运行 `target/release/mdpad--.exe`。首次启动会自动载入一份示例文档，
+覆盖全部渲染特性，可直接用来检验效果。
+
+开发期用 `cargo run`（依赖已配置 `opt-level = 2`，否则字形整形与图表布局会慢到不可用）。
+
+```bash
+cargo test    # 170 个单元测试
+```
+
+---
+
+## 核心特性
+
+### 所见即所得，但不是所见即所得编辑器
+
+大多数 WYSIWYG 编辑器在内存里维护一棵 AST，导出时才序列化成 Markdown，
+于是「编辑的东西」和「存下来的东西」并不完全一致，源码往返容易走形。
+
+MarkdownPad 反过来：**你编辑的始终是 Markdown 源码本身**，没有任何隐藏的
+AST。渲染层是一个实时视图——它解析源码、决定每段怎么显示，并管理光标与
+选区在源码字节和屏幕位置之间的双向映射。
+
+所以：
+
+- 源码模式与渲染模式切换的是**同一份字符串**，不会丢内容、不会走形。
+- 在渲染视图里按退格删掉的，就是源码里那几个字符。
+- 任何无法解析的写法都不会被"悄悄改写"，它会原样留在文档里。
+
+代价是渲染层必须自己解决所见即所得编辑的核心难题：
+语法标记的隐藏与显形。下面就是这一部分。
+
+### 语法标记的自动隐藏
+
+行内扫描器（`src/doc/inline.rs`）把一行拆成**逐字节连续的样式片段**，
+同时记录每个语法构造的定界符范围（`*` 的位置、`[text](url)` 里方括号与
+圆括号的边界，等等）。
+
+渲染时按光标位置决定：
+
+- 光标**不在**这个构造内 → 只画内容，`**`、`[]()`、`$` 全部隐藏。
+- 光标**在**这个构造内 → 定界符以淡色显形，方便定位和编辑。
+
+于是平时看到的是干净的成品，光标一靠近，语法就浮出来。这个切换是逐
+构造独立的，同一段里两个强调不会一起显形。
+
+### 源码模式
+
+右下角的按钮一键切换。源码侧仍带语法高亮（标题、强调、代码围栏、链接、
+行内公式、图表围栏），并且与渲染视图共享同一份文本与光标。
+
+---
+
+## 渲染能力（全部本地实现）
+
+没有任何网络请求，没有外部渲染器，没有 Java 运行时。断网可用。
+
+### LaTeX
+
+Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
+（`src/tex/`，约 3400 行）。基线驱动的布局盒模型，全部字形宽度通过字体
+度量接口取得，没有硬编码。
+
+支持：
+
+| 类别 | 内容 |
+|---|---|
+| 希腊字母 | `\alpha` … `\omega`，含 `\varepsilon` `\vartheta` `\varphi` `\varpi` 等异体 |
+| 关系符 | `\leq \geq \neq \equiv \approx \cong \propto \preceq \in \notin \vdash \models \implies \iff` … |
+| 运算符 | `\pm \times \div \cdot \oplus \otimes \otimes \circ \bullet` 及各类大算符 |
+| 上下标 | `^` `_` 任意次序与嵌套；`\displaystyle` 下大算符取上下限，支持 `\limits` / `\nolimits` 覆盖 |
+| 分式 | `\frac` `\dfrac` `\tfrac`，分子分母上下居中于横线 |
+| 根式 | `\sqrt{x}` `\sqrt[n]{x}`，根号随内容伸缩 |
+| 定界符 | `\left…\right` 覆盖 `()[]{}||\langle\rangle` 上下限号族；另有 `\big` 系列 |
+| 环境 | `matrix pmatrix bmatrix vmatrix Bmatrix cases aligned align gathered array`，支持 `&` 与 `\\`、array 列格式与竖线 |
+| 样式 | `\text \mathrm \mathbf \mathit \mathsf \mathtt \mathbb \mathcal \mathscr \mathfrak \operatorname` |
+| 重音 | `\hat \bar \overline \tilde \dot \ddot \vec \check \breve \acute \grave` |
+| 间距 | `\, \; \: \! \quad \qquad \thinspace \ `，按 TeX 规则区分关系符（0.2778em）与二元运算符（0.2222em） |
+
+字体直接取自系统：`Cambria Math`（`cambria.ttc` 的第 1 个字面）作为数学字体，
+微软雅黑兜底中文，`\mathbb` 走 Unicode 双线体字形（`\mathbb{R}` → `ℝ`）。
+
+未识别的命令按源码原样渲染并降低不透明度，同时记入警告列表——不崩溃，
+也不悄悄吞掉。
+
+### Mermaid
+
+自研解析器（`src/diagram/mermaid.rs`，约 2400 行）+ 分层布局
+（`layout.rs`，约 2500 行），支持：
+
+- **flowchart / graph** — TD/TB/BT/LR/RL 六种方向；13 种节点形状
+  （矩形、圆角、体育场、圆、双圆、六边形、平行四边形、圆柱、不对称形…）；
+  实线/虚线/粗线箭头，`--x` `--o` `<-->` 等箭头；带标签的边；
+  链式边 `A --> B --> C`；`&` 扇出扇入（自动取笛卡尔积）；`subgraph`
+  嵌套；v11 的 `@{ shape: rect, label: "x" }` 语法。
+- **sequenceDiagram** — `actor` / `participant` 别名、全部箭头类型、
+  激活/失活（`+`/`-` 后缀与独立语句）、四种 `Note` 位置写法、
+  `loop`/`alt`/`else`/`opt`/`par`/`break` 分块、`==` 分节线、`...` 延时、
+  `autonumber`。
+- **pie** — 标签可加引号可裸写，`showData` 控制数值显示。
+- **classDiagram** — 类体按「字段 / 方法」自动分格，`<<interface>>`
+  `<<abstract>>` 标记，全套继承与依赖关系箭头，命名空间。
+- **stateDiagram** — `[*]` 起始/终止圆点（同一文件出现两次会自动区分
+  起点与终点）、`state "描述" as X`、复合状态。
+- **erDiagram** — 实体属性格、基数关系。
+
+### PlantUML
+
+同样自研（`plantuml.rs`，约 2350 行），复用同一套 IR 与绘制层：
+
+- **时序图**（主力支持）— `participant`/`actor`/`boundary`/`control`/
+  `entity`/`database`/`collections`/`queue` 七种参与者类型；
+  消息箭头含 `->` `->>` `-->>` `->x` `->o` 与全部反向形式 `←` `<->`；
+  `note over A, B` 多行块；`alt`/`else`/`opt`/`loop`/`par`/`break`/
+  `critical`/`group`/`rect`；`==` 分节线；`autonumber`。
+- **类图** — `abstract class` / `interface` / `enum` / 立体标记，
+  成员按字段与方法分格，继承/依赖/组合/聚合全套关系，多重性，
+  `package`/`namespace` 嵌套。
+- **用例图 / 组件图**、**状态图**、**ER / IE**。
+
+### 提醒框：四种语法
+
+同一套模型，**双向**支持四种主流写法，可解析也可序列化：
+
+| 风格 | 写法 |
+|---|---|
+| GitHub | `> [!NOTE]` `> [!TIP]` `> [!WARNING]` `> [!IMPORTANT]` `> [!CAUTION]` |
+| Obsidian | `> [!note]` `> [!tip]` `> [!info]` `> [!warning]` `> [!danger]` |
+| VitePress | `::: tip 标题` … `:::`（另有 VitePress 独有的 `::: details`） |
+| Docusaurus | `:::note` … `:::`（另有 Docusaurus 独有的 `::: caution` `::: admonition`） |
+
+变体统一为 7 类：Note / Tip / Info / Warning / Danger / Details / Caution，
+各自有固定的配色与图标。
+
+**判定规则是按块独立的**，不是整篇统一：文档里同时出现 `::: tip`
+（VitePress 惯例，带空格）和 `:::note`（Docusaurus 惯例，不带空格）时，
+两者能被正确区分，不会因为看到第一个 `:::` 就把后面全判成同一种。
+遇到只有两种共有关键词（`tip`/`info`/`warning`/`danger`）无法区分的情况，
+若文档内还有任一方的独有语法，则用它决定整篇；都没有则默认 VitePress。
+
+设置里可指定导出风格，转换是实打实的语法换写（`convert_callout`）。
+
+### MDX 与 Markdoc
+
+按扩展名自动识别（`.mdx` / `.markdoc`），状态栏显示当前文档类型。
+
+- **MDX** — `import` / `export` 语句渲染为语义化的组件块（不当作普通段落）；
+  JSX 标签 `<Foo />`、`<Foo>…</Foo>` 成对识别为组件块，内部 Markdown
+  照常渲染。
+- **Markdoc** — `{% tag %}` / `{% tag attr="x" %}` 单标签、`{% #if %}`
+  等逻辑块，配对标签内的内容正常渲染。
+
+两者都能正确显示、正确编辑，并保留原始源码写法。
+
+---
+
+## 快捷键
+
+| 操作 | 快捷键 |
+|---|---|
+| 源码模式切换 | `Ctrl+\` |
+| 保存 | `Ctrl+S` |
+| 另存为 | `Ctrl+Shift+S` |
+| 打开 | `Ctrl+O` |
+| 新建 | `Ctrl+N` |
+| 导出 HTML | `Ctrl+E` |
+| 加粗 / 斜体 | `Ctrl+B` / `Ctrl+I` |
+| 插入链接 | `Ctrl+K` |
+| 查找 | `Ctrl+F` |
+
+工具栏提供标题级别、粗斜体、删除线、行内代码、引用、有序/无序/任务列表、
+代码围栏、表格、分割线、提醒框（7 种变体 × 4 种语法）、图表（3 种引擎）、
+数学（行内/块级）、MDX 组件、Markdoc 标签的插入。
+
+---
+
+## 代码结构
+
+```
+src/
+  gfx.rs              渲染无关的绘图图元与文本度量契约（引擎层不碰 egui）
+  gfx_egui.rs         gfx → egui 的桥接层，全项目唯一直接画图元的地方
+  theme.rs            主题：配色、字号阶、行高、7 类提醒框外观
+  fonts.rs            系统字体挂载（按 ttc face 索引精确挂载）
+  config.rs           持久化设置
+
+  doc/
+    model.rs          Document、Block/BlockKind、提醒框模型、字数统计
+    block.rs          块级解析器：标题/列表/表格/围栏/提醒框/MDX/Markdoc
+    inline.rs         行内扫描器：样式片段 + 构造定界符范围
+
+  tex/                LaTeX 排版引擎
+    parse.rs          分词器与 AST
+    layout.rs         基线驱动布局 + 图元生成
+
+  diagram/
+    model.rs          图表 IR（Graph / Sequence / Pie 三个变体）
+    mermaid.rs        Mermaid 前端
+    plantuml.rs       PlantUML 前端
+    layout.rs         分层布局 / 时序图布局 / 饼图布局
+    draw.rs           图元生成
+
+  edit.rs             就地编辑核心：块级渲染、光标映射、语法标记显隐
+  app.rs              应用外壳：面板、工具栏、状态栏、文件操作、设置
+```
+
+分层原则：**引擎层完全不接触 egui**。`gfx.rs` 定义了平台无关的
+`Prim` / `Measure` 抽象，LaTeX 引擎与图表引擎只依赖它，因此它们可以
+脱离 GUI 独立测试（170 个测试大部分跑在这一层）。egui 只出现在
+`gfx_egui.rs`（绘制桥接）、`edit.rs`（控件与光标）、`app.rs`（外壳）三处。
+
+新增渲染能力的路径通常是：往 `gfx.rs` 加图元 → 引擎层产出图元 → 在
+`edit.rs` 里把图元塞进一个块。引擎层不需要任何改动。
+
+---
+
+## 已知边界
+
+诚实说明当前没有覆盖的部分：
+
+- **LaTeX** 是常用子集，不是 TeX 的完整实现。`array` 的列格式支持有限；
+  `\frac` 不支持行内自动缩放；连字符、字体微调（`\!` 之外的负间距）
+  等 TeX 细节未做。`\mathbb` 对 Unicode 无对应字形的字母会退化为下划线。
+- **Mermaid / PlantUML** 覆盖了常用语法，但主题（`classDef`、皮肤参数）
+  只解析不生效，绘制采用编辑器统一配色。时序图 activation 条按语句
+  配对，遇到不配对的 `deactivate` 会安全忽略而非报错。
+- **表格**可正常渲染与编辑，但不是所见即所得的单元格网格——表格整块
+  通过「编辑表格源码」进入源码态编辑，因为 Markdown 表格的行内语法
+  很容易在直接改列宽时被破坏。
+- **MDX / Markdoc** 的语义块能正确识别与往返，但只渲染其结构，不执行
+  MDX 组件代码，也不求值 Markdoc 逻辑表达式——离线编辑器里没有运行时。
+- **撤销**只做单级（整份文档快照），没有撤销栈。跨会话的自动保存间隔
+  可在设置中调整。
