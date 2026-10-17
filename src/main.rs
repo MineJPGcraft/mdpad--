@@ -34,8 +34,9 @@ fn main() -> eframe::Result<()> {
     // it where it can be read back.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let path = app::App::report_path().with_file_name("mdpad-panic.log");
-        let _ = std::fs::write(&path, format!("{info}\n"));
+        if let Some(path) = app::App::report_path().map(|p| p.with_file_name("mdpad-panic.log")) {
+            let _ = std::fs::write(&path, format!("{info}\n"));
+        }
         previous(info);
     }));
 

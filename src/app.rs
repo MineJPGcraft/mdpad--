@@ -976,6 +976,8 @@ impl App {
         let theme = self.theme;
         let geo = PageGeometry::resolve(ui.available_width());
         egui::CentralPanel::default_margins().show(ui, |ui| {
+            let scroll_id = ui.make_persistent_id(doc_scroll_salt(&self.doc.display_path()))
+                .with(self.session);
             egui::ScrollArea::vertical()
                 // The id is scoped to *this session*, not just to the document.
                 // egui's memory — including scroll offsets — is persisted to disk by
@@ -1062,20 +1064,31 @@ impl App {
                         painter.rect_filled(sheet, 3.0, theme.palette.paper.to_egui());
 
                         // Reserve the sheet's space so the scroll area grows with the
-                        // document rather than clipping it. The height is measured
-                        // from the content itself, never from the scrolled `top`:
-                        // deriving it from `top` would make the scrollable area grow
-                        // by the current offset every frame, and egui would then let
-                        // a smooth-scroll animation chase the page further down for
-                        // as long as it kept repainting — leaving the page parked
-                        // past the end of the document, which is the blank-page
-                        // failure.
-                        ui.allocate_exact_size(egui::vec2(width, sheet_h), egui::Sense::hover());
+                        // document rather than clipping it.
+                        //
+                        // The reservation is expressed in the layout's own coordinate
+                        // space — the sheet's top is the layout's cursor, and the sheet
+                        // is `sheet_h` tall — so it contributes exactly `sheet_h` to the
+                        // scroll content, independent of the current scroll offset.
+                        // Reserving from an offset-shifted rect instead would add the
+                        // offset to the content height every frame; egui would then keep
+                        // extending the scrollable range and let the view drift to the
+                        // very bottom, which is the blank-page failure.
+                        let reserved = egui::Rect::from_min_size(
+                            egui::pos2(ui.cursor().left(), sheet.top() - ui.min_rect().top()),
+                            egui::vec2(width, sheet_h),
+                        );
+                        ui.allocate_rect(reserved, egui::Sense::hover());
 
-                        // `top` is the viewport's top edge and the content starts
-                        // `pad_top` below it, so a large gap means the page has been
-                        // scrolled out of view — the blank-page failure.
-                        if self.should_write_report(content.min_rect().top(), top + geo.pad_top) {
+                        // The report fires while the first frames are painted and
+                        // whenever the viewport has scrolled away from the top — the
+                        // failure this report exists to explain. The scroll state is
+                        // read back rather than inferred from painted content, so the
+                        // report still lands when nothing painted at all.
+                        let scrolled = egui::scroll_area::State::load(ui.ctx(), scroll_id)
+                            .map(|s| s.clamped_offset().y)
+                            .unwrap_or(0.0);
+                        if self.should_write_report(scrolled) {
                             self.log_startup_diagnostics(ui, &geo, content_width, sheet, &content);
                         }
                     });
@@ -1090,28 +1103,36 @@ impl App {
     /// report exists to explain. That keeps it free in normal use and
     /// self-capturing when the bug comes back, which matters because a blank page
     /// in a real window is not reproducible headlessly.
-    fn should_write_report(&mut self, content_top: f32, viewport_top: f32) -> bool {
+    fn should_write_report(&mut self, scrolled: f32) -> bool {
         let frames = self.diag_frames.get();
         self.diag_frames.set(frames + 1);
         if frames < 3 {
             return true;
         }
-        // The document surface's content starts below the viewport's top edge; if
-        // it has drifted far above it, every line is off screen.
-        content_top < viewport_top - 200.0
+        // Any non-trivial offset means the page is not showing its top, which is
+        // the condition worth recording.
+        scrolled.abs() > 1.0
     }
 
     /// Where the diagnostic report goes.
     ///
     /// `%TEMP%` rather than the config directory: during a "the page is blank and
     /// there is no log either" hunt, the log has to be somewhere the user can find
-    /// in one step. Tests point this at their own file so they do not fight over
-    /// one shared path.
-    pub fn report_path() -> PathBuf {
+    /// in one step.
+    ///
+    /// Returns `None` when no path is configured, which is the default under
+    /// `cfg(test)`: a test that renders the shell must not clobber the log a real
+    /// run left behind, and tests that care about the report set their own path
+    /// with [`set_report_path`].
+    pub fn report_path() -> Option<PathBuf> {
         REPORT_PATH.with(|p| {
-            p.borrow()
-                .clone()
-                .unwrap_or_else(|| std::env::temp_dir().join("mdpad-startup.log"))
+            p.borrow().clone().or_else(|| {
+                if cfg!(test) {
+                    None
+                } else {
+                    Some(std::env::temp_dir().join("mdpad-startup.log"))
+                }
+            })
         })
     }
 
@@ -1139,6 +1160,7 @@ impl App {
              window size   {:?}\n\
              page          width {:.1} gutter {:.1} pad_top {:.1} sheet {sheet:?}\n\
              content       column {content_width:.1} rect {:?}\n\
+             viewport top  {:.1}  (negative means the page is scrolled away)\n\
              theme         dark {} text {:?} paper {:?}\n\
              fonts         {}\n\
              blocks        {}\n",
@@ -1150,6 +1172,7 @@ impl App {
             geo.gutter,
             geo.pad_top,
             content.min_rect(),
+            ui.available_rect_before_wrap().top(),
             self.theme.dark,
             self.theme.palette.text.to_array(),
             self.theme.palette.paper.to_array(),
@@ -1160,7 +1183,9 @@ impl App {
             report.push_str(&line);
             report.push('\n');
         }
-        let path = Self::report_path();
+        let Some(path) = Self::report_path() else {
+            return;
+        };
         if std::fs::write(&path, report).is_ok() {
             self.startup_log.set(Some(path));
         }
@@ -2679,15 +2704,14 @@ mod tests {
         let mut app = test_app(SAMPLE);
         // First three frames always report, so burn them off.
         for _ in 0..3 {
-            assert!(app.should_write_report(-5000.0, -5000.0));
+            assert!(app.should_write_report(0.0));
         }
         assert!(
-            !app.should_write_report(-5000.0, -5000.0),
-            "a healthy frame must not write a report"
+            !app.should_write_report(0.0),
+            "an unscrolled frame must not write a report"
         );
-        // Content 300pt above where it belongs: every line is off screen.
         assert!(
-            app.should_write_report(-400.0, 0.0),
+            app.should_write_report(400.0),
             "a scrolled-away page must write a report"
         );
     }
@@ -2851,6 +2875,66 @@ mod tests {
             on_screen > 0,
             "scrolling left the page with no text on screen: {tops:?}"
         );
+    }
+
+    /// The viewport must stay at the top of the document when nothing scrolls it.
+    ///
+    /// No user input, no focus request, no wheel: whatever offset the scroll area
+    /// ends up holding is one egui produced on its own. The blank-page report had a
+    /// viewport top of -2876 with `active None`, so this is the invariant that was
+    /// actually violated.
+    ///
+    /// The window also starts at eframe's 1320x900 and the user maximises it, so
+    /// the first frames run at a different size than the settled one.
+    #[test]
+    fn the_viewport_does_not_scroll_itself() {
+        let context = egui::Context::default();
+        let mut app = test_app(SAMPLE);
+        app.fonts = crate::fonts::install(&context);
+        let mut frame = eframe::Frame::_new_kittest();
+        for pass in 0..20 {
+            // Degenerate, then the launch size, then the maximised size.
+            let size = match pass {
+                0 => egui::vec2(0.0, 0.0),
+                1 => egui::vec2(1.0, 1.0),
+                2 => egui::vec2(640.0, 480.0),
+                _ => egui::vec2(1440.0, 829.5),
+            };
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let out = context.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |context| {
+                    let mut ui = egui::Ui::new(
+                        context.clone(),
+                        egui::Id::unique("mdp-root"),
+                        egui::UiBuilder::new()
+                            .max_rect(screen)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    eframe::App::ui(&mut app, &mut ui, &mut frame);
+                },
+            );
+            let xs: Vec<f32> = out
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.job.text.contains("这是一个") => {
+                        Some(text.visual_bounding_rect().top())
+                    }
+                    _ => None,
+                })
+                .collect();
+            out.drop_without_applying_deltas();
+            for top in xs {
+                assert!(
+                    top > -10.0,
+                    "the viewport scrolled itself on pass {pass} ({size:?}): paragraph top {top}"
+                );
+            }
+        }
     }
 
     #[test]
