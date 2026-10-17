@@ -2937,6 +2937,74 @@ mod tests {
         }
     }
 
+    /// Every painted text run must also survive tessellation.
+    ///
+    /// The field report is geometry that is *correct* — every paragraph at the right
+    /// y, no scroll offset — on a window that is nonetheless blank. Painting and
+    /// tessellating are different steps: a shape can be queued correctly and still
+    /// produce no vertices, which is what happens when a clip rect is degenerate or
+    /// the font atlas never gets a texture. Rect shapes (the sheet) survive that,
+    /// text does not, which is exactly "the paper is there and the text is gone".
+    #[test]
+    fn painted_text_survives_tessellation_on_a_2x_display() {
+        let context = egui::Context::default();
+        let mut app = test_app(SAMPLE);
+        app.fonts = crate::fonts::install(&context);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 829.5));
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = context.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |context| {
+                // The reporter's display is 200%.
+                context.set_pixels_per_point(2.0);
+                let mut ui = egui::Ui::new(
+                    context.clone(),
+                    egui::Id::unique("mdp-root"),
+                    egui::UiBuilder::new()
+                        .max_rect(screen)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                eframe::App::ui(&mut app, &mut ui, &mut frame);
+            },
+        );
+
+        // Shapes first: the renderer queued the document text.
+        let queued = output
+            .shapes
+            .iter()
+            .filter(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => {
+                    !text.galley.job.text.trim().is_empty()
+                        && screen.contains(text.visual_bounding_rect().center())
+                }
+                _ => false,
+            })
+            .count();
+        assert!(queued > 10, "only {queued} text runs were queued");
+
+        // Then vertices: those shapes must actually produce geometry on screen.
+        let prims = context.tessellate(output.shapes.clone(), output.pixels_per_point);
+        let mut text_vertices = 0usize;
+        let mut clipped_away = 0usize;
+        for prim in &prims {
+            if let egui::epaint::Primitive::Mesh(mesh) = &prim.primitive {
+                if mesh.indices.is_empty() {
+                    clipped_away += 1;
+                    continue;
+                }
+                text_vertices += mesh.vertices.len();
+            }
+        }
+        output.drop_without_applying_deltas();
+        assert!(
+            text_vertices > 0,
+            "no vertices were produced at all ({clipped_away} empty meshes)"
+        );
+    }
+
     #[test]
     fn html_export_mentions_all_block_families() {
         let doc = Document::from_file("t.md".into(), SAMPLE);
