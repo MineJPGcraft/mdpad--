@@ -641,6 +641,26 @@ impl MarkdocTagKind {
     }
 }
 
+/// Short machine-readable name for a block kind, for diagnostics.
+pub fn kind_label(kind: &BlockKind) -> &'static str {
+    match kind {
+        BlockKind::Heading { .. } => "heading",
+        BlockKind::Paragraph { .. } => "paragraph",
+        BlockKind::ListItem { .. } => "list-item",
+        BlockKind::Quote { .. } => "quote",
+        BlockKind::Callout(_) => "callout",
+        BlockKind::Code { .. } => "code",
+        BlockKind::Math { .. } => "math",
+        BlockKind::Table { .. } => "table",
+        BlockKind::Rule => "rule",
+        BlockKind::Html { .. } => "html",
+        BlockKind::FrontMatter { .. } => "front-matter",
+        BlockKind::MdxEsm { .. } => "mdx-esm",
+        BlockKind::MdxJsx { .. } => "mdx-jsx",
+        BlockKind::MarkdocTag { .. } => "markdoc",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Document
 // ---------------------------------------------------------------------------

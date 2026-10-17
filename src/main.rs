@@ -29,6 +29,16 @@ fn main() -> eframe::Result<()> {
     )
     .init();
 
+    // A panic inside the render path is swallowed by the event loop: the window
+    // stays open but stops drawing, which looks exactly like a blank page. Record
+    // it where it can be read back.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = app::App::report_path().with_file_name("mdpad-panic.log");
+        let _ = std::fs::write(&path, format!("{info}\n"));
+        previous(info);
+    }));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1320.0, 900.0])

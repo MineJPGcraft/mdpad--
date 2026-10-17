@@ -23,6 +23,18 @@ use crate::theme::Theme;
 /// How many undo snapshots to keep.
 const UNDO_LIMIT: usize = 200;
 
+thread_local! {
+    /// Overrides where the diagnostic report is written; tests set their own path.
+    static REPORT_PATH: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Points the diagnostic report at `path` for this thread, returning the previous
+/// value so a caller can restore it.
+fn set_report_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    REPORT_PATH.with(|p| std::mem::replace(&mut *p.borrow_mut(), path))
+}
+
 /// One undo step: the whole document text plus its path.
 struct Snapshot {
     text: String,
@@ -49,9 +61,30 @@ pub struct App {
     last_title: String,
     /// Pending error/notice text shown in the status bar.
     status_note: Option<String>,
+    /// Where the first frames' diagnostic report was written, if it was.
+    ///
+    /// A cell, not a plain field: the report is written from the render path,
+    /// which only has `&self`.
+    startup_log: std::cell::Cell<Option<PathBuf>>,
+    /// Frames painted so far, so the diagnostic report runs once per session.
+    diag_frames: std::cell::Cell<u32>,
+    /// Identifies this launch, so persisted view state is not restored across runs.
+    session: u64,
 }
 
 impl App {
+    /// Identifies this launch, so persisted view state is not restored across runs.
+    ///
+    /// Nanoseconds since the epoch, which differs on every run: a fixed value would
+    /// be persisted by eframe and restored on the next launch, which is exactly the
+    /// bug this guards against.
+    pub fn session_id() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+
     /// Builds the application, installing fonts and loading settings.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = Config::load();
@@ -90,6 +123,9 @@ impl App {
             force_quit: false,
             last_title: String::new(),
             status_note: Some(ready),
+            startup_log: std::cell::Cell::new(None),
+            diag_frames: std::cell::Cell::new(0),
+            session: Self::session_id(),
         }
     }
 
@@ -895,6 +931,17 @@ impl App {
                                 .color(self.theme.palette.accent.to_egui()),
                         );
                     }
+                    // One-shot: the first frames write a geometry report, and the
+                    // status bar says where it went so a blank page can be
+                    // diagnosed without guessing at the window's real state.
+                    if let Some(path) = self.startup_log.take() {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("诊断报告：{}", path.display()))
+                                .size(11.0)
+                                .color(self.theme.palette.text_faint.to_egui()),
+                        );
+                    }
 
                     // ---- bottom-right: the source-mode toggle ----
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -930,6 +977,21 @@ impl App {
         let geo = PageGeometry::resolve(ui.available_width());
         egui::CentralPanel::default_margins().show(ui, |ui| {
             egui::ScrollArea::vertical()
+                // The id is scoped to *this session*, not just to the document.
+                // egui's memory — including scroll offsets — is persisted to disk by
+                // eframe and restored on the next launch. A stored offset is in
+                // points, but whether it is valid depends on the content height,
+                // which is only known after layout; a value written by a
+                // differently sized window (or by a smooth-scroll animation that
+                // overshot) can park the page past the end of the document, where
+                // every line sits above the viewport while the sheet — painted at
+                // full document height into its own background layer — still paints.
+                // The user sees a completely blank page.
+                //
+                // Scoping to the session makes that unreachable: the editor always
+                // opens a document at the top, while scrolling within the running
+                // session still works normally.
+                .id_salt((doc_scroll_salt(&self.doc.display_path()), self.session))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.horizontal_top(|ui| {
@@ -977,6 +1039,9 @@ impl App {
 
                         // Height so far, plus the trailing margin that lets the
                         // sheet run on past the last paragraph like a real page.
+                        // `content.min_rect()` starts at the sheet's top padding, so
+                        // its height is measured from there; only the bottom margin
+                        // is added on top of it.
                         let used = content.min_rect().height();
                         let sheet_h = (geo.pad_top + used + geo.pad_bottom)
                             // Never smaller than the viewport: a short document
@@ -996,12 +1061,109 @@ impl App {
                         paint_shadow(&painter, sheet, &theme);
                         painter.rect_filled(sheet, 3.0, theme.palette.paper.to_egui());
 
-                        // Reserve the space the sheet occupies so the scroll area
-                        // grows with the document rather than clipping it.
+                        // Reserve the sheet's space so the scroll area grows with the
+                        // document rather than clipping it. The height is measured
+                        // from the content itself, never from the scrolled `top`:
+                        // deriving it from `top` would make the scrollable area grow
+                        // by the current offset every frame, and egui would then let
+                        // a smooth-scroll animation chase the page further down for
+                        // as long as it kept repainting — leaving the page parked
+                        // past the end of the document, which is the blank-page
+                        // failure.
                         ui.allocate_exact_size(egui::vec2(width, sheet_h), egui::Sense::hover());
+
+                        // `top` is the viewport's top edge and the content starts
+                        // `pad_top` below it, so a large gap means the page has been
+                        // scrolled out of view — the blank-page failure.
+                        if self.should_write_report(content.min_rect().top(), top + geo.pad_top) {
+                            self.log_startup_diagnostics(ui, &geo, content_width, sheet, &content);
+                        }
                     });
                 });
         });
+    }
+
+    /// Whether this frame should write the diagnostic report.
+    ///
+    /// Written on the first few frames (a snapshot of a healthy startup) and then
+    /// whenever the document has been scrolled out of view — the failure this
+    /// report exists to explain. That keeps it free in normal use and
+    /// self-capturing when the bug comes back, which matters because a blank page
+    /// in a real window is not reproducible headlessly.
+    fn should_write_report(&mut self, content_top: f32, viewport_top: f32) -> bool {
+        let frames = self.diag_frames.get();
+        self.diag_frames.set(frames + 1);
+        if frames < 3 {
+            return true;
+        }
+        // The document surface's content starts below the viewport's top edge; if
+        // it has drifted far above it, every line is off screen.
+        content_top < viewport_top - 200.0
+    }
+
+    /// Where the diagnostic report goes.
+    ///
+    /// `%TEMP%` rather than the config directory: during a "the page is blank and
+    /// there is no log either" hunt, the log has to be somewhere the user can find
+    /// in one step. Tests point this at their own file so they do not fight over
+    /// one shared path.
+    pub fn report_path() -> PathBuf {
+        REPORT_PATH.with(|p| {
+            p.borrow()
+                .clone()
+                .unwrap_or_else(|| std::env::temp_dir().join("mdpad-startup.log"))
+        })
+    }
+
+    /// Writes one report describing the geometry the renderer actually used.
+    ///
+    /// A blank page in a real window is not reproducible headlessly, so the app
+    /// records what it sees instead: window size, pixel ratio, the sheet rect and
+    /// what the renderer painted. See [`Self::report_path`] for where it lands.
+    fn log_startup_diagnostics(
+        &self,
+        ui: &egui::Ui,
+        geo: &PageGeometry,
+        content_width: f32,
+        sheet: egui::Rect,
+        content: &egui::Ui,
+    ) {
+        let ctx = ui.ctx();
+        let screen = ctx.input(|i| i.viewport_rect());
+        let mut report = String::new();
+        report.push_str(&format!(
+            "MarkdownPad startup report — frame {}\n\
+             screen_rect   {screen:?}\n\
+             pixels_per_point {}\n\
+             available     {:?}\n\
+             window size   {:?}\n\
+             page          width {:.1} gutter {:.1} pad_top {:.1} sheet {sheet:?}\n\
+             content       column {content_width:.1} rect {:?}\n\
+             theme         dark {} text {:?} paper {:?}\n\
+             fonts         {}\n\
+             blocks        {}\n",
+            self.diag_frames.get(),
+            ctx.pixels_per_point(),
+            ui.available_rect_before_wrap(),
+            ctx.input(|i| i.viewport().inner_rect),
+            geo.width,
+            geo.gutter,
+            geo.pad_top,
+            content.min_rect(),
+            self.theme.dark,
+            self.theme.palette.text.to_array(),
+            self.theme.palette.paper.to_array(),
+            self.fonts.summary(),
+            self.doc.blocks.len(),
+        ));
+        for line in edit::diag::take() {
+            report.push_str(&line);
+            report.push('\n');
+        }
+        let path = Self::report_path();
+        if std::fs::write(&path, report).is_ok() {
+            self.startup_log.set(Some(path));
+        }
     }
 
 
@@ -1172,6 +1334,8 @@ impl App {
 
     fn window_title(&mut self, ctx: &egui::Context) {
         let dirty = if self.doc.dirty { "• " } else { "" };
+        // A clean title in normal use; the diagnostic report's path is surfaced in
+        // the status bar instead, and only when a report was actually written.
         let title = format!("{dirty}{} — MarkdownPad", self.doc.display_name());
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1321,6 +1485,23 @@ fn paint_shadow(painter: &egui::Painter, rect: egui::Rect, theme: &Theme) {
             egui::StrokeKind::Outside,
         );
     }
+}
+
+/// Salt for the document surface's scroll area.
+///
+/// Keyed by the document, **not** a constant. The scroll offset lives in egui's
+/// memory, which eframe persists to `app.ron` and restores on the next run, so a
+/// constant salt lets a stale offset from a previous session apply to whatever
+/// document happens to be open now. When that offset points past the end of the
+/// document, every line lands above the viewport while the sheet — painted at
+/// full document height into its own background layer — stays visible, which the
+/// user sees as a completely blank page.
+///
+/// Keying by document makes a restored offset for another document unreachable,
+/// so a freshly opened document starts at the top while scrolling inside the
+/// current document is still preserved.
+fn doc_scroll_salt(path: &str) -> (String, String) {
+    ("mdp-doc-scroll".to_owned(), path.to_owned())
 }
 
 fn theme_from(config: &Config) -> Theme {
@@ -2001,6 +2182,9 @@ mod tests {
             force_quit: false,
             last_title: String::new(),
             status_note: None,
+            startup_log: std::cell::Cell::new(None),
+            diag_frames: std::cell::Cell::new(0),
+            session: App::session_id(),
         }
     }
 
@@ -2296,6 +2480,380 @@ mod tests {
     }
 
     #[test]
+    fn the_startup_report_is_written_with_the_real_geometry() {
+        // Its own file: the report path is process-wide and every shell test
+        // renders it, so a shared path makes this test order-dependent.
+        let path = std::env::temp_dir().join(format!(
+            "mdpad-report-test-{}.log",
+            App::session_id()
+        ));
+        let previous = set_report_path(Some(path.clone()));
+        let context = egui::Context::default();
+        let mut app = test_app(SAMPLE);
+        app.fonts = crate::fonts::install(&context);
+        let mut frame = eframe::Frame::_new_kittest();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1424.0, 862.0));
+        for _ in 0..3 {
+            let out = context.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |context| {
+                    let mut ui = egui::Ui::new(
+                        context.clone(),
+                        egui::Id::unique("mdp-root"),
+                        egui::UiBuilder::new()
+                            .max_rect(screen)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    eframe::App::ui(&mut app, &mut ui, &mut frame);
+                },
+            );
+            out.drop_without_applying_deltas();
+        }
+        let report = std::fs::read_to_string(&path).unwrap_or_default();
+        set_report_path(previous);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            report.contains("MarkdownPad startup report"),
+            "the report was not written:\n{report}"
+        );
+        assert!(
+            report.contains("page          width"),
+            "report lacks page geometry:\n{report}"
+        );
+        assert!(
+            report.contains("paint paragraph"),
+            "report lacks what the renderer painted:\n{report}"
+        );
+        assert!(
+            report.contains("blocks        45"),
+            "report lacks the block count:\n{report}"
+        );
+    }
+
+    /// A block that holds keyboard focus must not drag the page out of view.
+    #[test]
+    fn a_focused_block_does_not_scroll_the_page_away() {
+        let context = egui::Context::default();
+        let mut app = test_app(SAMPLE);
+        app.fonts = crate::fonts::install(&context);
+        assert!(app.doc.blocks.len() > 2, "the sample needs a few blocks");
+        let block = app.doc.blocks[2].clone();
+        app.view.begin_session(vec![2], &app.doc, &block);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut offsets = Vec::new();
+        let mut visible = 0usize;
+        // The window starts at eframe's 1320x900 and the user maximises it; the
+        // report came from a 1440x829.5 logical window at 2x scaling.
+        let sizes = [
+            egui::vec2(1320.0, 900.0),
+            egui::vec2(1320.0, 900.0),
+            egui::vec2(1440.0, 829.5),
+            egui::vec2(1440.0, 829.5),
+            egui::vec2(1440.0, 829.5),
+            egui::vec2(1440.0, 829.5),
+        ];
+        for (pass, size) in sizes.into_iter().enumerate() {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let out = context.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |context| {
+                    // Reproduce the real loop: `inline_edit` calls `request_focus`
+                    // whenever `focus_requested` is set, and nothing clears it
+                    // afterwards.
+                    app.view.focus_requested = true;
+                    let mut ui = egui::Ui::new(
+                        context.clone(),
+                        egui::Id::unique("mdp-root"),
+                        egui::UiBuilder::new()
+                            .max_rect(screen)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    eframe::App::ui(&mut app, &mut ui, &mut frame);
+                },
+            );
+            visible = out
+                .shapes
+                .iter()
+                .filter(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => {
+                        !text.galley.job.text.trim().is_empty()
+                            && screen.contains(text.visual_bounding_rect().center())
+                    }
+                    _ => false,
+                })
+                .count();
+            println!("pass {pass}: visible_text={visible}");
+            offsets.push(visible);
+            out.drop_without_applying_deltas();
+        }
+        // Focus-scrolling is allowed to move the page, but not to empty it.
+        assert!(
+            visible >= 3,
+            "only {visible} text runs stayed visible with a block focused (history {offsets:?})"
+        );
+    }
+
+    /// The document surface's scroll state is never restored across launches.
+    ///
+    /// This is the fix for the reported blank page. egui's memory — including
+    /// scroll offsets — is persisted by eframe to `app.ron` and restored on the
+    /// next launch. A stored offset is in points, but whether it is valid depends
+    /// on the content height, which is only known after layout: a value written by
+    /// a differently sized window, or by a smooth-scroll animation that overshot,
+    /// can park the page past the end of the document. Every line then sits above
+    /// the viewport while the sheet — painted at full document height into its own
+    /// background layer — still paints, so the user sees a completely blank page.
+    ///
+    /// The scroll area's id therefore carries a per-launch value, so a restored
+    /// offset is never found and a document always opens at the top.
+    #[test]
+    fn the_scroll_state_is_never_restored_across_launches() {
+        // A new launch must not be able to address the previous launch's state.
+        let a = App::session_id();
+        let b = App::session_id();
+        assert_ne!(a, b, "each launch needs its own scroll identity");
+        assert_eq!(a, a, "the identity must be stable within a launch");
+        // Different documents are still kept apart within a launch.
+        assert_ne!(
+            doc_scroll_salt("示例.md"),
+            doc_scroll_salt("另一份.md"),
+            "two documents must not share one scroll offset"
+        );
+    }
+
+    /// A freshly opened document paints its first paragraph near the top.
+    ///
+    /// The counterpart to the scroll bug: whatever offset a previous session left
+    /// behind, the first frame of a new document must show the beginning of the
+    /// text rather than an empty sheet.
+    #[test]
+    fn a_fresh_document_starts_at_the_top_of_the_page() {
+        let context = egui::Context::default();
+        let mut app = test_app(SAMPLE);
+        app.fonts = crate::fonts::install(&context);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 829.5));
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut paragraph = None;
+        for _ in 0..3 {
+            let out = context.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |context| {
+                    let mut ui = egui::Ui::new(
+                        context.clone(),
+                        egui::Id::unique("mdp-root"),
+                        egui::UiBuilder::new()
+                            .max_rect(screen)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    eframe::App::ui(&mut app, &mut ui, &mut frame);
+                },
+            );
+            if let Some(rect) = out.shapes.iter().find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains("这是一个") => {
+                    Some(text.visual_bounding_rect())
+                }
+                _ => None,
+            }) {
+                paragraph = Some(rect);
+            }
+            out.drop_without_applying_deltas();
+        }
+        let paragraph = paragraph.expect("the first paragraph was never painted");
+        assert!(
+            screen.contains(paragraph.center()),
+            "the page did not start at the top: {paragraph:?}"
+        );
+    }
+
+    #[test]
+    fn the_report_is_written_when_the_page_has_been_scrolled_away() {
+        let mut app = test_app(SAMPLE);
+        // First three frames always report, so burn them off.
+        for _ in 0..3 {
+            assert!(app.should_write_report(-5000.0, -5000.0));
+        }
+        assert!(
+            !app.should_write_report(-5000.0, -5000.0),
+            "a healthy frame must not write a report"
+        );
+        // Content 300pt above where it belongs: every line is off screen.
+        assert!(
+            app.should_write_report(-400.0, 0.0),
+            "a scrolled-away page must write a report"
+        );
+    }
+
+    /// The document surface's geometry must be stable across frames.
+    ///
+    /// `document_surface` renders the content and then reserves the sheet's height
+    /// with `allocate_exact_size` inside the same layout, and the sheet's height is
+    /// derived from the content's own rect. If the reservation feeds back into the
+    /// content's position, every frame pushes the text further down: the content
+    /// rect drifts negative, the scroll offset chases it to the maximum, and the
+    /// page ends up blank with no user input at all.
+    #[test]
+    fn the_page_geometry_settles_and_stays_put() {
+        let context = egui::Context::default();
+        let mut app = test_app(SAMPLE);
+        app.fonts = crate::fonts::install(&context);
+        // A real window's first frames can run before the surface has a size, so
+        // start degenerate and let it settle, then require it to stay put.
+        let sizes = [
+            egui::vec2(0.0, 0.0),
+            egui::vec2(1.0, 1.0),
+            egui::vec2(320.0, 200.0),
+        ];
+        let settled = egui::vec2(1440.0, 829.5);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut tops = Vec::new();
+        for pass in 0..12 {
+            let size = sizes.get(pass).copied().unwrap_or(settled);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let out = context.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |context| {
+                    let mut ui = egui::Ui::new(
+                        context.clone(),
+                        egui::Id::unique("mdp-root"),
+                        egui::UiBuilder::new()
+                            .max_rect(screen)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    eframe::App::ui(&mut app, &mut ui, &mut frame);
+                },
+            );
+            let top = out
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.job.text.contains("这是一个") => {
+                        Some(text.visual_bounding_rect().top())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(f32::NAN);
+            tops.push(top);
+            println!("pass {pass}: first paragraph top = {top}");
+            out.drop_without_applying_deltas();
+        }
+        // Once the window has a real size the layout must stop moving.
+        let tail = &tops[3..];
+        let first = tail[0];
+        for (i, top) in tail.iter().enumerate() {
+            assert!(
+                top.is_finite() && (top - first).abs() < 1.0,
+                "the page kept moving after settling (pass {}): {tops:?}",
+                i + 3
+            );
+        }
+    }
+
+    /// A large wheel delta must not leave the page parked past the document.
+    ///
+    /// Not a claim about how far one tick *should* move — egui animates scrolling,
+    /// so a big delta legitimately travels a long way. This pins the failure mode:
+    /// the page must still be showing body text afterwards rather than sitting in
+    /// the blank padding below the last paragraph.
+    #[test]
+    fn a_large_wheel_delta_does_not_park_the_page_past_the_document() {
+        let context = egui::Context::default();
+        let mut app = test_app(SAMPLE);
+        app.fonts = crate::fonts::install(&context);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 829.5));
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut tops = Vec::new();
+        let mut on_screen = 0usize;
+        for pass in 0..6 {
+            // A big single tick on the first pass, nothing after.
+            let events_input = if pass == 0 {
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -4000.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                    modifiers: egui::Modifiers::NONE,
+                }]
+            } else {
+                Vec::new()
+            };
+            let out = context.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    // The wheel only reaches the scroll area when the pointer is
+                    // over it, so park the pointer in the middle of the page.
+                    events: {
+                        let mut events = vec![egui::Event::PointerMoved(egui::pos2(
+                            720.0, 400.0,
+                        ))];
+                        events.extend(events_input);
+                        events
+                    },
+                    ..Default::default()
+                },
+                |context| {
+                    let mut ui = egui::Ui::new(
+                        context.clone(),
+                        egui::Id::unique("mdp-root"),
+                        egui::UiBuilder::new()
+                            .max_rect(screen)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    eframe::App::ui(&mut app, &mut ui, &mut frame);
+                },
+            );
+            let top = out
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.job.text.contains("这是一个") => {
+                        Some(text.visual_bounding_rect().top())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(f32::NAN);
+            tops.push(top);
+            on_screen = out
+                .shapes
+                .iter()
+                .filter(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) => {
+                        !text.galley.job.text.trim().is_empty()
+                            && text.galley.rect.width() > 50.0
+                            && screen.contains(text.visual_bounding_rect().center())
+                    }
+                    _ => false,
+                })
+                .count();
+            println!("pass {pass}: first paragraph top = {top}, body runs on screen = {on_screen}");
+            out.drop_without_applying_deltas();
+        }
+        // Not a claim about how far one tick *should* move: egui animates scrolling,
+        // so a big delta legitimately travels a long way. The failure mode to pin is
+        // that the page is still showing text afterwards, rather than sitting in the
+        // blank padding below the last paragraph.
+        assert!(
+            tops.iter().all(|t| t.is_finite()),
+            "the first paragraph was not painted: {tops:?}"
+        );
+        assert!(
+            on_screen > 0,
+            "scrolling left the page with no text on screen: {tops:?}"
+        );
+    }
+
+    #[test]
     fn html_export_mentions_all_block_families() {
         let doc = Document::from_file("t.md".into(), SAMPLE);
         let html = render_html(&doc);
@@ -2315,6 +2873,128 @@ mod tests {
         assert_eq!(
             html_escape("<a href=\"x\">&</a>"),
             "&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;"
+        );
+    }
+
+    /// Whole-shell headless pass: the same widget hierarchy the real window uses,
+    /// so a blank page (content drawn behind the sheet, or laid out past the
+    /// viewport) fails here instead of only on screen.
+    #[test]
+    fn the_document_is_painted_inside_the_visible_viewport() {
+        // Cover the logical sizes a real window produces: a 2560x1440 panel at
+        // 1.5x scaling is 1707x960 points, a 4K panel at 2x is 1920x1080, and a
+        // maximised 1080p window is about 1920x1040. A blank page that only shows
+        // up at one of these is exactly the kind of bug a single-size test misses.
+        for (w, h) in [
+            (1694.0f32, 1002.0f32),
+            (1707.0, 960.0),
+            (1424.0, 862.0),
+            (1440.0, 900.0),
+            (1129.0, 668.0),
+            (1920.0, 1040.0),
+            (1920.0, 1080.0),
+            (1280.0, 720.0),
+            (2560.0, 1400.0),
+        ] {
+            assert_document_is_visible(w, h);
+        }
+        // The caret-in-a-block state, where egui may scroll a focused widget into
+        // view and the document can end up scrolled away from the top.
+        for (w, h) in [(1694.0f32, 1002.0f32), (1440.0, 900.0), (1424.0, 862.0)] {
+            assert_document_visible_at(w, h, 1.0, true);
+        }
+    }
+
+    fn assert_document_is_visible(width: f32, height: f32) {
+        assert_document_visible_at(width, height, 1.0, false);
+        // Non-integral pixel ratios make egui round glyph positions, which is where
+        // "the page is blank but the status bar is right" tends to hide.
+        assert_document_visible_at(width, height, 1.25, false);
+        assert_document_visible_at(width, height, 1.5, false);
+        assert_document_visible_at(width, height, 2.0, false);
+    }
+
+    /// Paints the whole shell once and asserts the first body paragraph is visible.
+    ///
+    /// `focus_first_block` reproduces a click into the first block, which is the
+    /// state the editor is in whenever the caret is on screen.
+    fn assert_document_visible_at(
+        width: f32,
+        height: f32,
+        pixels_per_point: f32,
+        focus_first_block: bool,
+    ) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
+        let context = egui::Context::default();
+        let mut app = test_app(SAMPLE);
+        app.fonts = crate::fonts::install(&context);
+        if focus_first_block {
+            let block = app.doc.blocks[0].clone();
+            app.view.begin_session(vec![0], &app.doc, &block);
+        }
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = context.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |context| {
+                context.set_pixels_per_point(pixels_per_point);
+                let mut ui = egui::Ui::new(
+                    context.clone(),
+                    egui::Id::unique("mdp-root"),
+                    egui::UiBuilder::new()
+                        .max_rect(screen)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                eframe::App::ui(&mut app, &mut ui, &mut frame);
+            },
+        );
+
+        // The first body paragraph is the canary: if the sheet is painted over the
+        // content, or the content column is laid out past the viewport, this is the
+        // run that disappears first.
+        let paragraph = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains("这是一个") => {
+                    Some(text.visual_bounding_rect())
+                }
+                _ => None,
+            })
+            .expect("the first body paragraph was not painted at all");
+        assert!(
+            screen.contains(paragraph.center()),
+            "the first paragraph landed outside the window: {paragraph:?}"
+        );
+        assert!(
+            paragraph.top() > 40.0 && paragraph.top() < 400.0,
+            "the first paragraph is not near the top of the page: {paragraph:?}"
+        );
+        // It must sit inside the sheet's content column, not out in the desk.
+        let sheet = PageGeometry::resolve(screen.width());
+        let column = sheet.content_width(app.config.measure);
+        let column_left = sheet.gutter + (sheet.width - column) * 0.5;
+        assert!(
+            paragraph.left() >= column_left - 2.0
+                && paragraph.right() <= column_left + column + 2.0,
+            "the paragraph is outside the content column: {paragraph:?} (column from {column_left})"
+        );
+
+        let mut on_screen = 0usize;
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape
+                && !text.galley.job.text.trim().is_empty()
+                && screen.contains(text.visual_bounding_rect().center())
+            {
+                on_screen += 1;
+            }
+        }
+        output.drop_without_applying_deltas();
+        assert!(
+            on_screen >= 20,
+            "only {on_screen} text runs are visible on the first frame"
         );
     }
 }

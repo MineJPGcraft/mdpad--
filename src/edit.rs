@@ -150,6 +150,36 @@ impl Default for RenderOpts {
     }
 }
 
+/// One-shot diagnostic lines describing what the renderer actually did.
+///
+/// Written to a log file by the app on the first frames, because a blank page in
+/// the real window can depend on state a headless test cannot reproduce (window
+/// size, pixel ratio, scroll offset). Reading the numbers back beats guessing.
+pub mod diag {
+    use std::sync::Mutex;
+
+    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(crate) fn clear() {
+        if let Ok(mut lines) = LINES.lock() {
+            lines.clear();
+        }
+    }
+
+    pub(crate) fn push(line: String) {
+        if let Ok(mut lines) = LINES.lock() {
+            if lines.len() < 40 {
+                lines.push(line);
+            }
+        }
+    }
+
+    /// Takes everything recorded since the last call.
+    pub fn take() -> Vec<String> {
+        LINES.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -170,6 +200,7 @@ pub fn document_ui(
     }
 
     let mut action: Option<EditorAction> = None;
+    let active_path = state.active.as_ref().map(|s| s.path.clone());
     let mut ctx = BlockCtx {
         state,
         doc,
@@ -177,10 +208,24 @@ pub fn document_ui(
         opts,
         level: 0,
     };
+    diag::clear();
+    diag::push(format!(
+        "document: {} blocks, flavor {:?}, measure {:.1}, active {active_path:?}",
+        doc.blocks.len(),
+        doc.flavor,
+        opts.measure,
+    ));
     for (i, block) in doc.blocks.iter().enumerate() {
         let path = vec![i];
         if let Some(a) = ctx.block_ui(ui, block, &path) {
             merge_action(&mut action, a);
+        }
+        if i < 4 {
+            diag::push(format!(
+                "  block {i}: span {:?} kind {}",
+                block.span,
+                crate::doc::model::kind_label(&block.kind)
+            ));
         }
     }
     action
@@ -369,6 +414,11 @@ impl BlockCtx<'_> {
             job.wrap.max_width = ui.available_width().min(self.opts.measure).max(1.0);
             let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
             let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
+            diag::push(format!(
+                "  paint paragraph span {span:?} at {rect:?} galley {:?} text {:?}",
+                galley.size(),
+                source.chars().take(12).collect::<String>()
+            ));
             // `painter.galley` consumes the `Arc`, but the math overlay needs it
             // to resolve cursor positions, so keep a handle.
             let placed = Arc::clone(&galley);

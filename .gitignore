@@ -7,3 +7,7 @@ mdpad-config.json
 
 # Scratch files from verification runs.
 ui-check.png
+
+# Diagnostic reports the app writes (to %TEMP%) and copies made for reading.
+mdpad-startup.log
+mdpad-panic.log
