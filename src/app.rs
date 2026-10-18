@@ -999,6 +999,24 @@ impl App {
                     ui.horizontal_top(|ui| {
                         ui.add_space(geo.gutter);
 
+                        // Claim a slot in this panel's own layer *before* the content
+                        // is drawn, then fill it in once the content has been measured
+                        // and the sheet's height is known.
+                        //
+                        // The sheet used to go into a layer of its own
+                        // (`Order::Background` with a fresh id). Within one `Order`,
+                        // egui paints by the order the layers were registered in, and
+                        // a layer requested here is registered *after* the panel's —
+                        // so the sheet was painted over the document text. The toolbar
+                        // and status bar sit in other layers, which is why only the
+                        // page went blank. Reserving a slot in the same layer turns the
+                        // ordering into a matter of call order, which cannot drift.
+                        // Shadow slot first, sheet slot second: within one layer egui
+                        // paints in the order the shapes were added, so this puts the
+                        // shadow under the sheet and both under the document text.
+                        let shadow_slot = ui.painter().add(egui::Shape::Noop);
+                        let sheet_slot = ui.painter().add(egui::Shape::Noop);
+
                         // Draw the content first, into a scope whose height is
                         // unconstrained, then paint the sheet behind it using the
                         // height the content actually needed. Sizing the sheet
@@ -1054,14 +1072,14 @@ impl App {
                             egui::pos2(ui.available_rect_before_wrap().left(), top),
                             egui::vec2(width, sheet_h),
                         );
-                        // Shadow and sheet go on the background layer so they
-                        // sit behind everything the content just drew.
-                        let painter = ui.ctx().layer_painter(egui::LayerId::new(
-                            egui::Order::Background,
-                            egui::Id::unique("mdp-page"),
-                        ));
-                        paint_shadow(&painter, sheet, &theme);
-                        painter.rect_filled(sheet, 3.0, theme.palette.paper.to_egui());
+                        // Fill the slots claimed before the content was drawn, so the
+                        // sheet and its shadow end up behind the document text.
+                        ui.painter()
+                            .set(shadow_slot, egui::Shape::Vec(shadow_shapes(sheet, &theme)));
+                        ui.painter().set(
+                            sheet_slot,
+                            egui::Shape::rect_filled(sheet, 3.0, theme.palette.paper.to_egui()),
+                        );
 
                         // Reserve the sheet's space so the scroll area grows with the
                         // document rather than clipping it.
@@ -1183,6 +1201,67 @@ impl App {
             report.push_str(&line);
             report.push('\n');
         }
+        // Ground truth from egui itself: what layers exist, what each layer's clip
+        // rect is, and the real colour carried by the text shapes. Everything above
+        // is what the renderer *intended*; this is what actually reached the
+        // backend, which is where a blank-but-correct-geometry window differs.
+        let mut layers: Vec<String> = Vec::new();
+        // `GraphicLayers` exposes no iterator, so probe the two ids this app is
+        // known to paint into: its own sheet layer, and the background id egui uses
+        // for panel content.
+        let probe = [
+            egui::LayerId::new(egui::Order::Background, egui::Id::unique("mdp-page")),
+            egui::LayerId::background(),
+        ];
+        ctx.graphics_mut(|g| {
+            for id in probe {
+                let Some(list) = g.get(id) else { continue };
+                let mut texts = 0usize;
+                let mut rects = 0usize;
+                let mut clip = egui::Rect::NOTHING;
+                let mut sample = String::new();
+                let mut ink = egui::Rect::NOTHING;
+                for shape in list.all_entries() {
+                    clip = clip.union(shape.clip_rect);
+                    match &shape.shape {
+                        egui::Shape::Text(text) => {
+                            texts += 1;
+                            ink = ink.union(text.visual_bounding_rect());
+                            if sample.is_empty() && !text.galley.job.text.trim().is_empty() {
+                                let preview: String =
+                                    text.galley.job.text.chars().take(10).collect();
+                                sample = format!(
+                                    " first={preview:?} color={:?} at {:?}",
+                                    text.fallback_color,
+                                    text.pos
+                                );
+                            }
+                        }
+                        egui::Shape::Rect(_) => rects += 1,
+                        _ => {}
+                    }
+                }
+                layers.push(format!(
+                    "  {id:?}: texts={texts} rects={rects} clip={clip:?} ink={ink:?}{sample}"
+                ));
+            }
+        });
+        report.push_str("layers:\n");
+        for line in &layers {
+            report.push_str(line);
+            report.push('\n');
+        }
+        // The font atlas is the last link in the chain: text shapes become visible
+        // vertices only if their glyph UVs point into a texture the backend actually
+        // has. A rect needs no texture, which is why "the sheet draws and every glyph
+        // does not" is the signature of a missing or empty atlas.
+        //
+        // Only the size is read here: taking the texture delta would consume the
+        // upload the renderer still has to apply.
+        let atlas_size = ctx.fonts(|f| f.font_image_size());
+        report.push_str(&format!(
+            "font atlas    {atlas_size:?} (a zero-sized atlas blanks all text)\n"
+        ));
         let Some(path) = Self::report_path() else {
             return;
         };
@@ -1492,24 +1571,28 @@ impl PageGeometry {
     }
 }
 
-/// Paints the page drop shadow.
+/// Builds the page drop shadow's shapes.
 ///
 /// egui has no shadow primitive, so the effect is faked with a few progressively
 /// larger, more transparent rounded rects around the sheet. Four layers is
 /// enough to read as a soft edge without the banding a hard offset would give.
-fn paint_shadow(painter: &egui::Painter, rect: egui::Rect, theme: &Theme) {
+///
+/// Returns shapes rather than painting them, so the caller can drop them into a
+/// slot reserved *before* the document text was drawn.
+fn shadow_shapes(rect: egui::Rect, theme: &Theme) -> Vec<egui::Shape> {
     let base = theme.palette.paper_shadow;
+    let mut out = Vec::with_capacity(4);
     for (i, spread) in [2.0f32, 5.0, 9.0, 15.0].into_iter().enumerate() {
         // Alpha falls off with distance, so the layers blend outward.
         let alpha = (base.a as f32 * [0.30, 0.22, 0.14, 0.08][i]) as u8;
-        let grow = rect.expand(spread);
-        painter.rect_stroke(
-            grow,
+        out.push(egui::Shape::rect_stroke(
+            rect.expand(spread),
             4.0 + spread,
             egui::Stroke::new(spread * 2.0, base.with_alpha(alpha).to_egui()),
             egui::StrokeKind::Outside,
-        );
+        ));
     }
+    out
 }
 
 /// Salt for the document surface's scroll area.
