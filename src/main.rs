@@ -21,6 +21,8 @@ mod find;
 mod fonts;
 mod gfx;
 mod gfx_egui;
+mod icon;
+mod icon_data;
 mod recovery;
 mod tex;
 mod theme;

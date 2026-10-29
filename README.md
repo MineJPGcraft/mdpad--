@@ -174,8 +174,25 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 | VitePress | `::: tip 标题` … `:::`（另有 VitePress 独有的 `::: details`） |
 | Docusaurus | `:::note` … `:::`（另有 Docusaurus 独有的 `::: caution` `::: admonition`） |
 
-变体统一为 7 类：Note / Tip / Info / Warning / Danger / Details / Caution，
-各自有固定的配色与图标。
+变体统一为 7 类：Note / Tip / Info / Warning / Danger / Details / Caution。
+
+**渲染用的是各家的真实资产与真实结构**，不是照着印象配的近似样式：
+
+| 风格 | 结构 | 图标 | 标题 |
+|---|---|---|---|
+| GitHub | 4px 左侧竖线，无底色 | octicon（info / light-bulb / report / alert / stop） | 词首大写（`Note`） |
+| Obsidian | 1px 描边 + 10% 底色，圆角 4 | lucide（pencil / info / flame / triangle-alert / zap / octagon-alert） | 原样 |
+| VitePress | 柔和底色，边框默认透明，圆角 8 | 无（默认主题不显示图标） | 原样 |
+| Docusaurus | 4px 左侧竖线 + 淡底色 | 主题自带 SVG，尺寸 1.6em | 全大写（`text-transform: uppercase`） |
+
+配色也按各家发布的值取：GitHub 用 primer 的 accent/success/done/attention/danger，
+Obsidian 用它 `app.css` 里的 `--color-*-rgb`。
+
+图标路径数据原样取自 octicons（MIT）、lucide（ISC）与 Docusaurus 主题（MIT），
+放在 `assets/icons/`，由 `tools/extract_icons.py` 生成 `src/icon_data.rs`。
+运行时零网络请求，**也不再依赖系统字体里恰好有没有某个符号字形**：图标是矢量，
+按当前缩放绘制，`gfx` 侧新增了多边形填充（非零环绕与奇偶两种规则都要支持，
+因为 octicons 靠反向缠绕挖孔、Docusaurus 显式用 `fill-rule="evenodd"`）。
 
 **判定规则是按块独立的**，不是整篇统一：文档里同时出现 `::: tip`
 （VitePress 惯例，带空格）和 `:::note`（Docusaurus 惯例，不带空格）时，
@@ -234,6 +251,8 @@ src/
   config.rs           持久化设置与最近文件列表
   find.rs             查找/替换的匹配与光标逻辑（字节区间，无 egui）
   recovery.rs         崩溃恢复草稿的读写（纯文件 I/O，无 egui）
+  icon.rs             提醒框图标：SVG 路径解析 → 曲线展平 → 填充/描边几何
+  icon_data.rs        官方图标路径数据（由 tools/extract_icons.py 生成）
 
   doc/
     model.rs          Document、Block/BlockKind、提醒框模型、字数统计

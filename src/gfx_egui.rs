@@ -259,6 +259,55 @@ pub fn anchor_factor(anchor: Anchor) -> [f32; 2] {
     anchor.factor()
 }
 
+/// Paints an icon into `rect`, keeping its aspect ratio and centring it.
+///
+/// Icons are the one thing that reaches egui as a mesh rather than a primitive:
+/// their silhouettes are concave (the "i" of `info`, the lightning of `zap`) and
+/// some punch holes (the octicon ring), which no convex polygon can express.
+/// Triangulation happens in [`crate::icon`], which knows nothing about egui.
+pub fn icon(
+    painter: &Painter,
+    geo: &crate::icon::Geometry,
+    rect: ERect,
+    color: Color32,
+) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 || geo.view[0] <= 0.0 || geo.view[1] <= 0.0 {
+        return;
+    }
+    let scale = (rect.width() / geo.view[0]).min(rect.height() / geo.view[1]);
+    let drawn = Vec2::new(geo.view[0] * scale, geo.view[1] * scale);
+    let origin = rect.center() - drawn * 0.5;
+    let map = |p: [f32; 2]| Pos2::new(origin.x + p[0] * scale, origin.y + p[1] * scale);
+
+    if geo.triangles.len() >= 3 {
+        let mut mesh = egui::Mesh::default();
+        for p in &geo.triangles {
+            mesh.colored_vertex(map(*p), color);
+        }
+        for index in 0..(geo.triangles.len() / 3) as u32 {
+            let base = index * 3;
+            mesh.add_triangle(base, base + 1, base + 2);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+
+    // A hair of minimum width keeps outline icons visible at small sizes.
+    let stroke = EStroke::new((geo.stroke * scale).max(0.7), color);
+    for line in &geo.polylines {
+        if line.len() >= 2 {
+            let pts: Vec<Pos2> = line.iter().map(|p| map(*p)).collect();
+            painter.add(egui::Shape::line(pts, stroke));
+        }
+    }
+    for (centre, radius) in &geo.circles {
+        painter.circle_stroke(map(*centre), radius * scale, stroke);
+    }
+    let dot = (geo.stroke * scale * 0.5).max(0.7);
+    for centre in &geo.dots {
+        painter.circle_filled(map(*centre), dot, color);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

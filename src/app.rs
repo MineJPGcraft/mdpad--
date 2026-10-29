@@ -120,24 +120,40 @@ impl App {
         theme.apply_egui_visuals(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
+        // A path on the command line wins over everything: `mdpad-- notes.md` and
+        // a double-clicked file in the file manager both arrive this way.
+        let from_cli = std::env::args_os()
+            .skip(1)
+            .map(PathBuf::from)
+            .find(|p| p.is_file());
+
         // First run: open the sample so the editor has something to show. It
         // exercises every construct the app supports, which also makes it a
         // living smoke test of the renderer.
-        let first_run = config.recent.is_empty();
-        let doc = if first_run {
+        let opened_from_cli = from_cli.is_some();
+        let first_run = config.recent.is_empty() && !opened_from_cli;
+        let doc = if let Some(path) = from_cli {
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            Document::from_file(path, &raw)
+        } else if first_run {
             Document::from_file(PathBuf::from("示例.md"), SAMPLE)
         } else {
             Document::new()
         };
         let source_buffer = doc.text.clone();
         let source_mode = config.source_mode;
-        let ready = if first_run {
+        let ready = if opened_from_cli {
+            format!("已打开 {} · {}", doc.display_path(), fonts_summary(&fonts))
+        } else if first_run {
             format!("已载入示例文档 · {} · 右下角可切换源码模式", fonts_summary(&fonts))
         } else {
             format!("已就绪 · {} · 右下角可切换源码模式", fonts_summary(&fonts))
         };
         let mut config = config;
         config.prune_recent();
+        if let Some(path) = doc.path.as_ref() {
+            config.push_recent(path);
+        }
         // A draft from an earlier run is only announced, never applied: see the
         // module note in `recovery` for why.
         let pending_draft = Draft::load().filter(Draft::is_worth_offering);
@@ -3815,6 +3831,100 @@ mod tests {
             "the pending edit must be committed before offsets are trusted"
         );
         assert!(app.view.active.is_some());
+    }
+
+    #[test]
+    fn a_github_callout_paints_its_official_icon_and_left_rule() {
+        // github.com renders `> [!NOTE]` as a 4px left rule in the accent colour,
+        // the octicon next to a Title Case keyword, and no panel tint. Anything
+        // else here would mean the WYSIWYG view is lying about the target site.
+        let mut app = test_app("> [!NOTE]\n> 提示内容\n");
+        let context = egui::Context::default();
+        app.fonts = crate::fonts::install(&context);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let mut frame = eframe::Frame::_new_kittest();
+        let (mut meshes, mut rule) = (0usize, false);
+        let mut icon_points: Vec<egui::Pos2> = Vec::new();
+        let mut rule_rect: Option<egui::Rect> = None;
+        let mut title_rect: Option<egui::Rect> = None;
+        let (mut title_case, mut shouty) = (false, false);
+        for _ in 0..3 {
+            let out = context.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |context| {
+                    let mut ui = egui::Ui::new(
+                        context.clone(),
+                        egui::Id::unique("mdp-root"),
+                        egui::UiBuilder::new()
+                            .max_rect(screen)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    eframe::App::ui(&mut app, &mut ui, &mut frame);
+                },
+            );
+            for clipped in &out.shapes {
+                match &clipped.shape {
+                    // The icon is the only mesh in a callout.
+                    egui::Shape::Mesh(mesh) => {
+                        meshes += 1;
+                        icon_points.extend(mesh.vertices.iter().map(|v| v.pos));
+                    }
+                    egui::Shape::Rect(rect) => {
+                        if (rect.rect.width() - 4.0).abs() < 0.6
+                            && rect.fill == egui::Color32::from_rgb(0x44, 0x93, 0xF8)
+                        {
+                            rule = true;
+                            rule_rect = Some(rect.rect);
+                        }
+                    }
+                    egui::Shape::Text(text) => {
+                        if text.galley.job.text.contains("NOTE") {
+                            shouty = true;
+                        }
+                        if text.galley.job.text.contains("Note") {
+                            title_case = true;
+                            title_rect = Some(text.visual_bounding_rect());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.drop_without_applying_deltas();
+        }
+        assert!(meshes > 0, "the callout icon was never painted");
+        assert!(rule, "the 4px left rule is missing");
+        assert!(title_case, "the keyword should be Title Case");
+        assert!(!shouty, "GitHub does not uppercase the keyword");
+
+        // The icon must sit next to the title on the same optical line, and clear
+        // of the rule. A glyph used to be a text run here, so nothing checked that
+        // the two actually lined up.
+        let icon = icon_points
+            .iter()
+            .fold(None::<egui::Rect>, |acc: Option<egui::Rect>, p| {
+                Some(match acc {
+                    None => egui::Rect::from_min_max(*p, *p),
+                    Some(r) => r.union(egui::Rect::from_min_max(*p, *p)),
+                })
+            })
+            .expect("the icon mesh had no vertices");
+        let title = title_rect.expect("the title was not painted");
+        let rule = rule_rect.expect("the rule was not painted");
+        assert!(
+            (icon.center().y - title.center().y).abs() < 3.0,
+            "the icon is not on the title's line: icon {icon:?} title {title:?}"
+        );
+        assert!(
+            icon.left() >= rule.right() - 0.5,
+            "the icon overlaps the left rule: icon {icon:?} rule {rule:?}"
+        );
+        assert!(
+            icon.width() >= 12.0,
+            "the icon is too small to read: {icon:?}"
+        );
     }
 
     #[test]

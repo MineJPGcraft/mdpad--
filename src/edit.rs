@@ -667,12 +667,20 @@ impl BlockCtx<'_> {
                 if title.is_some() || look.icon.is_some() {
                     ui.horizontal(|ui| {
                         if let Some(icon) = look.icon {
-                            ui.label(
-                                RichText::new(icon)
-                                    .color(look.accent.to_egui())
-                                    .size(self.theme.body_size()),
+                            // The icon is the variant's real asset, not a glyph:
+                            // it is sized off the body text so it scales with the
+                            // document, and painted through the one bridge that
+                            // owns egui drawing.
+                            let side = self.theme.body_size() * look.icon_scale;
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(side, side), Sense::hover());
+                            gfx_egui::icon(
+                                ui.painter(),
+                                crate::icon::geometry(icon),
+                                rect,
+                                look.accent.to_egui(),
                             );
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
                         }
                         if let Some(title) = &title {
                             let text = if look.uppercase_title {
@@ -779,25 +787,9 @@ impl BlockCtx<'_> {
             );
         }
         // A hairline above/below keeps GitHub's flat style readable.
-        if look.bar.is_none() && look.border.is_none() {
-            let hair = egui::Stroke::new(1.0, look.accent.with_alpha(0x55).to_egui());
-            let top = rect.min.y;
-            let bottom = rect.max.y;
-            ui.painter().line_segment(
-                [
-                    egui::pos2(rect.min.x, top),
-                    egui::pos2(rect.max.x, top),
-                ],
-                hair,
-            );
-            ui.painter().line_segment(
-                [
-                    egui::pos2(rect.min.x, bottom),
-                    egui::pos2(rect.max.x, bottom),
-                ],
-                hair,
-            );
-        }
+        // No hairline fallback: each syntax now has the structure its own
+        // stylesheet gives it (a left rule, a full border, or a bare tint), so
+        // adding decorative edges here would be inventing a look again.
 
         action
     }

@@ -9,6 +9,7 @@
 
 use crate::diagram::DiagramTheme;
 use crate::doc::model::{CalloutSyntax, CalloutVariant};
+use crate::icon::IconId;
 use crate::gfx::{Family, Rgba, Stroke};
 
 /// The colour set for one brightness mode.
@@ -232,63 +233,114 @@ impl Theme {
         }
     }
 
+    /// The colour each ecosystem actually paints its callouts with.
+    ///
+    /// GitHub and Obsidian publish theirs; the other two route everything through
+    /// theme variables, so the editor's own per-variant accents stand in there.
+    fn syntax_accent(&self, syntax: CalloutSyntax, variant: &CalloutVariant) -> Rgba {
+        use CalloutVariant::*;
+        let dark = self.dark;
+        match syntax {
+            // github.com: --fgColor-accent / success / done / attention / danger.
+            CalloutSyntax::GitHub => {
+                let (light, dark_hex) = match variant {
+                    Note | Info | Abstract | Todo => (0x0969DA, 0x4493F8),
+                    Tip | Success | Example => (0x1A7F37, 0x3FB950),
+                    Important => (0x8250DF, 0xAB7DF8),
+                    Warning | Question => (0x9A6700, 0xD29922),
+                    Danger | Caution | Failure | Bug => (0xCF222E, 0xF85149),
+                    Quote | Details | Custom(_) => (0x57606A, 0x9198A1),
+                };
+                Rgba::hex(if dark { dark_hex } else { light })
+            }
+            // Obsidian's default palette (`--color-*-rgb` in app.css). The hue is
+            // the same in both themes; only the tint alpha changes.
+            CalloutSyntax::Obsidian => Rgba::hex(match variant {
+                Note | Info | Abstract | Todo => 0x086DDD,
+                Important => 0x7852EE,
+                Tip | Success | Example => 0x00BFBC,
+                Warning | Question | Caution => 0xEC7500,
+                Danger | Failure | Bug => 0xE93147,
+                Details | Quote => 0x9E9E9E,
+                Custom(_) => 0x7852EE,
+            }),
+            CalloutSyntax::VitePress | CalloutSyntax::Docusaurus => {
+                self.variant_accent(variant)
+            }
+        }
+    }
+
     /// The look of a callout, which depends on both the syntax it was written in
     /// and its semantic variant.
+    ///
+    /// Each arm mirrors the structure that syntax's own stylesheet produces, not
+    /// an impression of it: GitHub rules the left edge only, Obsidian outlines
+    /// the whole box, VitePress tints without a visible border, Docusaurus rules
+    /// the left edge and prints its heading in caps.
     pub fn callout_look(
         &self,
         syntax: CalloutSyntax,
         variant: &CalloutVariant,
     ) -> CalloutLook {
-        let accent = self.variant_accent(variant);
-        let canvas = self.palette.canvas;
+        let accent = self.syntax_accent(syntax, variant);
+        // Callouts sit on the sheet, not on the desk: blending against `canvas`
+        // gave every panel a tint of the wrong colour (and made GitHub's
+        // "no background" case paint a faintly darker box over the paper).
+        let canvas = self.palette.paper;
         match syntax {
-            // GitHub alerts: a faint tinted panel with a coloured title and no
-            // icon or side bar. The keyword itself is the signal.
+            // github.com `.markdown-alert`: `border-left: .25em solid`, radius
+            // 6px, no background tint of its own, octicon next to the keyword,
+            // keyword in Title Case.
             CalloutSyntax::GitHub => CalloutLook {
-                tint: accent.with_alpha(if self.dark { 0x1F } else { 0x14 }).blend_over(canvas),
+                tint: canvas,
                 accent,
                 title: accent,
                 radius: 6.0,
+                bar: Some(4.0),
+                border: None,
+                icon: Some(github_icon(variant)),
+                icon_scale: 1.0,
+                uppercase_title: false,
+            },
+            // Obsidian `.callout`: 1px border at ~25% of the colour over a 10%
+            // tint, radius 4px, lucide icon, title in the accent colour.
+            CalloutSyntax::Obsidian => CalloutLook {
+                tint: accent.with_alpha(if self.dark { 0x1F } else { 0x17 }).blend_over(canvas),
+                accent,
+                title: accent,
+                radius: 4.0,
+                bar: None,
+                border: Some(Stroke::new(1.0, accent.with_alpha(0x45))),
+                icon: Some(obsidian_icon(variant)),
+                icon_scale: 1.0,
+                uppercase_title: false,
+            },
+            // VitePress `.custom-block`: radius 0.5rem, a soft per-type
+            // background, and a border that defaults to `transparent`. No icon in
+            // the default theme.
+            CalloutSyntax::VitePress => CalloutLook {
+                tint: accent.with_alpha(if self.dark { 0x1C } else { 0x14 }).blend_over(canvas),
+                accent,
+                title: accent,
+                radius: 8.0,
                 bar: None,
                 border: None,
                 icon: None,
-                uppercase_title: true,
-            },
-            // Obsidian callouts: a saturated tint, a coloured left bar and an
-            // icon; custom titles are common and render in the accent colour.
-            CalloutSyntax::Obsidian => CalloutLook {
-                tint: accent.with_alpha(if self.dark { 0x2B } else { 0x1C }).blend_over(canvas),
-                accent,
-                title: accent,
-                radius: 8.0,
-                bar: Some(3.0),
-                border: None,
-                icon: Some(icon_for(variant)),
+                icon_scale: 1.0,
                 uppercase_title: false,
             },
-            // VitePress containers: the strong 4px left rule plus a soft tint is
-            // the signature look.
-            CalloutSyntax::VitePress => CalloutLook {
-                tint: accent.with_alpha(if self.dark { 0x24 } else { 0x17 }).blend_over(canvas),
-                accent,
-                title: accent,
-                radius: 8.0,
-                bar: Some(4.0),
-                border: None,
-                icon: None,
-                uppercase_title: false,
-            },
-            // Docusaurus admonitions: a hairline border, a leading icon in its
-            // own box, and only a whisper of tint.
+            // Docusaurus admonitions: left rule, faint tint, radius 4px, its own
+            // icon at `1.6em`, and `text-transform: uppercase` on the heading.
             CalloutSyntax::Docusaurus => CalloutLook {
-                tint: accent.with_alpha(if self.dark { 0x14 } else { 0x0E }).blend_over(canvas),
+                tint: accent.with_alpha(if self.dark { 0x17 } else { 0x10 }).blend_over(canvas),
                 accent,
                 title: accent,
                 radius: 4.0,
                 bar: Some(4.0),
-                border: Some(Stroke::new(1.0, accent.with_alpha(0x3D))),
-                icon: Some(icon_for(variant)),
-                uppercase_title: false,
+                border: None,
+                icon: Some(docusaurus_icon(variant)),
+                icon_scale: 1.6,
+                uppercase_title: true,
             },
         }
     }
@@ -387,29 +439,54 @@ pub struct CalloutLook {
     /// Width of the left rule, when the syntax uses one.
     pub bar: Option<f32>,
     pub border: Option<Stroke>,
-    /// A single glyph standing in for the variant's icon.
-    pub icon: Option<&'static str>,
-    /// GitHub renders its keyword in caps.
+    /// The variant's real icon, from the set its ecosystem ships.
+    pub icon: Option<IconId>,
+    /// Icon box size as a multiple of the body font size. Docusaurus asks for
+    /// `1.6em`; the others sit at about one line of text.
+    pub icon_scale: f32,
+    /// Whether the title is rendered in caps, which is what the syntax's CSS does.
     pub uppercase_title: bool,
 }
 
-/// A text glyph per variant. Chosen from the common geometric/symbol blocks so
-/// they are present in the bundled symbol fonts.
-fn icon_for(variant: &CalloutVariant) -> &'static str {
+/// The icons GitHub puts on its five alerts, from octicons.
+fn github_icon(variant: &CalloutVariant) -> IconId {
     use CalloutVariant::*;
     match variant {
-        Note => "✎",
-        Info => "ℹ",
-        Tip | Success | Example => "✔",
-        Important => "★",
-        Warning | Caution => "⚠",
-        Question => "?",
-        Danger | Failure => "✖",
-        Bug => "☠",
-        Abstract | Todo => "☰",
-        Quote => "❝",
-        Details => "▸",
-        Custom(_) => "◆",
+        Tip | Success | Example => IconId::GitHubBulb,
+        Important => IconId::GitHubReport,
+        Warning | Question => IconId::GitHubAlert,
+        Danger | Caution | Failure | Bug => IconId::GitHubStop,
+        Note | Info | Abstract | Todo | Quote | Details | Custom(_) => IconId::GitHubInfo,
+    }
+}
+
+/// Obsidian's callout icons are lucide glyphs; these are the ones it assigns to
+/// the types we can express.
+fn obsidian_icon(variant: &CalloutVariant) -> IconId {
+    use CalloutVariant::*;
+    match variant {
+        Note => IconId::ObsidianPencil,
+        Info | Abstract | Todo => IconId::ObsidianInfo,
+        // Obsidian has no "important" callout; the purple accent carries it and
+        // the info glyph is the closest of its own set.
+        Important => IconId::ObsidianInfo,
+        Tip | Success | Example => IconId::ObsidianFlame,
+        Warning | Question => IconId::ObsidianAlert,
+        Danger | Failure | Bug => IconId::ObsidianZap,
+        Caution => IconId::ObsidianOctagon,
+        Details | Quote => IconId::ObsidianChevron,
+        Custom(_) => IconId::ObsidianInfo,
+    }
+}
+
+/// Docusaurus ships one icon per admonition type.
+fn docusaurus_icon(variant: &CalloutVariant) -> IconId {
+    use CalloutVariant::*;
+    match variant {
+        Note | Abstract | Todo => IconId::DocusaurusNote,
+        Tip | Success | Example => IconId::DocusaurusTip,
+        Info | Quote | Details | Important => IconId::DocusaurusInfo,
+        Warning | Danger | Caution | Failure | Bug | Question | Custom(_) => IconId::DocusaurusDanger,
     }
 }
 
@@ -467,21 +544,66 @@ mod tests {
             .iter()
             .map(|s| t.callout_look(*s, &v))
             .collect();
-        // GitHub has no bar or icon; the others must have a bar.
-        assert!(looks[0].bar.is_none() && looks[0].icon.is_none());
-        assert!(looks[0].uppercase_title);
-        for look in &looks[1..] {
-            assert!(look.bar.is_some(), "expected a left rule");
-        }
-        // Docusaurus is the only one with a hairline border.
-        assert!(looks[3].border.is_some());
-        assert!(looks[1].border.is_none() && looks[2].border.is_none());
-        // Obsidian and Docusaurus show an icon.
-        assert!(looks[1].icon.is_some() && looks[3].icon.is_some());
+        // GitHub: left rule, octicon, Title Case, and no background of its own.
+        assert_eq!(looks[0].bar, Some(4.0));
+        assert!(looks[0].icon.is_some());
+        assert!(!looks[0].uppercase_title, "github.com shows 'Warning', not 'WARNING'");
+        assert_eq!(
+            looks[0].tint, t.palette.paper,
+            "the panel must be the page colour, not a tint"
+        );
+        // Obsidian outlines the whole box and has no left rule.
+        assert!(looks[1].border.is_some());
+        assert!(looks[1].bar.is_none());
+        assert!(looks[1].icon.is_some());
+        // VitePress is a tinted panel with a transparent border and no icon.
+        assert!(looks[2].border.is_none());
+        assert!(looks[2].bar.is_none());
+        assert!(looks[2].icon.is_none());
+        assert_ne!(looks[2].tint, t.palette.paper, "it is a tinted panel");
+        // Docusaurus: left rule, its own icon, uppercase heading.
+        assert!(looks[3].bar.is_some());
+        assert!(looks[3].icon.is_some());
+        assert!(looks[3].uppercase_title);
         // Every tint must be opaque, otherwise callouts read as translucent.
         for look in &looks {
             assert_eq!(look.tint.a, 255);
         }
+    }
+
+    #[test]
+    fn github_alerts_use_githubs_own_colours() {
+        // From the primer palette: accent / success / done / attention / danger.
+        for (dark, note, tip, important, warning, caution) in [
+            (false, 0x0969DA, 0x1A7F37, 0x8250DF, 0x9A6700, 0xCF222E),
+            (true, 0x4493F8, 0x3FB950, 0xAB7DF8, 0xD29922, 0xF85149),
+        ] {
+            let t = if dark { Theme::dark() } else { Theme::light() };
+            let accent = |v: CalloutVariant| t.callout_look(CalloutSyntax::GitHub, &v).accent;
+            assert_eq!(accent(CalloutVariant::Note), Rgba::hex(note), "note");
+            assert_eq!(accent(CalloutVariant::Tip), Rgba::hex(tip), "tip");
+            assert_eq!(
+                accent(CalloutVariant::Important),
+                Rgba::hex(important),
+                "important"
+            );
+            assert_eq!(accent(CalloutVariant::Warning), Rgba::hex(warning), "warning");
+            assert_eq!(accent(CalloutVariant::Caution), Rgba::hex(caution), "caution");
+        }
+    }
+
+    #[test]
+    fn obsidian_callouts_use_its_palette_and_its_icon_set() {
+        let t = Theme::dark();
+        let look = |v: CalloutVariant| t.callout_look(CalloutSyntax::Obsidian, &v);
+        // `--color-blue-rgb` / `--color-cyan-rgb` / `--color-red-rgb`.
+        assert_eq!(look(CalloutVariant::Note).accent, Rgba::hex(0x086DDD));
+        assert_eq!(look(CalloutVariant::Tip).accent, Rgba::hex(0x00BFBC));
+        assert_eq!(look(CalloutVariant::Danger).accent, Rgba::hex(0xE93147));
+        // Lucide glyphs, not the octicons.
+        assert_eq!(look(CalloutVariant::Note).icon, Some(IconId::ObsidianPencil));
+        assert_eq!(look(CalloutVariant::Tip).icon, Some(IconId::ObsidianFlame));
+        assert_eq!(look(CalloutVariant::Warning).icon, Some(IconId::ObsidianAlert));
     }
 
     #[test]

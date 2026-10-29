@@ -505,18 +505,14 @@ impl Parser<'_> {
                     content: stripped.to_owned(),
                 });
                 j += 1;
-            } else if l.is_blank()
-                && j + 1 < to
-                && lines[j + 1].content.trim_start().starts_with('>')
-            {
-                inner.push(Line {
-                    start: l.start,
-                    end: l.end,
-                    content_start: l.content_start,
-                    content: String::new(),
-                });
-                j += 1;
             } else {
+                // A blank line ends the quote. Continuing across it (which this
+                // used to do whenever the next line still started with `>`) glued
+                // two separate blockquotes into one block — so a document with
+                // several callouts rendered only the first, with the rest shown as
+                // literal `[!TIP]` lines inside it. To continue a quote across a
+                // paragraph break, CommonMark requires a `>` on the blank line,
+                // which the branch above already handles.
                 break;
             }
         }

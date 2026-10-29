@@ -935,6 +935,58 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_alerts_stay_separate_blocks() {
+        // A blank line ends a blockquote. Gluing them together made the editor
+        // render only the first alert and show every later one as literal
+        // `[!TIP]` text wrapped inside it.
+        let doc = Document::from_file(
+            "t.md".into(),
+            "> [!NOTE]\n> a\n\n> [!TIP]\n> b\n\n> [!WARNING]\n> c\n\n> [!CAUTION]\n> d\n",
+        );
+        let variants: Vec<CalloutVariant> = doc
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BlockKind::Callout(c) => Some(c.variant.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            variants,
+            vec![
+                CalloutVariant::Note,
+                CalloutVariant::Tip,
+                CalloutVariant::Warning,
+                CalloutVariant::Caution
+            ]
+        );
+        assert_eq!(doc.blocks.len(), 4, "one block per alert");
+        // Each block must own only its own two lines.
+        for block in &doc.blocks {
+            assert_eq!(
+                doc.text[block.span.clone()].lines().count(),
+                2,
+                "block span leaked into the next alert: {:?}",
+                &doc.text[block.span.clone()]
+            );
+        }
+    }
+
+    #[test]
+    fn a_quote_can_still_span_a_paragraph_break_with_a_marker() {
+        // The rule that replaced the old behaviour: to continue across a blank
+        // line the author writes `>` on it, exactly as CommonMark requires.
+        let doc = Document::from_file("t.md".into(), "> first\n>\n> second\n");
+        assert_eq!(doc.blocks.len(), 1, "still one blockquote");
+        match &doc.blocks[0].kind {
+            BlockKind::Quote { text } => {
+                assert!(text.contains("first") && text.contains("second"), "{text:?}");
+            }
+            other => panic!("expected a quote, got {}", kind_label(other)),
+        }
+    }
+
+    #[test]
     fn replace_span_edits_only_that_range() {
         let mut doc = Document::new();
         doc.set_text("# Title\n\nfirst\n\nsecond\n".to_owned());
