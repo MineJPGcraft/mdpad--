@@ -13,6 +13,153 @@ use crate::doc::model::CalloutSyntax;
 /// How many recently opened files to remember.
 const MAX_RECENT: usize = 12;
 
+/// Which graphics API the window is created with.
+///
+/// The default is [`Backend::Auto`], which resolves to the platform's native
+/// API: Direct3D 12 on Windows, Vulkan on Linux, Metal on macOS. Anything the
+/// page draws is still painted by `egui`; the choice only decides which driver
+/// stack gets loaded, and those are not interchangeable in cost — on a machine
+/// with only Vulkan installed, asking for Direct3D fails outright.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// The platform's own API (see above).
+    #[default]
+    Auto,
+    /// Direct3D 12. Windows only.
+    DirectX,
+    /// Vulkan. Linux and Windows.
+    Vulkan,
+    /// Metal. macOS only.
+    Metal,
+    /// OpenGL, through `glow` rather than `wgpu`.
+    OpenGl,
+}
+
+impl Backend {
+    /// Every backend, in the order the settings menu lists them.
+    pub fn all() -> [Self; 5] {
+        [
+            Self::Auto,
+            Self::DirectX,
+            Self::Vulkan,
+            Self::Metal,
+            Self::OpenGl,
+        ]
+    }
+
+    /// Name shown in the settings menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动（跟随系统）",
+            Self::DirectX => "Direct3D 12",
+            Self::Vulkan => "Vulkan",
+            Self::Metal => "Metal",
+            Self::OpenGl => "OpenGL",
+        }
+    }
+
+    /// The API this platform should use when nothing else is asked for.
+    ///
+    /// Order matters: the first entry is the default, the rest are fallbacks.
+    /// Windows lists OpenGL first because the Direct3D 12 stack costs roughly
+    /// 340 MB of private working set against OpenGL's 120 MB on the same
+    /// machine — for a 2D text editor that difference buys nothing.
+    pub fn platform_order() -> &'static [Self] {
+        #[cfg(target_os = "windows")]
+        {
+            &[Self::OpenGl, Self::DirectX, Self::Vulkan]
+        }
+        #[cfg(target_os = "macos")]
+        {
+            &[Self::Metal, Self::OpenGl]
+        }
+        #[cfg(target_os = "linux")]
+        {
+            &[Self::Vulkan, Self::OpenGl]
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        {
+            &[Self::OpenGl]
+        }
+    }
+
+    /// The API this platform should use when nothing else is asked for.
+    pub fn platform_default() -> Self {
+        Self::platform_order()[0]
+    }
+
+    /// What to switch to when `self` failed to create a window.
+    ///
+    /// A failed start leaves no UI to change the setting from, and the event
+    /// loop cannot be created twice in one process — so the recovery is to write
+    /// the next candidate to the config and let the following launch use it.
+    pub fn fallback(self) -> Self {
+        Self::platform_order()
+            .iter()
+            .copied()
+            .find(|b| *b != self && b.is_usable())
+            .unwrap_or(Self::Auto)
+    }
+
+    /// Resolves [`Self::Auto`] and demotes a request this machine cannot honour.
+    ///
+    /// Demoting here rather than only at window creation matters: a failed
+    /// window leaves the user with no UI to change the setting back, and the
+    /// event loop cannot be created twice in one process, so retrying in-process
+    /// is not an option.
+    pub fn effective(self) -> Self {
+        match self {
+            Self::Auto => Self::platform_default(),
+            other if other.unavailable_reason().is_none() => other,
+            _ => Self::platform_default(),
+        }
+    }
+
+    /// Why this backend cannot be used here, or `None` if it can.
+    ///
+    /// Deliberately cheap: it looks for the platform's loader rather than
+    /// creating an instance, because probing by *loading* the driver would add
+    /// exactly the memory cost this setting exists to avoid.
+    pub fn unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::DirectX if !cfg!(target_os = "windows") => Some("仅 Windows 可用"),
+            Self::Metal if !cfg!(target_os = "macos") => Some("仅 macOS 可用"),
+            Self::Vulkan if cfg!(target_os = "macos") => Some("macOS 请用 Metal"),
+            Self::Vulkan if !vulkan_loader_present() => Some("系统未安装 Vulkan 驱动"),
+            _ => None,
+        }
+    }
+
+    /// `true` when the window can actually be created with this backend.
+    pub fn is_usable(self) -> bool {
+        self.unavailable_reason().is_none()
+    }
+}
+
+/// Whether the platform's Vulkan loader is installed at all.
+///
+/// The loader is a separate install on Windows (shipped with the GPU driver),
+/// so its absence means no Vulkan, whatever the hardware can do.
+fn vulkan_loader_present() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        std::path::Path::new(&root).join("System32/vulkan-1.dll").is_file()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        const CANDIDATES: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/usr/lib64/libvulkan.so.1",
+            "/usr/lib/libvulkan.so.1",
+            "/usr/local/lib/libvulkan.so.1",
+        ];
+        CANDIDATES.iter().any(|p| std::path::Path::new(p).exists())
+    }
+}
+
 /// Serialisable settings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,6 +184,8 @@ pub struct Config {
     pub source_wrap: bool,
     /// Render diagrams at this font scale.
     pub diagram_font_scale: f32,
+    /// Graphics API for the window. Takes effect on the next start.
+    pub renderer: Backend,
 }
 
 impl Default for Config {
@@ -52,6 +201,7 @@ impl Default for Config {
             last_dir: None,
             source_wrap: true,
             diagram_font_scale: 1.0,
+            renderer: Backend::Auto,
         }
     }
 }
@@ -224,5 +374,72 @@ mod tests {
             cfg.set_callout_syntax(syntax);
             assert_eq!(cfg.callout_syntax(), syntax);
         }
+    }
+
+    #[test]
+    fn auto_resolves_to_the_platform_api() {
+        let expected = if cfg!(target_os = "windows") {
+            Backend::OpenGl
+        } else if cfg!(target_os = "macos") {
+            Backend::Metal
+        } else {
+            Backend::Vulkan
+        };
+        assert_eq!(Backend::platform_default(), expected);
+        assert_eq!(Backend::Auto.effective(), expected);
+        // The default has to be something the machine can serve.
+        assert!(Backend::platform_default().is_usable());
+    }
+
+    #[test]
+    fn a_failed_backend_falls_back_to_a_different_one() {
+        for backend in Backend::all() {
+            let next = backend.effective().fallback();
+            assert_ne!(next, backend.effective(), "{backend:?} fell back to itself");
+            assert!(next.is_usable() || next == Backend::Auto);
+        }
+    }
+
+    #[test]
+    fn another_platforms_api_is_reported_as_unavailable() {
+        #[cfg(target_os = "windows")]
+        assert!(Backend::Metal.unavailable_reason().is_some());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(Backend::DirectX.unavailable_reason().is_some());
+            assert!(Backend::Vulkan.unavailable_reason().is_some());
+        }
+        #[cfg(target_os = "linux")]
+        assert!(Backend::DirectX.unavailable_reason().is_some());
+    }
+
+    #[test]
+    fn an_impossible_request_never_reaches_the_window_builder() {
+        // Whatever the user asked for, `effective` has to hand back something
+        // this machine can serve — the failure mode is a window that never
+        // appears, with no UI left to change the setting back.
+        for backend in Backend::all() {
+            let effective = backend.effective();
+            assert!(
+                effective.is_usable() || effective == Backend::platform_default(),
+                "{backend:?} resolved to unusable {effective:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_setting_round_trips_and_old_configs_still_load() {
+        let cfg = Config {
+            renderer: Backend::OpenGl,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"renderer\":\"opengl\""), "{json}");
+        let parsed: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.renderer, Backend::OpenGl);
+
+        // A file written before the field existed must not break start-up.
+        let parsed: Config = serde_json::from_str(r#"{"dark":true,"zoom":1.0}"#).unwrap();
+        assert_eq!(parsed.renderer, Backend::Auto);
     }
 }

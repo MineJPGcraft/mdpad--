@@ -44,17 +44,67 @@ fn main() -> eframe::Result<()> {
         previous(info);
     }));
 
+    // The backend is picked before the window exists, so a setting changed in the
+    // UI only takes effect on the next start. `effective` also demotes a request
+    // this machine cannot honour (Direct3D off Windows, Vulkan with no loader).
+    let mut config = config::Config::load();
+    let backend = config.renderer.effective();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1320.0, 900.0])
             .with_min_inner_size([760.0, 520.0])
             .with_title("MarkdownPad"),
+        renderer: if backend == config::Backend::OpenGl {
+            eframe::Renderer::Glow
+        } else {
+            eframe::Renderer::Wgpu
+        },
+        wgpu_options: wgpu_config(backend),
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "MarkdownPad",
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
-    )
+    );
+
+    // A backend that cannot create a window leaves no UI to switch back from,
+    // and the event loop cannot be created twice in one process. Write the next
+    // candidate to the config so the following launch can start.
+    if result.is_err() {
+        let next = backend.fallback();
+        eprintln!(
+            "无法用 {} 创建窗口，已把渲染后端切换为 {}，请重新启动。",
+            backend.label(),
+            next.label()
+        );
+        config.renderer = next;
+        let _ = config.save();
+    }
+    result
+}
+
+/// Restricts `wgpu` to a single API.
+///
+/// Left alone, `wgpu` enumerates every backend it can: on an Intel Arc machine
+/// that means loading the Direct3D 12 user-mode driver, the shader compiler *and*
+/// the Vulkan ICD plus WARP, none of which a 2D editor ever draws with.
+fn wgpu_config(backend: config::Backend) -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::wgpu;
+
+    let backends = match backend {
+        config::Backend::DirectX => wgpu::Backends::DX12,
+        config::Backend::Vulkan => wgpu::Backends::VULKAN,
+        config::Backend::Metal => wgpu::Backends::METAL,
+        // Opening the window through `glow`; this branch is never reached, but
+        // leaving `wgpu` unrestricted would keep the old behaviour.
+        config::Backend::OpenGl | config::Backend::Auto => wgpu::Backends::all(),
+    };
+
+    let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_setup {
+        setup.instance_descriptor.backends = backends;
+    }
+    options
 }

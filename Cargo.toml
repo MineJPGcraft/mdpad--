@@ -8,7 +8,7 @@ readme = "README.md"
 
 [dependencies]
 # --- GUI ---
-eframe = { version = "0.37", features = ["persistence"] }
+eframe = { version = "0.37", features = ["persistence", "glow"] }
 egui = "0.37"
 # `image` feature lets the editor display local raster assets (PNG/JPEG/WebP)
 # referenced from Markdown, and output produced by optional external renderers.

@@ -14,7 +14,7 @@ use egui::{FontFamily, FontId, RichText};
 
 use crate::gfx::Rgba;
 
-use crate::config::Config;
+use crate::config::{Backend, Config};
 use crate::doc::model::{BlockKind, CalloutSyntax, Document, Flavor};
 use crate::edit::{self, EditorAction, RenderOpts, ViewState};
 use crate::find::{CaseMode, Search};
@@ -1355,6 +1355,39 @@ impl App {
             );
             ui.checkbox(&mut self.config.source_wrap, "源码模式自动换行");
             ui.separator();
+            // The backend is chosen before the window exists, so this list only
+            // takes effect on the next start. Entries the machine cannot serve
+            // stay greyed out: clicking them would produce a window that never
+            // appears, with no UI left to switch back from.
+            ui.label("渲染后端（重启后生效）");
+            for backend in Backend::all() {
+                let selected = self.config.renderer == backend;
+                let reason = backend.unavailable_reason();
+                let text = match reason {
+                    Some(why) => format!("{}（{why}）", backend.label()),
+                    None if backend == Backend::Auto => {
+                        format!("{}：{}", backend.label(), backend.effective().label())
+                    }
+                    None => backend.label().to_owned(),
+                };
+                // The active entry stays clickable even if it is no longer
+                // available, otherwise a config carried over from another
+                // machine could not be changed back.
+                let clickable = reason.is_none() || selected;
+                let clicked = ui
+                    .add_enabled_ui(clickable, |ui| ui.selectable_label(selected, text))
+                    .inner
+                    .clicked();
+                if clicked && !selected {
+                    self.config.renderer = backend;
+                    self.note(format!(
+                        "渲染后端改为 {}，重启后生效",
+                        backend.effective().label()
+                    ));
+                    ui.close();
+                }
+            }
+            ui.separator();
             // Font status matters here: without a CJK face Chinese text renders
             // as empty boxes, and without a maths face formulas lose glyphs.
             ui.label(
@@ -2049,7 +2082,7 @@ impl eframe::App for App {
         }
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.commit_active_edit();
         // This run's draft described text that is no longer at risk: either it
         // was saved, or the user chose to discard it when closing.
