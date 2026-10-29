@@ -1061,18 +1061,50 @@ fn classify_callout_syntax(
     variant: &CalloutVariant,
     title: Option<&str>,
 ) -> CalloutSyntax {
-    if variant.is_native_to(CalloutSyntax::GitHub) {
-        let has_fold = line.contains("[!") && {
-            let after = line.split(']').nth(1).unwrap_or("");
-            after.trim_start().starts_with(['+', '-'])
-        };
-        if has_fold || title.is_some_and(|t| !t.trim().is_empty()) {
-            CalloutSyntax::Obsidian
-        } else {
-            CalloutSyntax::GitHub
-        }
-    } else {
-        CalloutSyntax::Obsidian
+    // A custom title or a fold marker only exists in Obsidian's grammar; GitHub's
+    // alert has to be the bare keyword. Those signals win over everything else.
+    let has_fold = line.contains("[!") && {
+        let after = line.split(']').nth(1).unwrap_or("");
+        after.trim_start().starts_with(['+', '-'])
+    };
+    if has_fold || title.is_some_and(|t| !t.trim().is_empty()) {
+        return CalloutSyntax::Obsidian;
+    }
+    // Otherwise the keyword's case decides: GitHub's documentation always writes
+    // `[!NOTE]` in caps, Obsidian's always writes `[!note]` in lower case. Judging
+    // per block is what keeps a document that mixes both from painting a stray
+    // GitHub-styled box in the middle of an Obsidian run.
+    match keyword_case(line) {
+        Some(KeywordCase::Upper) => CalloutSyntax::GitHub,
+        Some(KeywordCase::Lower) => CalloutSyntax::Obsidian,
+        // No ASCII letters (`[!注意]`) or mixed case: fall back to whether the
+        // variant can even be expressed in GitHub's five keywords.
+        None if variant.is_native_to(CalloutSyntax::GitHub) => CalloutSyntax::GitHub,
+        None => CalloutSyntax::Obsidian,
+    }
+}
+
+/// How the alert keyword was typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeywordCase {
+    Upper,
+    Lower,
+}
+
+/// The case the keyword between `[!` and `]` was written in.
+///
+/// `None` when it is mixed (`Note`), carries no ASCII letters (a Chinese custom
+/// key), or the marker is malformed.
+fn keyword_case(line: &str) -> Option<KeywordCase> {
+    let start = line.find("[!")? + 2;
+    let end = start + line[start..].find(']')?;
+    let key = line[start..end].trim();
+    let upper = key.chars().any(|c| c.is_ascii_uppercase());
+    let lower = key.chars().any(|c| c.is_ascii_lowercase());
+    match (upper, lower) {
+        (true, false) => Some(KeywordCase::Upper),
+        (false, true) => Some(KeywordCase::Lower),
+        _ => None,
     }
 }
 
@@ -1828,5 +1860,50 @@ mod tests {
         let src = "**粗体** 与 `代码`\n\n> [!note] 标题\n> 内容\n\n| 表 | 头 |\n|---|---|\n| 值 | 1 |\n";
         let blocks = parse_document(src, Flavor::Markdown);
         assert_spans_sane(src, &blocks);
+    }
+
+    #[test]
+    fn keyword_case_decides_the_syntax_per_block() {
+        // The document mixes both dialects, exactly as it does when someone keeps
+        // an Obsidian section under a GitHub section. A single per-document guess
+        // painted `[!tip]` as a GitHub alert — green left rule and a light bulb in
+        // the middle of the Obsidian run. GitHub's docs write capitals, Obsidian's
+        // write lower case, so the keyword's own case is the reliable signal.
+        let src = "> [!NOTE]\n> a\n\n> [!tip]\n> b\n\n> [!DANGER]\n> c\n\n> [!danger]\n> d\n\n> [!note] 自定义标题\n> e\n";
+        let blocks = parse_document(src, Flavor::Markdown);
+        let syntaxes: Vec<CalloutSyntax> = blocks
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BlockKind::Callout(c) => Some(c.syntax),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            syntaxes,
+            vec![
+                CalloutSyntax::GitHub,   // [!NOTE]
+                CalloutSyntax::Obsidian, // [!tip]
+                CalloutSyntax::GitHub,   // [!DANGER] — caps, even though GitHub has no such keyword
+                CalloutSyntax::Obsidian, // [!danger]
+                CalloutSyntax::Obsidian, // [!note] 自定义标题 — a title is Obsidian-only
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mixed_case_keyword_falls_back_to_the_variant() {
+        // `[!Note]` matches neither convention; the variant then decides whether
+        // the keyword is even expressible as a GitHub alert.
+        let blocks = parse_document("> [!Note]\n> a\n", Flavor::Markdown);
+        match &blocks[0].kind {
+            BlockKind::Callout(c) => assert_eq!(c.syntax, CalloutSyntax::GitHub),
+            other => panic!("expected a callout, got {}", crate::doc::model::kind_label(other)),
+        }
+        let blocks = parse_document("> [!Bug]\n> a\n", Flavor::Markdown);
+        match &blocks[0].kind {
+            // `bug` is not one of GitHub's five, so mixed case lands on Obsidian.
+            BlockKind::Callout(c) => assert_eq!(c.syntax, CalloutSyntax::Obsidian),
+            other => panic!("expected a callout, got {}", crate::doc::model::kind_label(other)),
+        }
     }
 }
