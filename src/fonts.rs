@@ -181,19 +181,48 @@ fn font_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
+/// Font file bytes, shared and never copied.
+///
+/// `epaint` accepts any `Arc<dyn AsRef<[u8]>>` here, which is what lets a file be
+/// mapped rather than read: a mapped face is file-backed, so its untouched
+/// tables are reclaimable pages instead of committed heap. A CJK collection is
+/// ~20 MB, and most of a glyph table never gets touched in a normal session, so
+/// the difference is the largest single saving left in this editor.
+type FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 /// Loads one candidate, returning `(key, bytes, index)`.
-fn load_candidate(cand: &Candidate, dirs: &[std::path::PathBuf]) -> Option<(String, Vec<u8>, u32)> {
+fn load_candidate(cand: &Candidate, dirs: &[std::path::PathBuf]) -> Option<(String, FontBytes, u32)> {
     for dir in dirs {
         for file in cand.files {
             let path = dir.join(file);
-            if let Ok(bytes) = std::fs::read(&path)
-                && !bytes.is_empty()
-            {
+            if let Some(bytes) = map_font(&path) {
                 return Some((cand.key.to_owned(), bytes, cand.index));
             }
         }
     }
     None
+}
+
+/// Maps a font file, falling back to reading it if mapping is not possible.
+fn map_font(path: &std::path::Path) -> Option<FontBytes> {
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() == 0 {
+        return None;
+    }
+    // SAFETY: the mapping is read-only and nothing in this program writes fonts.
+    // The files live in the system font directory, which Windows and the font
+    // config on Unix treat as read-only; a face being replaced is a rename, so
+    // the pages this mapping points at stay valid.
+    if let Ok(map) = unsafe { memmap2::Mmap::map(&file) }
+        && !map.is_empty()
+    {
+        return Some(Arc::new(map));
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(Arc::new(bytes))
 }
 
 /// Registers the platform fonts and returns a report.
@@ -229,10 +258,10 @@ pub fn install(ctx: &egui::Context) -> Report {
                 }
                 report.loaded.push(key.clone());
                 found.push((cand.key, key, index));
-                // Store the bytes.
-                let mut data = FontData::from_owned(bytes);
-                data.index = index;
-                defs.font_data.insert(cand.key.to_owned(), Arc::new(data));
+                // Hand the bytes over as a shared blob: they are not copied and,
+                // when mapped, stay out of the committed heap.
+                defs.font_data
+                    .insert(cand.key.to_owned(), Arc::new(FontData::from_blob(bytes, index)));
             }
             None => report
                 .missing
