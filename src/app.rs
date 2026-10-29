@@ -17,11 +17,16 @@ use crate::gfx::Rgba;
 use crate::config::Config;
 use crate::doc::model::{BlockKind, CalloutSyntax, Document, Flavor};
 use crate::edit::{self, EditorAction, RenderOpts, ViewState};
+use crate::find::{CaseMode, Search};
 use crate::fonts::{self, Report as FontReport};
+use crate::recovery::Draft;
 use crate::theme::Theme;
 
 /// How many undo snapshots to keep.
 const UNDO_LIMIT: usize = 200;
+
+/// How often a dirty document is mirrored to the recovery draft.
+const DRAFT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 thread_local! {
     /// Overrides where the diagnostic report is written; tests set their own path.
@@ -70,6 +75,28 @@ pub struct App {
     diag_frames: std::cell::Cell<u32>,
     /// Identifies this launch, so persisted view state is not restored across runs.
     session: u64,
+    /// The find/replace query and its cursor.
+    find: Search,
+    /// Whether the find bar is open.
+    find_open: bool,
+    /// Whether the find bar is showing its replace row.
+    find_replace_row: bool,
+    /// Document revision the match list was computed at.
+    find_revision: u64,
+    /// Set for one frame after the bar opens, so the query field takes focus.
+    find_focus: bool,
+    /// A draft left by an earlier run, offered in the status bar. It is never
+    /// applied without the user clicking it.
+    pending_draft: Option<Draft>,
+    /// Whether this run has written the draft, so exit can clean up after itself.
+    draft_written: bool,
+    /// The document revision as of the last draft write, so an idle document is
+    /// not rewritten (comparing the text itself would cost a full memcmp a frame).
+    draft_revision: u64,
+    /// When the draft was last written.
+    draft_at: Option<std::time::Instant>,
+    /// A match to select in the source-mode text field, in chars.
+    source_selection: Option<(usize, usize)>,
 }
 
 impl App {
@@ -111,6 +138,9 @@ impl App {
         };
         let mut config = config;
         config.prune_recent();
+        // A draft from an earlier run is only announced, never applied: see the
+        // module note in `recovery` for why.
+        let pending_draft = Draft::load().filter(Draft::is_worth_offering);
         Self {
             config,
             theme,
@@ -126,6 +156,16 @@ impl App {
             startup_log: std::cell::Cell::new(None),
             diag_frames: std::cell::Cell::new(0),
             session: Self::session_id(),
+            find: Search::default(),
+            find_open: false,
+            find_replace_row: false,
+            find_revision: 0,
+            find_focus: false,
+            pending_draft,
+            draft_written: false,
+            draft_revision: 0,
+            draft_at: None,
+            source_selection: None,
         }
     }
 
@@ -208,6 +248,7 @@ impl App {
         self.checkpoint();
         self.doc = Document::new();
         self.after_document_change();
+        self.forget_draft();
         self.note("已新建文档");
     }
 
@@ -231,12 +272,69 @@ impl App {
         self.load_path(path);
     }
 
-    fn load_path(&mut self, path: PathBuf) {
-        match std::fs::read_to_string(&path) {
+    /// The contents of the "打开" menu: the file dialog plus the recent list.
+    fn recent_menu(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button("打开文件 …")
+            .on_hover_text("Ctrl+O")
+            .clicked()
+        {
+            self.open_document();
+            ui.close();
+        }
+        ui.separator();
+        let recent = self.config.recent.clone();
+        if recent.is_empty() {
+            ui.add_enabled(
+                false,
+                egui::Button::new(RichText::new("暂无最近文件").size(12.0)),
+            );
+            return;
+        }
+        ui.label(
+            RichText::new("最近打开")
+                .size(11.0)
+                .color(self.theme.palette.text_faint.to_egui()),
+        );
+        for entry in recent {
+            let path = PathBuf::from(&entry);
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| entry.clone());
+            if ui.button(name).on_hover_text(entry.clone()).clicked() {
+                self.open_recent(path);
+                ui.close();
+            }
+        }
+    }
+
+    /// Opens a file from the recent list.
+    ///
+    /// A vanished file is dropped from the list rather than reported through a
+    /// modal dialog: the list outlives individual files, and a dead entry that
+    /// keeps offering itself is worse than a one-line note.
+    fn open_recent(&mut self, path: PathBuf) {
+        if !path.is_file() {
+            let text = path.display().to_string();
+            self.config.recent.retain(|p| p != &text);
+            self.note(format!("文件已不存在：{text}"));
+            return;
+        }
+        self.commit_active_edit();
+        if self.doc.dirty && !self.confirm_discard() {
+            return;
+        }
+        self.load_path(path);
+    }
+
+    fn load_path(&mut self, path: PathBuf) {        match std::fs::read_to_string(&path) {
             Ok(raw) => {
                 self.checkpoint();
                 self.doc = Document::from_file(path.clone(), &raw);
                 self.after_document_change();
+                self.forget_draft();
                 self.config.push_recent(&path);
                 self.note(format!("已打开 {}", path.display()));
             }
@@ -288,10 +386,99 @@ impl App {
                 }
                 self.doc.dirty = false;
                 self.config.push_recent(&path);
+                // The text is on disk now, so the draft has nothing left to save.
+                self.clear_draft();
                 self.note(format!("已保存 {}", path.display()));
             }
             Err(err) => self.note(format!("保存失败：{err}")),
         }
+    }
+
+    // -- crash recovery ----------------------------------------------------
+
+    /// Mirrors a dirty document to the draft file, at most every few seconds.
+    ///
+    /// Takes the context because of the repaint at the end: an idle window
+    /// produces no frames, so without asking for one the last few seconds of
+    /// typing would sit in memory and never reach the draft — which is precisely
+    /// the window a crash is most likely to land in.
+    fn autosave_tick(&mut self, ctx: &egui::Context) {
+        if !self.doc.dirty || self.doc.revision == self.draft_revision {
+            return;
+        }
+        if let Some(at) = self.draft_at {
+            let elapsed = at.elapsed();
+            if elapsed < DRAFT_INTERVAL {
+                ctx.request_repaint_after(DRAFT_INTERVAL - elapsed);
+                return;
+            }
+        }
+        self.write_draft();
+    }
+
+    /// Writes the draft now.
+    ///
+    /// An empty or whitespace-only document is skipped: there is nothing to
+    /// recover from it, and a blank draft would only produce a pointless offer
+    /// on the next launch.
+    fn write_draft(&mut self) {
+        if self.doc.text.trim().is_empty() {
+            return;
+        }
+        let draft = Draft {
+            path: self.doc.path.as_ref().map(|p| p.display().to_string()),
+            text: self.doc.text.clone(),
+            saved_at: now_secs(),
+        };
+        match draft.save() {
+            Ok(()) => {
+                self.draft_revision = self.doc.revision;
+                self.draft_at = Some(std::time::Instant::now());
+                self.draft_written = true;
+            }
+            Err(err) => log::warn!("draft write failed: {err}"),
+        }
+    }
+
+    /// Drops the draft bookkeeping without touching the file.
+    ///
+    /// Used when the document is replaced: an unclaimed draft from an earlier run
+    /// is not this document's to delete.
+    fn forget_draft(&mut self) {
+        self.pending_draft = None;
+        self.draft_written = false;
+        self.draft_revision = 0;
+        self.draft_at = None;
+    }
+
+    /// Deletes the draft and its bookkeeping, because the text it held is now
+    /// safely on disk.
+    fn clear_draft(&mut self) {
+        Draft::discard();
+        self.forget_draft();
+    }
+
+    /// Adopts the draft found at startup.
+    fn restore_draft(&mut self) {
+        let Some(draft) = self.pending_draft.take() else {
+            return;
+        };
+        self.checkpoint();
+        self.doc = match &draft.path {
+            Some(path) => Document::from_file(PathBuf::from(path), &draft.text),
+            None => {
+                let mut doc = Document::new();
+                doc.set_text(draft.text.clone());
+                doc
+            }
+        };
+        // A draft is unsaved work by definition, even when it came from a file.
+        self.doc.dirty = true;
+        self.after_document_change();
+        self.draft_written = false;
+        self.draft_revision = 0;
+        self.draft_at = None;
+        self.note("已恢复上次未保存的草稿");
     }
 
     /// Asks before throwing away unsaved work.
@@ -332,10 +519,145 @@ impl App {
         }
     }
 
+    // -- find / replace ----------------------------------------------------
+
+    /// Opens the find bar, optionally with the replace row.
+    fn open_find(&mut self, with_replace: bool) {
+        self.find_open = true;
+        self.find_replace_row |= with_replace;
+        self.find_focus = true;
+        self.find_revision = self.doc.revision;
+        self.find.refresh(&self.doc.text);
+    }
+
+    fn close_find(&mut self) {
+        self.find_open = false;
+        self.find_focus = false;
+        self.find.reset_cursor();
+    }
+
+    /// Jumps to the next (or previous) match and selects it in place.
+    fn find_step(&mut self, forward: bool) {
+        // Committing first matters: while a block is being edited its text lives
+        // in the session buffer, not in `doc.text`, so offsets in the document
+        // would otherwise describe the pre-edit text.
+        self.commit_active_edit();
+        self.find.refresh(&self.doc.text);
+        self.find_revision = self.doc.revision;
+        if self.find.is_empty() {
+            self.note("未找到匹配");
+            return;
+        }
+        // Source mode has no blocks: the whole document is one text field, so the
+        // match is selected directly instead of opening a block session.
+        if self.source_mode {
+            if let Some(range) = self.find.step(forward) {
+                let from = edit::byte_to_char(&self.doc.text, range.start);
+                let to = edit::byte_to_char(&self.doc.text, range.end);
+                self.source_selection = Some((from, to));
+            }
+            return;
+        }
+        let total = self.find.len();
+        for _ in 0..total {
+            let Some(range) = self.find.step(forward) else {
+                return;
+            };
+            if self.find_focus_match(&range) {
+                return;
+            }
+        }
+        self.note("匹配处的内容不能直接编辑");
+    }
+
+    /// Opens the block that contains `range` and selects the matched text.
+    ///
+    /// Returns `false` when the block has no text widget, so the caller can try
+    /// the next match instead of leaving a focus request that no widget will
+    /// ever consume.
+    fn find_focus_match(&mut self, range: &std::ops::Range<usize>) -> bool {
+        let Some(path) = path_at_byte(&self.doc.blocks, range.start) else {
+            return false;
+        };
+        let Some(block) = resolve_path(&self.doc.blocks, &path).cloned() else {
+            return false;
+        };
+        // Rules and raw-HTML cards paint only; there is nothing to put a caret in.
+        if matches!(&block.kind, BlockKind::Rule | BlockKind::Html { .. }) {
+            return false;
+        }
+        // A match may run past the block's own span (a paragraph break inside the
+        // query); the buffer only holds this block, so the selection is clamped.
+        let start = range.start.clamp(block.span.start, block.span.end);
+        let end = range.end.clamp(start, block.span.end);
+        let base = edit::byte_to_char(&self.doc.text, block.span.start);
+        let from = edit::byte_to_char(&self.doc.text, start) - base;
+        let to = edit::byte_to_char(&self.doc.text, end) - base;
+        self.view.begin_session(path, &self.doc, &block);
+        self.view.pending_selection = Some((from, to));
+        true
+    }
+
+    /// Replaces the match under the cursor, then selects the following one.
+    fn find_replace_current(&mut self) {
+        self.commit_active_edit();
+        self.find.refresh(&self.doc.text);
+        let Some(range) = self.find.current_match() else {
+            self.note("请先定位到一处匹配");
+            return;
+        };
+        let replacement = self.find.replacement.clone();
+        self.checkpoint();
+        self.doc.replace_span(range, &replacement);
+        self.source_buffer = self.doc.text.clone();
+        self.find.refresh(&self.doc.text);
+        self.find_revision = self.doc.revision;
+        // The replaced match is gone, so the cursor's index already names the
+        // next one; only a cursor that fell off the end needs a wrap.
+        let next = self.find.current_match().or_else(|| self.find.step(true));
+        if let Some(next) = next {
+            self.find_focus_match(&next);
+        }
+    }
+
+    /// Replaces every match in one pass.
+    ///
+    /// The document is rewritten once through the search results rather than by
+    /// repeated [`Document::replace_span`] calls: each of those reparses the whole
+    /// document, and offsets from a match list collected beforehand stop being
+    /// valid the moment the first replacement changes the text length.
+    fn find_replace_all(&mut self) {
+        self.commit_active_edit();
+        self.find.refresh(&self.doc.text);
+        self.find_revision = self.doc.revision;
+        if self.find.is_empty() {
+            self.note("未找到匹配");
+            return;
+        }
+        let count = self.find.len();
+        let replacement = self.find.replacement.clone();
+        let updated = crate::find::replace_all(&self.doc.text, self.find.matches(), &replacement);
+        if updated == self.doc.text {
+            self.note("没有发生变化");
+            return;
+        }
+        self.checkpoint();
+        let len = self.doc.text.len();
+        self.doc.replace_span(0..len, &updated);
+        self.view.end_session();
+        self.source_buffer = self.doc.text.clone();
+        self.find.reset_cursor();
+        self.find.refresh(&self.doc.text);
+        self.find_revision = self.doc.revision;
+        self.note(format!("已替换 {count} 处"));
+    }
+
     // -- source mode -------------------------------------------------------
 
     fn toggle_source(&mut self, ctx: &egui::Context) {
         self.commit_active_edit();
+        // A selection aimed at the other surface would land in the wrong place.
+        self.source_selection = None;
         self.source_mode = !self.source_mode;
         self.config.source_mode = self.source_mode;
         if self.source_mode {
@@ -486,9 +808,9 @@ impl App {
                             if ui.button("新建").on_hover_text("Ctrl+N").clicked() {
                                 self.new_document();
                             }
-                            if ui.button("打开").on_hover_text("Ctrl+O").clicked() {
-                                self.open_document();
-                            }
+                            ui.menu_button("打开", |ui| self.recent_menu(ui))
+                                .response
+                                .on_hover_text("Ctrl+O · 最近打开的文件");
                             if ui
                                 .button(if self.doc.dirty { "保存 •" } else { "保存" })
                                 .on_hover_text("Ctrl+S")
@@ -573,6 +895,160 @@ impl App {
                     });
                 });
             });
+    }
+
+    /// The find/replace bar, drawn directly under the toolbar.
+    ///
+    /// Kept as its own panel rather than a floating window so it never covers the
+    /// text it is pointing at, and so the page geometry below it is unaffected.
+    fn find_bar(&mut self, ui: &mut egui::Ui) {
+        if !self.find_open {
+            return;
+        }
+        // Matching the whole document on every frame would be wasteful; the list
+        // is only stale when the text changed or the query did.
+        if self.find_revision != self.doc.revision {
+            self.find_revision = self.doc.revision;
+            self.find.refresh(&self.doc.text);
+        }
+
+        let theme = self.theme;
+        let mut jump: Option<bool> = None;
+        let mut replace_current = false;
+        let mut replace_all = false;
+        let mut close = false;
+        let height = if self.find_replace_row { 66.0 } else { 38.0 };
+
+        egui::Panel::top("mdp-find")
+            .exact_size(height)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    let query = ui.add(
+                        egui::TextEdit::singleline(&mut self.find.query)
+                            .desired_width(240.0)
+                            .hint_text("查找"),
+                    );
+                    if self.find_focus {
+                        query.request_focus();
+                        self.find_focus = false;
+                    }
+                    if query.changed() {
+                        self.find.refresh(&self.doc.text);
+                        self.find.reset_cursor();
+                        self.find_revision = self.doc.revision;
+                    }
+
+                    let mut sensitive = self.find.case == CaseMode::Sensitive;
+                    if ui
+                        .checkbox(&mut sensitive, "Aa")
+                        .on_hover_text("区分大小写")
+                        .changed()
+                    {
+                        self.find.case = if sensitive {
+                            CaseMode::Sensitive
+                        } else {
+                            CaseMode::Insensitive
+                        };
+                        self.find.refresh(&self.doc.text);
+                        self.find.reset_cursor();
+                        self.find_revision = self.doc.revision;
+                    }
+
+                    if ui.button("↓").on_hover_text("下一处（Enter）").clicked() {
+                        jump = Some(true);
+                    }
+                    if ui.button("↑").on_hover_text("上一处（Shift+Enter）").clicked() {
+                        jump = Some(false);
+                    }
+
+                    let label = if self.find.query.is_empty() {
+                        String::new()
+                    } else if self.find.is_empty() {
+                        "无匹配".to_owned()
+                    } else {
+                        match self.find.position() {
+                            Some(at) => format!("{at} / {}", self.find.len()),
+                            None => format!("共 {} 处", self.find.len()),
+                        }
+                    };
+                    if !label.is_empty() {
+                        ui.label(
+                            RichText::new(label)
+                                .size(11.0)
+                                .color(theme.palette.text_faint.to_egui()),
+                        );
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        if ui.button("×").on_hover_text("关闭（Esc）").clicked() {
+                            close = true;
+                        }
+                        let toggle = if self.find_replace_row {
+                            "替换 ▴"
+                        } else {
+                            "替换 ▾"
+                        };
+                        if ui
+                            .selectable_label(self.find_replace_row, RichText::new(toggle).size(12.0))
+                            .on_hover_text("展开替换输入框（Ctrl+H）")
+                            .clicked()
+                        {
+                            self.find_replace_row = !self.find_replace_row;
+                        }
+                    });
+                });
+
+                if self.find_replace_row {
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.find.replacement)
+                                .desired_width(240.0)
+                                .hint_text("替换为"),
+                        );
+                        ui.add_space(8.0);
+                        if ui
+                            .button("替换")
+                            .on_hover_text("替换当前匹配并跳到下一处")
+                            .clicked()
+                        {
+                            replace_current = true;
+                        }
+                        if ui.button("全部替换").clicked() {
+                            replace_all = true;
+                        }
+                    });
+                }
+
+                // Keys are consumed here so the document below never sees them.
+                if ui
+                    .input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter))
+                {
+                    jump = Some(false);
+                }
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                    jump = Some(true);
+                }
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+
+        if let Some(forward) = jump {
+            self.find_step(forward);
+        }
+        if replace_current {
+            self.find_replace_current();
+        }
+        if replace_all {
+            self.find_replace_all();
+        }
+        if close {
+            self.close_find();
+        }
     }
 
     /// One labelled ribbon group: a bordered panel with a caption below.
@@ -931,6 +1407,30 @@ impl App {
                                 .color(self.theme.palette.accent.to_egui()),
                         );
                     }
+                    // A draft from an earlier run: offered, never applied. Two
+                    // small buttons, because the alternative — restoring state on
+                    // startup — is exactly what this project decided against.
+                    if let Some(draft) = self.pending_draft.clone() {
+                        ui.separator();
+                        if ui
+                            .small_button("恢复草稿")
+                            .on_hover_text(format!(
+                                "{} · 上次运行未保存的内容：{}\n点击恢复，会覆盖当前文档（可撤销）",
+                                draft.age_words(now_secs()),
+                                draft.path.clone().unwrap_or_else(|| "未命名文档".to_owned())
+                            ))
+                            .clicked()
+                        {
+                            self.restore_draft();
+                        }
+                        if ui
+                            .small_button("丢弃")
+                            .on_hover_text("删除这份草稿，不再提示")
+                            .clicked()
+                        {
+                            self.clear_draft();
+                        }
+                    }
                     // One-shot: the first frames write a geometry report, and the
                     // status bar says where it went so a blank page can be
                     // diagnosed without guessing at the window's real state.
@@ -1281,7 +1781,7 @@ impl App {
             ui.ctx().fonts_mut(|f| f.layout_job(job))
         };
 
-        ui.add(
+        let resp = ui.add(
             egui::TextEdit::multiline(&mut self.source_buffer)
                 .id(egui::Id::unique("mdp-source"))
                 .frame(egui::Frame::NONE)
@@ -1292,6 +1792,22 @@ impl App {
                 ))
                 .layouter(&mut layouter),
         );
+        // A search jump installs its selection here, where the widget and its id
+        // both exist. egui keeps the cursor in memory keyed by that id.
+        if let Some((from, to)) = self.source_selection.take() {
+            resp.request_focus();
+            if let Some(mut state) =
+                egui::widgets::text_edit::TextEditState::load(ui.ctx(), resp.id)
+            {
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(from),
+                        egui::text::CCursor::new(to),
+                    )));
+                state.store(ui.ctx(), resp.id);
+            }
+        }
         // The buffer is authoritative while source mode is active.
         if self.source_buffer != self.doc.text {
             self.checkpoint();
@@ -1423,6 +1939,12 @@ impl App {
         if consume(egui::Modifiers::COMMAND, egui::Key::E) {
             self.export_html();
         }
+        if consume(egui::Modifiers::COMMAND, egui::Key::F) {
+            self.open_find(false);
+        }
+        if consume(egui::Modifiers::COMMAND, egui::Key::H) {
+            self.open_find(true);
+        }
         if self.view.active.is_some() {
             if consume(egui::Modifiers::COMMAND, egui::Key::B) {
                 self.wrap_active("**", "**");
@@ -1460,6 +1982,14 @@ impl App {
     }
 }
 
+/// Seconds since the Unix epoch, for draft timestamps.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn path_at_byte(blocks: &[crate::doc::model::Block], byte: usize) -> Option<Vec<usize>> {
     for (index, block) in blocks.iter().enumerate() {
         if block.span.start <= byte && byte < block.span.end {
@@ -1491,7 +2021,9 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.handle_close_request(&ctx);
         self.shortcuts(&ctx);
+        self.autosave_tick(&ctx);
         self.toolbar(ui);
+        self.find_bar(ui);
         self.status_bar(ui);
         self.document_surface(ui);
         self.window_title(&ctx);
@@ -1503,6 +2035,11 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         self.commit_active_edit();
+        // This run's draft described text that is no longer at risk: either it
+        // was saved, or the user chose to discard it when closing.
+        if self.draft_written {
+            Draft::discard();
+        }
         let _ = self.config.save();
     }
 }
@@ -2293,6 +2830,16 @@ mod tests {
             startup_log: std::cell::Cell::new(None),
             diag_frames: std::cell::Cell::new(0),
             session: App::session_id(),
+            find: Search::default(),
+            find_open: false,
+            find_replace_row: false,
+            find_revision: 0,
+            find_focus: false,
+            pending_draft: None,
+            draft_written: false,
+            draft_revision: 0,
+            draft_at: None,
+            source_selection: None,
         }
     }
 
@@ -3231,5 +3778,457 @@ mod tests {
             on_screen >= 20,
             "only {on_screen} text runs are visible on the first frame"
         );
+    }
+
+    // -- find / replace ----------------------------------------------------
+
+    fn typed_search(app: &mut App, query: &str, replacement: &str) {
+        app.find.query = query.to_owned();
+        app.find.replacement = replacement.to_owned();
+        app.find.refresh(&app.doc.text);
+        app.find_revision = app.doc.revision;
+    }
+
+    #[test]
+    fn finding_opens_the_block_that_holds_the_match_and_selects_it() {
+        let mut app = test_app("# 标题\n\n第一段文字\n\n第二段 alpha\n");
+        typed_search(&mut app, "alpha", "");
+        app.find_step(true);
+        let session = app.view.active.as_ref().expect("the matching block opens");
+        assert_eq!(session.path, vec![2]);
+        let (from, to) = app.view.pending_selection.expect("a selection is installed");
+        // Check the selection against the buffer it will be applied to, rather
+        // than against the numbers the code just computed.
+        let buffer = session.buffer.clone();
+        let selected = &buffer[edit::char_to_byte(&buffer, from)..edit::char_to_byte(&buffer, to)];
+        assert_eq!(selected, "alpha");
+    }
+
+    #[test]
+    fn finding_commits_the_block_being_edited_first() {
+        let mut app = test_app("one\n\ntwo\n");
+        edit_first_block(&mut app, "one edited");
+        typed_search(&mut app, "edited", "");
+        app.find_step(true);
+        assert!(
+            app.doc.text.contains("one edited"),
+            "the pending edit must be committed before offsets are trusted"
+        );
+        assert!(app.view.active.is_some());
+    }
+
+    #[test]
+    fn replace_all_rewrites_every_match_in_a_single_undo_step() {
+        let mut app = test_app("alpha beta\n\nalpha gamma\n");
+        typed_search(&mut app, "alpha", "omega");
+        app.find_replace_all();
+        assert_eq!(app.doc.text, "omega beta\n\nomega gamma\n");
+        assert!(app.doc.dirty);
+        // One undo must restore the whole thing; two would mean the replacement
+        // was applied match by match.
+        app.undo();
+        assert_eq!(app.doc.text, "alpha beta\n\nalpha gamma\n");
+    }
+
+    #[test]
+    fn replace_all_is_a_no_op_when_the_replacement_matches_the_query() {
+        let mut app = test_app("same same\n");
+        typed_search(&mut app, "same", "same");
+        app.find_replace_all();
+        assert_eq!(app.doc.text, "same same\n");
+        assert!(!app.doc.dirty);
+        assert_eq!(app.status_note.as_deref(), Some("没有发生变化"));
+    }
+
+    #[test]
+    fn replace_current_replaces_only_the_selected_match() {
+        let mut app = test_app("a b a b a\n");
+        typed_search(&mut app, "a", "X");
+        app.find_step(true);
+        app.find_replace_current();
+        assert_eq!(app.doc.text, "X b a b a\n");
+        // And the selection moved on to the next match.
+        assert_eq!(app.find.current_match(), Some(4..5));
+    }
+
+    #[test]
+    fn a_match_inside_a_rule_does_not_open_a_text_session() {
+        let mut app = test_app("text\n\n---\n\nmore\n");
+        typed_search(&mut app, "---", "");
+        app.find_step(true);
+        assert!(
+            app.view.active.is_none(),
+            "a rule paints only; there is no widget to hold a caret"
+        );
+        assert_eq!(
+            app.status_note.as_deref(),
+            Some("匹配处的内容不能直接编辑")
+        );
+    }
+
+    /// Drives `passes` frames of the real app widget tree.
+    ///
+    /// Returns every painted text rectangle, plus the ones whose text contains
+    /// `needle` — the second list is how a test asks "was this specific label
+    /// actually laid out", rather than trusting that *something* was painted.
+    fn paint_frames(
+        app: &mut App,
+        passes: usize,
+        events: Vec<egui::Event>,
+        needle: &str,
+    ) -> (Vec<egui::Rect>, Vec<egui::Rect>) {
+        let context = egui::Context::default();
+        app.fonts = crate::fonts::install(&context);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 829.5));
+        let mut frame = eframe::Frame::_new_kittest();
+        let (mut all, mut hits) = (Vec::new(), Vec::new());
+        for pass in 0..passes {
+            let out = context.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: if pass == 0 { events.clone() } else { Vec::new() },
+                    ..Default::default()
+                },
+                |context| {
+                    let mut ui = egui::Ui::new(
+                        context.clone(),
+                        egui::Id::unique("mdp-root"),
+                        egui::UiBuilder::new()
+                            .max_rect(screen)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    eframe::App::ui(app, &mut ui, &mut frame);
+                },
+            );
+            for clipped in &out.shapes {
+                if let egui::Shape::Text(text) = &clipped.shape {
+                    let rect = text.visual_bounding_rect();
+                    all.push(rect);
+                    if !needle.is_empty() && text.galley.job.text.contains(needle) {
+                        hits.push(rect);
+                    }
+                }
+            }
+            out.drop_without_applying_deltas();
+        }
+        (all, hits)
+    }
+
+    #[test]
+    fn pressing_enter_in_the_find_bar_jumps_to_the_match() {
+        let mut app = test_app("alpha\n\nbeta gamma\n");
+        app.find_open = true;
+        app.find_focus = true;
+        app.find.query = "beta".to_owned();
+        app.find.refresh(&app.doc.text);
+        app.find_revision = app.doc.revision;
+        paint_frames(
+            &mut app,
+            3,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            "",
+        );
+        let session = app
+            .view
+            .active
+            .as_ref()
+            .expect("Enter in the find bar must jump to the match");
+        assert_eq!(session.path, vec![1]);
+        assert!(app.find_open, "jumping must not close the bar");
+    }
+
+    #[test]
+    fn escape_closes_the_find_bar_without_reaching_the_document() {
+        let mut app = test_app("alpha\n\nbeta\n");
+        app.find_open = true;
+        app.find_focus = true;
+        paint_frames(
+            &mut app,
+            3,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            "",
+        );
+        assert!(!app.find_open);
+    }
+
+    // -- recent files ------------------------------------------------------
+
+    #[test]
+    fn opening_a_recent_file_that_vanished_prunes_it() {
+        let mut app = test_app("current\n");
+        let missing = std::env::temp_dir().join(format!(
+            "mdpad-gone-{}.md",
+            App::session_id()
+        ));
+        app.config.recent = vec![missing.display().to_string(), "keep.md".to_owned()];
+        app.open_recent(missing.clone());
+        assert_eq!(
+            app.config.recent,
+            vec!["keep.md".to_owned()],
+            "a missing file must not stay in the recent list"
+        );
+        assert_eq!(app.doc.text, "current\n", "the open document must not change");
+        assert!(
+            app.status_note.as_deref().is_some_and(|n| n.contains("不存在")),
+            "the miss must be reported: {:?}",
+            app.status_note
+        );
+    }
+
+    #[test]
+    fn opening_a_recent_file_loads_it_and_moves_it_to_the_front() {
+        let path = std::env::temp_dir().join(format!(
+            "mdpad-recent-{}.md",
+            App::session_id()
+        ));
+        std::fs::write(&path, "# 最近\n\n正文\n").expect("write test file");
+        let mut app = test_app("current\n");
+        app.config.recent = vec!["other.md".to_owned(), path.display().to_string()];
+
+        app.open_recent(path.clone());
+
+        assert_eq!(app.doc.path.as_ref(), Some(&path));
+        assert_eq!(app.doc.text, "# 最近\n\n正文\n");
+        assert_eq!(
+            app.config.recent.first().map(String::as_str),
+            Some(path.display().to_string().as_str()),
+            "the opened file must become the most recent entry"
+        );
+        std::fs::remove_file(&path).expect("remove test file");
+    }
+
+    #[test]
+    fn the_find_bar_does_not_crowd_the_document_off_the_page() {
+        let mut app = test_app("搜索目标段落\n\n第二段\n");
+        app.find_open = true;
+        app.find_replace_row = true;
+        app.find.query = "目标".to_owned();
+        app.find.replacement = "结果".to_owned();
+        app.find.refresh(&app.doc.text);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 829.5));
+
+        // The bar must actually lay out its own labels...
+        let (_, bar) = paint_frames(&mut app, 4, Vec::new(), "Aa");
+        assert!(
+            bar.iter().any(|r| screen.contains(r.center()) && r.top() < 160.0),
+            "the find bar painted no controls"
+        );
+
+        // ...and leave the first paragraph on the page below it.
+        let (_, body) = paint_frames(&mut app, 4, Vec::new(), "搜索目标段落");
+        let paragraph = body
+            .first()
+            .expect("the first paragraph was not painted at all");
+        assert!(
+            screen.contains(paragraph.center()) && paragraph.top() > 160.0,
+            "the paragraph is not below the find bar and on screen: {paragraph:?}"
+        );
+    }
+
+    // -- crash recovery ----------------------------------------------------
+
+    /// Redirects the draft file to a temp path for the duration of a test.
+    struct DraftAtTemp {
+        path: PathBuf,
+        previous: Option<PathBuf>,
+    }
+
+    impl DraftAtTemp {
+        fn new() -> Self {
+            let name = format!(
+                "mdpad-app-draft-{}-{:?}.json",
+                std::process::id(),
+                std::thread::current().id()
+            );
+            let path = std::env::temp_dir().join(name);
+            let previous = crate::recovery::set_draft_path(Some(path.clone()));
+            // Only after the redirect: this deletes the *temp* file, never the
+            // real draft of whoever is running the tests.
+            Draft::discard();
+            Self { path, previous }
+        }
+
+        fn load(&self) -> Option<Draft> {
+            Draft::load()
+        }
+    }
+
+    impl Drop for DraftAtTemp {
+        fn drop(&mut self) {
+            Draft::discard();
+            crate::recovery::set_draft_path(self.previous.clone());
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn finding_in_source_mode_selects_the_match_in_the_text_field() {
+        let mut app = test_app("alpha\n\nbeta\n");
+        app.source_mode = true;
+        app.source_buffer = app.doc.text.clone();
+        app.find_open = true;
+        typed_search(&mut app, "beta", "");
+        app.find_step(true);
+        assert_eq!(
+            app.source_selection,
+            Some((7, 11)),
+            "the match must be selected in the source buffer"
+        );
+        // One frame is enough for the pane to consume it and hand it to egui.
+        paint_frames(&mut app, 2, Vec::new(), "");
+        assert!(
+            app.source_selection.is_none(),
+            "the source pane must consume the pending selection"
+        );
+    }
+
+    #[test]
+    fn autosave_writes_a_dirty_document_and_ignores_a_clean_one() {
+        let draft = DraftAtTemp::new();
+        let mut app = test_app("clean\n");
+        app.autosave_tick(&egui::Context::default());
+        assert!(
+            draft.load().is_none(),
+            "a clean document has nothing to recover"
+        );
+
+        app.doc.set_text("未保存的内容\n".to_owned());
+        app.autosave_tick(&egui::Context::default());
+        let written = draft.load().expect("the dirty document must be drafted");
+        assert_eq!(written.text, "未保存的内容\n");
+        assert!(app.draft_written);
+    }
+
+    #[test]
+    fn autosave_waits_between_writes() {
+        let draft = DraftAtTemp::new();
+        let mut app = test_app("");
+        app.doc.set_text("first version\n".to_owned());
+        app.autosave_tick(&egui::Context::default());
+        assert_eq!(draft.load().expect("first draft").text, "first version\n");
+
+        // Changed again immediately: the throttle must keep the old draft until
+        // the interval has passed, so typing does not write on every keystroke.
+        app.doc.set_text("second version\n".to_owned());
+        app.autosave_tick(&egui::Context::default());
+        assert_eq!(draft.load().expect("draft still there").text, "first version\n");
+    }
+
+    #[test]
+    fn an_empty_document_is_never_drafted() {
+        let draft = DraftAtTemp::new();
+        let mut app = test_app("");
+        app.doc.set_text("   \n\n".to_owned());
+        app.autosave_tick(&egui::Context::default());
+        assert!(draft.load().is_none());
+    }
+
+    #[test]
+    fn saving_clears_the_draft() {
+        let draft = DraftAtTemp::new();
+        let mut app = test_app("");
+        app.doc.set_text("work in progress\n".to_owned());
+        app.autosave_tick(&egui::Context::default());
+        assert!(draft.load().is_some());
+
+        let path = std::env::temp_dir().join(format!(
+            "mdpad-saved-{}.md",
+            App::session_id()
+        ));
+        app.write_to(path.clone(), None);
+        assert!(draft.load().is_none(), "a saved document needs no draft");
+        assert!(!app.draft_written);
+        std::fs::remove_file(&path).expect("remove test file");
+    }
+
+    #[test]
+    fn a_startup_draft_is_offered_but_never_applied_on_its_own() {
+        let draft = DraftAtTemp::new();
+        Draft {
+            path: None,
+            text: "上次写到一半的内容\n".to_owned(),
+            saved_at: now_secs(),
+        }
+        .save()
+        .expect("seed a draft");
+
+        let mut app = test_app("current\n");
+        app.pending_draft = draft.load().filter(Draft::is_worth_offering);
+        assert!(app.pending_draft.is_some());
+        assert_eq!(
+            app.doc.text, "current\n",
+            "the draft must not replace the document by itself"
+        );
+
+        app.restore_draft();
+        assert_eq!(app.doc.text, "上次写到一半的内容\n");
+        assert!(app.doc.dirty, "restored text is unsaved work");
+        assert!(app.pending_draft.is_none());
+
+        // And it is a normal edit, so it can be undone.
+        app.undo();
+        assert_eq!(app.doc.text, "current\n");
+    }
+
+    #[test]
+    fn the_status_bar_offers_the_draft() {
+        let draft = DraftAtTemp::new();
+        let mut app = test_app("current\n");
+        app.pending_draft = Some(Draft {
+            path: None,
+            text: "草稿".to_owned(),
+            saved_at: now_secs(),
+        });
+        let (_, offered) = paint_frames(&mut app, 3, Vec::new(), "恢复草稿");
+        assert!(!offered.is_empty(), "the status bar never offered the draft");
+        assert!(draft.load().is_none(), "offering must not recreate the file");
+    }
+
+    #[test]
+    fn the_open_menu_lists_the_recent_files() {
+        let mut app = test_app("current\n");
+        app.config.recent = vec!["a.md".to_owned(), "b.md".to_owned()];
+        let context = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0));
+        let out = context.run_pass(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |context| {
+                let mut ui = egui::Ui::new(
+                    context.clone(),
+                    egui::Id::unique("menu"),
+                    egui::UiBuilder::new()
+                        .max_rect(screen)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                app.recent_menu(&mut ui);
+            },
+        );
+        let mut heading = false;
+        let mut entries = 0;
+        for clipped in &out.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                let job = &text.galley.job.text;
+                heading |= job.contains("最近打开");
+                entries += usize::from(job.contains("a.md")) + usize::from(job.contains("b.md"));
+            }
+        }
+        out.drop_without_applying_deltas();
+        assert!(heading, "the menu must title the recent section");
+        assert_eq!(entries, 2, "both recent files must be listed");
     }
 }

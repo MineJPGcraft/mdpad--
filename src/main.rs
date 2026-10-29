@@ -17,9 +17,11 @@ mod config;
 mod diagram;
 mod doc;
 mod edit;
+mod find;
 mod fonts;
 mod gfx;
 mod gfx_egui;
+mod recovery;
 mod tex;
 mod theme;
 

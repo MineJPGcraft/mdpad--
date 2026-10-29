@@ -82,12 +82,16 @@ pub struct ViewState {
     pub notice: Option<(String, f64)>,
     /// Set when a block was activated programmatically and should take focus.
     pub focus_requested: bool,
+    /// A selection (in *chars* of the block buffer) to install once the
+    /// editable widget exists, used when jumping to a search result.
+    pub pending_selection: Option<(usize, usize)>,
 }
 
 impl ViewState {
     /// Ends the current edit session.
     pub fn end_session(&mut self) {
         self.active = None;
+        self.pending_selection = None;
     }
 
     /// Drops caches after a theme or zoom change.
@@ -101,6 +105,9 @@ impl ViewState {
     }
 
     /// Begins editing `path`, seeding the buffer from the document.
+    ///
+    /// `pending_selection` is deliberately cleared: a fresh session has no
+    /// selection unless the caller installs one right after (search does).
     pub fn begin_session(&mut self, path: Vec<usize>, doc: &Document, block: &Block) {
         self.active = Some(EditSession {
             path,
@@ -108,6 +115,7 @@ impl ViewState {
             revision: doc.revision,
         });
         self.focus_requested = true;
+        self.pending_selection = None;
     }
 }
 
@@ -507,8 +515,7 @@ impl BlockCtx<'_> {
         );
 
         if self.state.focus_requested {
-            resp.request_focus();
-            self.state.focus_requested = false;
+            take_focus(self.state, ui, id, &resp);
         }
 
         let commit = resp.lost_focus()
@@ -900,8 +907,7 @@ impl BlockCtx<'_> {
                 .layouter(&mut layouter),
         );
         if self.state.focus_requested {
-            resp.request_focus();
-            self.state.focus_requested = false;
+            take_focus(self.state, ui, id, &resp);
         }
         if resp.lost_focus() {
             let text = self.state.active.as_ref()?.buffer.clone();
@@ -1793,6 +1799,31 @@ fn block_id(ui: &Ui, path: &[usize]) -> egui::Id {
     ui.make_persistent_id(("mdp-block", path.to_vec()))
 }
 
+/// Focuses a freshly created editable widget and installs a pending selection.
+///
+/// The cursor state lives in egui's memory keyed by the widget id, so it can only
+/// be written *after* the widget exists. Search needs that: it decides which
+/// block to open while handling a button click, several frames away from the
+/// widget that has to show the highlight.
+fn take_focus(state: &mut ViewState, ui: &Ui, id: egui::Id, resp: &egui::Response) {
+    if !state.focus_requested {
+        return;
+    }
+    resp.request_focus();
+    state.focus_requested = false;
+    let Some((from, to)) = state.pending_selection.take() else {
+        return;
+    };
+    let Some(mut edit_state) = TextEditState::load(ui.ctx(), id) else {
+        return;
+    };
+    edit_state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+        egui::text::CCursor::new(from),
+        egui::text::CCursor::new(to),
+    )));
+    edit_state.store(ui.ctx(), id);
+}
+
 /// The caret as a pair of *character* indices, if the widget has one.
 fn caret_chars(ui: &Ui, id: egui::Id) -> Option<(usize, usize)> {
     let state = TextEditState::load(ui.ctx(), id)?;
@@ -1811,6 +1842,21 @@ pub fn char_to_byte(text: &str, char_index: usize) -> usize {
         Some((byte, _)) => byte,
         None => text.len(),
     }
+}
+
+/// Converts a byte offset into a character index, snapping to the nearest
+/// boundary at or below it.
+///
+/// The editable widgets count in characters (that is what egui's cursor stores)
+/// while the document counts in bytes (that is what spans and search results
+/// store). Every hop between the two goes through these two functions so the
+/// conversion rule lives in one place.
+pub fn byte_to_char(text: &str, byte: usize) -> usize {
+    let mut at = byte.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    text[..at].chars().count()
 }
 
 /// Cache key for a diagram render.
