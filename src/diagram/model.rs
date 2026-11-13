@@ -21,6 +21,9 @@ pub enum DiagramKind {
     Class,
     State,
     Entity,
+    Mindmap,
+    Requirement,
+    Kanban,
 }
 
 impl DiagramKind {
@@ -32,6 +35,9 @@ impl DiagramKind {
             Self::Class => "class",
             Self::State => "state",
             Self::Entity => "ER",
+            Self::Mindmap => "mindmap",
+            Self::Requirement => "requirement",
+            Self::Kanban => "kanban",
         }
     }
 }
@@ -206,6 +212,8 @@ pub struct Edge {
     pub color: Option<Rgba>,
     /// `linkStyle ... stroke-width:3px`, in points.
     pub width: Option<f32>,
+    /// `A ~~~ B`: still shapes the layout, but is not drawn.
+    pub hidden: bool,
 }
 
 impl Edge {
@@ -220,6 +228,7 @@ impl Edge {
             label_pad: 0.0,
             color: None,
             width: None,
+            hidden: false,
         }
     }
 }

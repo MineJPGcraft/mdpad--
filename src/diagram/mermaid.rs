@@ -63,6 +63,9 @@ pub fn parse(src: &str) -> Diagram {
         Header::Class => Diagram::Graph(class_parse(&lines[1..], title)),
         Header::State => Diagram::Graph(state_parse(&lines[1..], title)),
         Header::Entity => Diagram::Graph(er_parse(&lines[1..], title)),
+        Header::Mindmap => Diagram::Graph(mindmap_parse(src, title)),
+        Header::Requirement => Diagram::Graph(requirement_parse(&lines[1..], title)),
+        Header::Kanban => Diagram::Graph(kanban_parse(src, title)),
         Header::Unknown(name) => {
             let mut graph = if looks_like_edge(first) {
                 flowchart_graph(&lines, Direction::TopDown, None, title)
@@ -407,6 +410,9 @@ enum Header {
     Class,
     State,
     Entity,
+    Mindmap,
+    Requirement,
+    Kanban,
     Unknown(String),
 }
 
@@ -432,6 +438,9 @@ fn detect_header(first: &str) -> Header {
         "classdiagram" | "classdiagram-v2" => Header::Class,
         "statediagram" | "statediagram-v2" => Header::State,
         "erdiagram" => Header::Entity,
+        "mindmap" => Header::Mindmap,
+        "requirementdiagram" => Header::Requirement,
+        "kanban" => Header::Kanban,
         _ => Header::Unknown(word.to_owned()),
     }
 }
@@ -599,6 +608,8 @@ struct Link {
     tail: Arrow,
     line: LineStyle,
     label: Option<String>,
+    /// `~~~`: laid out but never drawn.
+    hidden: bool,
 }
 
 struct FlowParser {
@@ -985,6 +996,7 @@ impl FlowParser {
         edge.head = link.head;
         edge.tail = link.tail;
         edge.line = link.line;
+        edge.hidden = link.hidden;
         if let Some(label) = &link.label {
             edge.label = Some(label.clone());
             edge.label_pad = 4.0;
@@ -1154,6 +1166,33 @@ fn read_link(s: &[char]) -> Option<Link> {
     if s.is_empty() {
         return None;
     }
+    // `~~~` is an invisible link: it only shapes the layout.
+    if s.first() == Some(&'~') {
+        let mut i = 0;
+        while s.get(i) == Some(&'~') {
+            i += 1;
+        }
+        let mut label = None;
+        // `~~~ text ~~~` carries a label that is never painted.
+        if s.get(i).is_some_and(|c| c.is_whitespace()) {
+            if let Some(close) = find_seq(s, &['~', '~', '~'], i) {
+                let text: String = s.get(i..close).unwrap_or(&[]).iter().collect();
+                let text = text.trim();
+                if !text.is_empty() {
+                    label = Some(clean_label(text));
+                }
+                i = close + 3;
+            }
+        }
+        return Some(Link {
+            len: i,
+            head: Arrow::None,
+            tail: Arrow::None,
+            line: LineStyle::Solid,
+            label,
+            hidden: true,
+        });
+    }
     let mut i = 0;
     let mut tail = Arrow::None;
     if s.first() == Some(&'<') {
@@ -1228,6 +1267,7 @@ fn read_link(s: &[char]) -> Option<Link> {
                         LineStyle::Solid
                     },
                     label: Some(clean_label(text)),
+                    hidden: false,
                 });
             }
         }
@@ -1243,6 +1283,7 @@ fn read_link(s: &[char]) -> Option<Link> {
             LineStyle::Solid
         },
         label,
+        hidden: false,
     })
 }
 
@@ -1305,7 +1346,9 @@ impl SeqParser {
         let lower = first_word(t).to_ascii_lowercase();
         match lower.as_str() {
             "autonumber" => {
-                self.autonumber = true;
+                // `autonumber off` stops numbering; a bare `autonumber` starts it.
+                let rest = after_first_word(t).trim().to_ascii_lowercase();
+                self.autonumber = rest != "off";
                 return;
             }
             "end" => {
@@ -1316,8 +1359,23 @@ impl SeqParser {
                 self.set_activation(after_first_word(t), true);
                 return;
             }
-            "deactivate" => {
+            "deactivate" | "destroy" => {
                 self.set_activation(after_first_word(t), false);
+                return;
+            }
+            "create" => {
+                // `create participant D` brings the participant in at this
+                // point; this renderer draws lifelines for the whole diagram, so
+                // the declaration is enough.
+                let rest = after_first_word(t);
+                let kind = first_word(rest).to_ascii_lowercase();
+                if matches!(
+                    kind.as_str(),
+                    "participant" | "actor" | "database" | "queue" | "collections" | "boundary"
+                        | "control" | "entity"
+                ) {
+                    self.declare(&kind, after_first_word(rest));
+                }
                 return;
             }
             "loop" | "alt" | "opt" | "par" | "break" | "critical" | "rect" => {
@@ -1325,7 +1383,7 @@ impl SeqParser {
                 self.group_open(kind, after_first_word(t));
                 return;
             }
-            "else" | "and" => {
+            "else" | "and" | "option" => {
                 self.group_else(after_first_word(t));
                 return;
             }
@@ -2301,6 +2359,325 @@ fn push_cluster(graph: &mut Graph, stack: &mut Vec<usize>, id: &str, label: &str
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Indentation-based diagrams: mindmap and kanban
+// ---------------------------------------------------------------------------
+
+/// Source lines with their indentation preserved.
+///
+/// [`strip_noise`] trims every line, which is fine for the statement-oriented
+/// parsers but destroys the nesting that mindmaps and kanban boards express.
+fn indented_lines(src: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut in_front_matter = false;
+    let mut seen_content = false;
+    for raw in src.lines() {
+        let code = strip_comment(raw);
+        let trimmed = code.trim();
+        if trimmed.is_empty() || trimmed.starts_with("%%") {
+            continue;
+        }
+        if !seen_content && trimmed == "---" {
+            in_front_matter = !in_front_matter;
+            continue;
+        }
+        if in_front_matter {
+            continue;
+        }
+        if trimmed.starts_with("@") {
+            continue;
+        }
+        seen_content = true;
+        let indent = code.chars().take_while(|c| c.is_whitespace()).count();
+        out.push((indent, trimmed.to_owned()));
+    }
+    out
+}
+
+/// `((circle))`, `(round)`, `[rect]`, `{{hex}}`, `)cloud(` or a bare label.
+fn mindmap_node(text: &str) -> (Option<NodeShape>, String) {
+    let t = text.trim();
+    for (open, close, shape) in [
+        ("((", "))", NodeShape::Circle),
+        ("))", "((", NodeShape::Circle),
+        ("{{", "}}", NodeShape::Hexagon),
+        ("(", ")", NodeShape::Round),
+        ("[", "]", NodeShape::Rect),
+        (")", "(", NodeShape::Asymmetric),
+    ] {
+        // The id may sit in front of the delimiters: `root((中心))`.
+        let Some(pos) = t.find(open) else { continue };
+        let Some(inner) = t[pos..]
+            .strip_prefix(open)
+            .and_then(|r| r.strip_suffix(close))
+        else {
+            continue;
+        };
+        return (Some(shape), inner.trim().to_owned());
+    }
+    (None, t.to_owned())
+}
+
+/// `mindmap` — an indentation tree that is laid out as a left-to-right graph.
+fn mindmap_parse(src: &str, title: Option<String>) -> Graph {
+    let mut graph = Graph {
+        kind_hint: Some(DiagramKind::Mindmap),
+        direction: Direction::LeftRight,
+        title,
+        ..Graph::default()
+    };
+    // (indent, node id) of the current ancestor chain.
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut auto = 0usize;
+
+    for (indent, text) in indented_lines(src) {
+        if text.eq_ignore_ascii_case("mindmap") {
+            continue;
+        }
+        while stack.last().is_some_and(|(outer, _)| *outer >= indent) {
+            stack.pop();
+        }
+        let parent = stack.last().map(|(_, id)| id.clone());
+
+        let (shape, label) = mindmap_node(&text);
+        auto += 1;
+        let id = format!("mm{auto}");
+        let mut node = Node::new(&id, if label.is_empty() { text.clone() } else { label });
+        if let Some(shape) = shape {
+            node.shape = shape;
+        }
+        graph.nodes.push(node);
+
+        if let Some(parent) = parent {
+            let mut edge = Edge::new(parent, id.clone());
+            // Mindmap branches are plain lines, not arrows.
+            edge.head = Arrow::None;
+            graph.edges.push(edge);
+        }
+        stack.push((indent, id));
+    }
+
+    if graph.nodes.is_empty() {
+        graph.warnings.push("mindmap 没有节点".to_owned());
+    }
+    graph
+}
+
+// ---------------------------------------------------------------------------
+// requirementDiagram
+// ---------------------------------------------------------------------------
+
+/// `requirementDiagram` — boxes with their fields, joined by dashed relations.
+fn requirement_parse(lines: &[String], title: Option<String>) -> Graph {
+    let mut graph = Graph {
+        kind_hint: Some(DiagramKind::Requirement),
+        direction: Direction::LeftRight,
+        title,
+        ..Graph::default()
+    };
+    let mut i = 0usize;
+    while i < lines.len() {
+        let text = lines[i].trim();
+        if text.is_empty()
+            || text.eq_ignore_ascii_case("requirementdiagram")
+            || text.eq_ignore_ascii_case("requirementDiagram")
+        {
+            i += 1;
+            continue;
+        }
+
+        if let Some(head) = text.strip_suffix('{') {
+            // `requirement name {` … `}`
+            let head = head.trim();
+            let (kind, name) = split_word(head);
+            let kind = if kind.is_empty() { "requirement" } else { kind };
+            let name = name.trim();
+            let id = if name.is_empty() { kind } else { name };
+            let mut fields: Vec<String> = Vec::new();
+            i += 1;
+            while i < lines.len() && lines[i].trim() != "}" {
+                let line = lines[i].trim();
+                if !line.is_empty() {
+                    fields.push(line.to_owned());
+                }
+                i += 1;
+            }
+            i += 1; // the closing brace
+
+            let mut node = Node::new(id, id);
+            node.shape = NodeShape::Classifier;
+            node.stereotype = Some(kind.to_owned());
+            if !fields.is_empty() {
+                node.compartments.push(fields);
+            }
+            // Re-declaring the same id keeps the first box but upgrades it.
+            if let Some(idx) = graph.index_of(id) {
+                graph.nodes[idx] = node;
+            } else {
+                graph.nodes.push(node);
+            }
+            continue;
+        }
+
+        if let Some((from, to, label)) = parse_requirement_relation(text) {
+            let mut edge = Edge::new(from, to);
+            edge.line = LineStyle::Dashed;
+            edge.label = label;
+            if edge.label.is_some() {
+                edge.label_pad = 4.0;
+            }
+            graph.edges.push(edge);
+        } else {
+            graph
+                .warnings
+                .push(format!("无法识别的 requirement 语句: {text}"));
+        }
+        i += 1;
+    }
+    graph
+}
+
+/// `A - satisfies -> B` and `B <- satisfies - A` both point at the relation head.
+///
+/// The forward form reads `tail [- label] -> head`, the reversed one reads
+/// `head <- label - tail`, so the two sides are split differently.
+fn parse_requirement_relation(text: &str) -> Option<(String, String, Option<String>)> {
+    if let Some(idx) = text.find("->") {
+        let (from, label) = split_name_label(text[..idx].trim());
+        let (to, _) = split_name_label(text[idx + 2..].trim());
+        if from.is_empty() || to.is_empty() {
+            return None;
+        }
+        return Some((from, to, label));
+    }
+    let idx = text.find("<-")?;
+    let (to, _) = split_name_label(text[..idx].trim());
+    let (label, from) = split_label_name(text[idx + 2..].trim());
+    if from.is_empty() || to.is_empty() {
+        return None;
+    }
+    Some((from, to, label))
+}
+
+/// `name - label` → `(name, Some(label))`; `name -` → `(name, None)`.
+fn split_name_label(s: &str) -> (String, Option<String>) {
+    let s = s.trim().trim_end_matches('-').trim();
+    match s.split_once(" - ") {
+        Some((name, label)) => {
+            let label = label.trim().trim_end_matches('-').trim();
+            (
+                name.trim().to_owned(),
+                if label.is_empty() {
+                    None
+                } else {
+                    Some(label.to_owned())
+                },
+            )
+        }
+        None => (s.to_owned(), None),
+    }
+}
+
+/// `label - name` → `(Some(label), name)`.
+fn split_label_name(s: &str) -> (Option<String>, String) {
+    let s = s.trim().trim_start_matches('-').trim();
+    match s.rsplit_once(" - ") {
+        Some((label, name)) => {
+            let label = label.trim().trim_start_matches('-').trim();
+            (
+                if label.is_empty() {
+                    None
+                } else {
+                    Some(label.to_owned())
+                },
+                name.trim().to_owned(),
+            )
+        }
+        None => (None, s.to_owned()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// kanban
+// ---------------------------------------------------------------------------
+
+/// `id[Label]`, `id(Label)` or a bare label.
+fn kanban_entry(text: &str) -> (String, String) {
+    let t = text.trim();
+    let t = match t.find("@{") {
+        Some(idx) => t[..idx].trim(),
+        None => t,
+    };
+    for (open, close) in [('[', ']'), ('(', ')'), ('{', '}')] {
+        if let Some(pos) = t.find(open) {
+            if let Some(end) = t.rfind(close) {
+                if end > pos {
+                    let id = t[..pos].trim().to_owned();
+                    let label = t[pos + 1..end].trim().to_owned();
+                    if !label.is_empty() {
+                        return (id, strip_quotes(&label));
+                    }
+                }
+            }
+        }
+    }
+    (String::new(), strip_quotes(t))
+}
+
+/// `kanban` — columns become clusters (laid out left to right), cards are nodes.
+fn kanban_parse(src: &str, title: Option<String>) -> Graph {
+    let mut graph = Graph {
+        kind_hint: Some(DiagramKind::Kanban),
+        direction: Direction::LeftRight,
+        title,
+        ..Graph::default()
+    };
+    let mut column: Option<usize> = None;
+    let mut column_indent: Option<usize> = None;
+    let mut auto = 0usize;
+
+    for (indent, text) in indented_lines(src) {
+        if text.eq_ignore_ascii_case("kanban") {
+            continue;
+        }
+        let (id, label) = kanban_entry(&text);
+        let is_column = match column_indent {
+            None => true,
+            Some(base) => indent <= base,
+        };
+        if is_column {
+            let cid = if id.is_empty() {
+                format!("column-{}", graph.clusters.len() + 1)
+            } else {
+                id.clone()
+            };
+            let idx = graph.clusters.len();
+            graph.clusters.push(Cluster::new(cid, label, None));
+            column = Some(idx);
+            column_indent = Some(indent);
+            continue;
+        }
+        let Some(ci) = column else { continue };
+        auto += 1;
+        let node_id = if id.is_empty() {
+            format!("card-{auto}")
+        } else {
+            id
+        };
+        let mut node = Node::new(node_id.clone(), label);
+        node.cluster = Some(ci);
+        if let Some(c) = graph.clusters.get_mut(ci) {
+            c.members.push(node_id);
+        }
+        graph.nodes.push(node);
+    }
+
+    if graph.clusters.is_empty() {
+        graph.warnings.push("kanban 没有列".to_owned());
+    }
+    graph
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2623,12 +3000,14 @@ mod tests {
 
     #[test]
     fn unsupported_header_warns_and_still_parses_edges() {
-        let g = graph("mindmap\n  root\nA --> B");
+        // `C4Context` is deliberately out of scope: C4 describes a deployment
+        // topology that this renderer has no layout for.
+        let g = graph("C4Context\n  Person(p)\nA --> B");
         assert!(g.kind_hint.is_none());
         assert!(
             g.warnings
                 .iter()
-                .any(|w| w.contains("unsupported diagram type: mindmap")),
+                .any(|w| w.contains("unsupported diagram type: C4Context")),
             "expected an unsupported-type warning, got {:?}",
             g.warnings
         );
@@ -2764,5 +3143,161 @@ mod tests {
     fn stroke_dasharray_makes_the_edge_dashed() {
         let g = graph("flowchart LR\n a --> b\n linkStyle 0 stroke-dasharray: 5 5");
         assert_eq!(g.edges[0].line, LineStyle::Dashed);
+    }
+    // -- sequence / flowchart gaps -----------------------------------------
+
+    #[test]
+    fn invisible_links_are_kept_for_layout_only() {
+        let g = graph("flowchart TD\n a ~~~ b\n a --> c\n c --> b");
+        let hidden = g.edges.iter().find(|e| e.hidden).expect("invisible edge");
+        assert_eq!(hidden.from, "a");
+        assert_eq!(hidden.to, "b");
+        assert_eq!(hidden.head, Arrow::None);
+        assert_eq!(g.edges.iter().filter(|e| !e.hidden).count(), 2);
+    }
+
+    #[test]
+    fn create_destroy_and_option_are_understood() {
+        let s = sequence(
+            "sequenceDiagram\n\
+             \x20 create participant D\n\
+             \x20 A->>D: hi\n\
+             \x20 destroy D\n\
+             \x20 critical 关键步骤\n\
+             \x20   A->>B: x\n\
+             \x20 option 备选\n\
+             \x20   A->>B: y\n\
+             \x20 end",
+        );
+        assert!(s.participants.iter().any(|p| p.id == "D"), "create 应声明参与者");
+        assert!(
+            s.steps.iter().any(|st| matches!(st, SeqStep::GroupElse { .. })),
+            "option 应变成分块的 else"
+        );
+        assert!(
+            s.steps
+                .iter()
+                .any(|st| matches!(st, SeqStep::Activate { on: false, .. })),
+            "destroy 应结束生命线"
+        );
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    }
+
+    #[test]
+    fn autonumber_off_stops_numbering() {
+        let s = sequence(
+            "sequenceDiagram\n\
+             \x20 autonumber\n\
+             \x20 A->>B: one\n\
+             \x20 autonumber off\n\
+             \x20 A->>B: two",
+        );
+        let labels: Vec<String> = s
+            .steps
+            .iter()
+            .filter_map(|st| match st {
+                SeqStep::Message { label, .. } => Some(label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels[0].starts_with('1'), "{labels:?}");
+        assert_eq!(labels[1], "two", "autonumber off 之后不再编号");
+    }
+    // -- mindmap / requirement / kanban ------------------------------------
+
+    #[test]
+    fn mindmap_nests_by_indentation() {
+        let g = graph(
+            "mindmap\n\
+             \x20 root((中心))\n\
+             \x20   A[分支一]\n\
+             \x20     A1(叶子)\n\
+             \x20   B[分支二]",
+        );
+        assert_eq!(g.kind_hint, Some(DiagramKind::Mindmap));
+        assert_eq!(g.direction, Direction::LeftRight);
+        assert_eq!(g.nodes.len(), 4);
+        assert_eq!(g.edges.len(), 3, "每个子节点一条边");
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+
+        // Root is the circle, the leaf hangs off its parent, not off the root.
+        let root = g.nodes.iter().find(|n| n.label == "中心").expect("root");
+        assert_eq!(root.shape, NodeShape::Circle);
+        let leaf = g.nodes.iter().find(|n| n.label == "叶子").expect("leaf");
+        let parent = g
+            .nodes
+            .iter()
+            .find(|n| n.label == "分支一")
+            .expect("branch");
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.from == parent.id && e.to == leaf.id),
+            "叶子应挂在分支一下"
+        );
+    }
+
+    #[test]
+    fn requirement_diagram_builds_boxes_and_relations() {
+        let g = graph(
+            "requirementDiagram\n\
+             \x20 requirement test_req {\n\
+             \x20   id: 1\n\
+             \x20   text: 需求文本\n\
+             \x20   risk: high\n\
+             \x20 }\n\
+             \x20 element test_entity {\n\
+             \x20   type: simulation\n\
+             \x20 }\n\
+             \x20 test_entity - satisfies -> test_req",
+        );
+        assert_eq!(g.kind_hint, Some(DiagramKind::Requirement));
+        assert_eq!(g.nodes.len(), 2);
+        let req = g.nodes.iter().find(|n| n.id == "test_req").expect("req");
+        assert_eq!(req.shape, NodeShape::Classifier);
+        assert_eq!(req.stereotype.as_deref(), Some("requirement"));
+        assert_eq!(req.compartments.len(), 1);
+        assert_eq!(req.compartments[0].len(), 3, "三个字段各一行");
+
+        assert_eq!(g.edges.len(), 1);
+        let edge = &g.edges[0];
+        assert_eq!(edge.from, "test_entity");
+        assert_eq!(edge.to, "test_req");
+        assert_eq!(edge.label.as_deref(), Some("satisfies"));
+        assert_eq!(edge.line, LineStyle::Dashed);
+    }
+
+    #[test]
+    fn requirement_relation_can_point_backwards() {
+        let g = graph(
+            "requirementDiagram\n\
+             \x20 requirement a {\n id: 1\n }\n\
+             \x20 element b {\n }\n\
+             \x20 a <- derives - b",
+        );
+        let edge = g.edges.first().expect("edge");
+        assert_eq!(edge.from, "b");
+        assert_eq!(edge.to, "a");
+        assert_eq!(edge.label.as_deref(), Some("derives"));
+    }
+
+    #[test]
+    fn kanban_columns_become_clusters() {
+        let g = graph(
+            "kanban\n\
+             \x20 todo[待办]\n\
+             \x20   t1[写解析器]\n\
+             \x20   t2[补测试]\n\
+             \x20 doing[进行中]\n\
+             \x20   d1[修布局]",
+        );
+        assert_eq!(g.kind_hint, Some(DiagramKind::Kanban));
+        assert_eq!(g.direction, Direction::LeftRight);
+        assert_eq!(g.clusters.len(), 2);
+        assert_eq!(g.clusters[0].label, "待办");
+        assert_eq!(g.clusters[0].members.len(), 2);
+        assert_eq!(g.clusters[1].members.len(), 1);
+        assert_eq!(g.nodes.len(), 3);
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
     }
 }

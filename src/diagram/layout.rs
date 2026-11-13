@@ -401,6 +401,10 @@ fn layout_graph(g: &Graph, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
 
     // 2. edges
     for e in &g.edges {
+        if e.hidden {
+            // `A ~~~ B` shapes the ranking above but is not painted.
+            continue;
+        }
         let (Some(&a), Some(&b)) = (index.get(e.from.as_str()), index.get(e.to.as_str())) else {
             continue;
         };

@@ -42,8 +42,13 @@ pub fn parse(src: &str) -> Diagram {
         Some(DiagramKind::State) => Diagram::Graph(parse_state(&lines, &pre)),
         Some(DiagramKind::Entity) => Diagram::Graph(parse_er(&lines, &pre)),
         Some(DiagramKind::Flowchart) => Diagram::Graph(parse_flow(&lines, &pre)),
-        // `Pie` never comes out of detection; keep the match total anyway.
-        Some(DiagramKind::Pie) | None => Diagram::Graph(parse_fallback(&lines, &pre)),
+        // `Pie` and the Mermaid-only families never come out of detection, but
+        // the match has to stay total.
+        Some(DiagramKind::Pie)
+        | Some(DiagramKind::Mindmap)
+        | Some(DiagramKind::Requirement)
+        | Some(DiagramKind::Kanban)
+        | None => Diagram::Graph(parse_fallback(&lines, &pre)),
     };
     match &mut diagram {
         Diagram::Graph(g) => apply_skin(g, &pre.skin),
