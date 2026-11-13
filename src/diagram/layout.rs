@@ -3768,6 +3768,37 @@ fn layout_sequence(seq: &Sequence, diagram: &Diagram, ctx: &Ctx) -> DiagramRende
         prims.extend(participant_prims(p, rect, ctx));
     }
 
+    // `box … end box` groups: a translucent plate behind the headers it spans.
+    for group in &seq.boxes {
+        let xs: Vec<f32> = group
+            .members
+            .iter()
+            .filter_map(|i| cx.get(*i).copied())
+            .collect();
+        if xs.is_empty() {
+            continue;
+        }
+        let left = xs.iter().copied().fold(f32::INFINITY, f32::min) - 34.0;
+        let right = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max) + 34.0;
+        let rect = Rect::new(left, header_top - 8.0, right, header_bottom + 8.0);
+        let tint = group
+            .fill
+            .unwrap_or_else(|| ctx.theme.cluster_fill.lerp(ctx.theme.accent, 0.10));
+        prims.insert(
+            0,
+            Prim::filled_rect(rect, 8.0, tint.with_alpha(70)),
+        );
+        if !group.label.trim().is_empty() {
+            prims.push(Prim::anchored_text(
+                [left + 8.0, header_top - 8.0 + ctx.lh(ctx.small()) * 0.5 + 2.0],
+                group.label.clone(),
+                ctx.small_bold(),
+                ctx.theme.cluster_text,
+                Anchor::LeftCenter,
+            ));
+        }
+    }
+
     // notes
     for nb in &notes {
         prims.extend(draw::note_shape(

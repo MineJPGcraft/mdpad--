@@ -151,7 +151,7 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
   （参与分层但不绘制）；链式边 `A --> B --> C`；`&` 扇出扇入（自动取笛卡尔积）；
   `subgraph` 嵌套；v11 的 `@{ shape: rect, label: "x" }` 语法；
   `classDef` / `class` / `A:::cls` / `style` / `linkStyle` 真生效。
-- **sequenceDiagram** — `actor` / `participant` / `database` / `queue` 等
+- **sequenceDiagram** — `box [颜色] 名称 … end box` 参与者分组、`actor` / `participant` / `database` / `queue` 等
   全部参与者类型、全部箭头类型、激活/失活（`+`/`-` 后缀与独立语句）、
   `create` / `destroy`、四种 `Note` 位置写法、
   `loop`/`alt`/`else`/`opt`/`par`/`and`/`critical`/`option`/`break`/`rect` 分块、
@@ -218,7 +218,7 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 | 图种 | 状态 | 关键语法 |
 |---|---|---|
 | flowchart / graph | ✅ | 6 方向、13 形状、全部连线形式、`&` 扇出、subgraph 嵌套、`~~~` 隐形连线、classDef/style/linkStyle |
-| sequenceDiagram | ✅ | 7 种参与者、全部箭头、激活/失活、create/destroy、note 四写法、alt/opt/loop/par/and/critical/option/break/rect、autonumber |
+| sequenceDiagram | ✅ | 7 种参与者、全部箭头、激活/失活、create/destroy、`box … end box` 参与者分组、note 四写法、alt/opt/loop/par/and/critical/option/break/rect、autonumber |
 | classDiagram | ✅ | 成员分格、`<<interface>>`/`<<abstract>>`、继承/依赖/组合/聚合、命名空间 |
 | stateDiagram(-v2) | ✅ | `[*]` 起止、复合状态、描述、转换标签 |
 | erDiagram | ✅ | 实体属性格、基数关系、标签 |

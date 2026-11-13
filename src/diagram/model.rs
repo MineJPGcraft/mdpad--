@@ -431,11 +431,21 @@ pub enum SeqStep {
     },
 }
 
+/// `box Purple Name … end box` — a visual group of participants.
+#[derive(Clone, Debug)]
+pub struct SeqBox {
+    pub label: String,
+    pub fill: Option<Rgba>,
+    /// Participant indices the box spans.
+    pub members: Vec<usize>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Sequence {
     pub title: Option<String>,
     pub participants: Vec<Participant>,
     pub steps: Vec<SeqStep>,
+    pub boxes: Vec<SeqBox>,
     pub warnings: Vec<String>,
 }
 

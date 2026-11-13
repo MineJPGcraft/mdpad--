@@ -1356,6 +1356,8 @@ struct SeqParser {
     depth: usize,
     autonumber: bool,
     next_index: u32,
+    /// `(label, fill, first member index)` of an open `box … end box`.
+    open_box: Option<(String, Option<Rgba>, usize)>,
 }
 
 fn sequence_parse(lines: &[String], title: Option<String>) -> Sequence {
@@ -1368,6 +1370,7 @@ fn sequence_parse(lines: &[String], title: Option<String>) -> Sequence {
         depth: 0,
         autonumber: false,
         next_index: 1,
+        open_box: None,
     };
     for line in lines {
         parser.stmt(line.trim());
@@ -1391,7 +1394,20 @@ impl SeqParser {
                 return;
             }
             "end" => {
-                self.group_close();
+                // `end box` closes a participant group; a bare `end` closes a
+                // frame — but only when no box is open.
+                if let Some((label, fill, first)) = self.open_box.take() {
+                    let members: Vec<usize> = (first..self.seq.participants.len()).collect();
+                    if !members.is_empty() {
+                        self.seq.boxes.push(crate::diagram::model::SeqBox {
+                            label,
+                            fill,
+                            members,
+                        });
+                    }
+                } else {
+                    self.group_close();
+                }
                 return;
             }
             "activate" => {
@@ -1435,7 +1451,20 @@ impl SeqParser {
                 self.note(t);
                 return;
             }
-            "box" | "links" | "link" | "acctitle" | "accdescr" | "properties" | "details"
+            "box" => {
+                // `box Purple Title` — a colour, then the group label.
+                let rest = after_first_word(t).trim();
+                let (color, label) = match rest.split_once(char::is_whitespace) {
+                    Some((first, tail)) => match parse_color(first) {
+                        Some(c) if !tail.trim().is_empty() => (Some(c), tail.trim().to_owned()),
+                        _ => (None, rest.to_owned()),
+                    },
+                    None => (parse_color(rest), String::new()),
+                };
+                self.open_box = Some((label, color, self.seq.participants.len()));
+                return;
+            }
+            "links" | "link" | "acctitle" | "accdescr" | "properties" | "details"
             | "linkstyle" | "style" => {
                 return;
             }
@@ -5219,5 +5248,42 @@ mod tests {
         let joined = lines.join(" | ");
         assert!(joined.contains("PK"), "主键标记应保留: {joined}");
         assert!(joined.contains("FK"), "外键标记应保留: {joined}");
+    }    // -- sequence boxes -----------------------------------------------------
+
+    #[test]
+    fn box_groups_participants() {
+        let d = parse(
+            "sequenceDiagram\n\
+             \x20 box Purple 内部系统\n\
+             \x20   participant A\n\
+             \x20   participant B\n\
+             \x20 end\n\
+             \x20 participant C\n\
+             \x20 A->>B: hi\n\
+             \x20 A->>C: out",
+        );
+        let s = match d {
+            Diagram::Sequence(s) => s,
+            other => panic!("expected a sequence, got {other:?}"),
+        };
+        assert_eq!(s.boxes.len(), 1, "应识别一个参与者分组");
+        let group = &s.boxes[0];
+        assert_eq!(group.label, "内部系统");
+        assert!(group.fill.is_some(), "Purple 应解析成填充色");
+        assert_eq!(group.members, vec![0, 1], "只圈住 A 和 B");
+        assert_eq!(s.participants.len(), 3);
+        // `end` closed the box instead of a frame, so no frame remains open.
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+    }
+
+    #[test]
+    fn a_box_without_members_is_dropped() {
+        let d = parse("sequenceDiagram\n box 空\n end\n A->>B: hi");
+        let s = match d {
+            Diagram::Sequence(s) => s,
+            other => panic!("expected a sequence, got {other:?}"),
+        };
+        assert!(s.boxes.is_empty());
+        assert_eq!(s.steps.len(), 1);
     }
 }
