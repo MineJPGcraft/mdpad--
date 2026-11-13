@@ -23,8 +23,8 @@ use std::collections::BTreeSet;
 
 use crate::diagram::model::{
     Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Gantt, Graph, GroupKind, LineStyle,
-    Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Period, Pie, SeqStep, Sequence,
-    Slice, Task, Timeline, civil_from_days, days_from_civil, parse_color,
+    Journey, JourneyStep, Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Period, Pie,
+    SeqStep, Sequence, Slice, Task, Timeline, civil_from_days, days_from_civil, parse_color,
 };
 use crate::gfx::Rgba;
 
@@ -68,6 +68,7 @@ pub fn parse(src: &str) -> Diagram {
         Header::Kanban => Diagram::Graph(kanban_parse(src, title)),
         Header::Gantt => Diagram::Gantt(gantt_parse(&lines[1..], title)),
         Header::Timeline => Diagram::Timeline(timeline_parse(&lines[1..], title)),
+        Header::Journey => Diagram::Journey(journey_parse(&lines[1..], title)),
         Header::Unknown(name) => {
             let mut graph = if looks_like_edge(first) {
                 flowchart_graph(&lines, Direction::TopDown, None, title)
@@ -417,6 +418,7 @@ enum Header {
     Kanban,
     Gantt,
     Timeline,
+    Journey,
     Unknown(String),
 }
 
@@ -447,6 +449,7 @@ fn detect_header(first: &str) -> Header {
         "kanban" => Header::Kanban,
         "gantt" => Header::Gantt,
         "timeline" => Header::Timeline,
+        "journey" => Header::Journey,
         _ => Header::Unknown(word.to_owned()),
     }
 }
@@ -2984,6 +2987,74 @@ fn timeline_parse(lines: &[String], title: Option<String>) -> Timeline {
     timeline
 }
 
+// ---------------------------------------------------------------------------
+// journey
+// ---------------------------------------------------------------------------
+
+/// `journey` — each step carries a 1..5 satisfaction score and its actors.
+fn journey_parse(lines: &[String], title: Option<String>) -> Journey {
+    let mut journey = Journey {
+        title,
+        ..Journey::default()
+    };
+    let mut section = usize::MAX;
+
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = first_word(t).to_ascii_lowercase();
+        if lower == "section" {
+            journey
+                .sections
+                .push(after_first_word(t).trim().to_owned());
+            section = journey.sections.len() - 1;
+            continue;
+        }
+        // `Make tea: 5: Me, Cat` — name, score, then actors.
+        let mut parts = t.split(':').map(|p| p.trim());
+        let Some(name) = parts.next() else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        let score: u8 = parts
+            .next()
+            .and_then(|p| p.parse::<f32>().ok())
+            .map(|v| v.round().clamp(1.0, 5.0) as u8)
+            .unwrap_or(3);
+        let actors: Vec<String> = parts
+            .next()
+            .map(|list| {
+                list.split(',')
+                    .map(|a| a.trim())
+                    .filter(|a| !a.is_empty())
+                    .map(|a| strip_quotes(a))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let section = if section == usize::MAX {
+            if journey.sections.is_empty() {
+                journey.sections.push(String::new());
+            }
+            0
+        } else {
+            section
+        };
+        journey.steps.push(JourneyStep {
+            name: strip_quotes(name),
+            score,
+            actors,
+            section,
+        });
+    }
+
+    if journey.steps.is_empty() {
+        journey.warnings.push("journey 没有步骤".to_owned());
+    }
+    journey
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3729,5 +3800,53 @@ mod tests {
         };
         assert!(t.periods.is_empty());
         assert!(t.warnings.iter().any(|w| w.contains("没有时期")));
+    }
+    // -- journey ------------------------------------------------------------
+
+    #[test]
+    fn journey_parses_scores_actors_and_sections() {
+        let d = parse(
+            "journey\n\
+             \x20 title 我的一天\n\
+             \x20 section 上班\n\
+             \x20 泡茶: 5: 我\n\
+             \x20 上楼: 3: 我\n\
+             \x20 干活: 1: 我, 猫\n\
+             \x20 section 回家\n\
+             \x20 下楼: 5: 我",
+        );
+        let Diagram::Journey(j) = d else {
+            panic!("expected a journey")
+        };
+        assert_eq!(j.title.as_deref(), Some("我的一天"));
+        assert_eq!(j.sections, vec!["上班", "回家"]);
+        assert_eq!(j.steps.len(), 4);
+        assert_eq!(j.steps[0].name, "泡茶");
+        assert_eq!(j.steps[0].score, 5);
+        assert_eq!(j.steps[0].actors, vec!["我"]);
+        assert_eq!(j.steps[2].actors, vec!["我", "猫"]);
+        assert_eq!(j.steps[3].section, 1);
+        assert!(j.warnings.is_empty(), "{:?}", j.warnings);
+    }
+
+    #[test]
+    fn journey_clamps_odd_scores_and_defaults_missing_ones() {
+        let d = parse("journey\n 高: 9: 我\n 缺: \n 低: 0: 我");
+        let Diagram::Journey(j) = d else {
+            panic!("expected a journey")
+        };
+        assert_eq!(j.steps[0].score, 5, "9 应夹到 5");
+        assert_eq!(j.steps[1].score, 3, "缺省给 3");
+        assert_eq!(j.steps[2].score, 1, "0 应夹到 1");
+    }
+
+    #[test]
+    fn an_empty_journey_warns() {
+        let d = parse("journey\n section 空");
+        let Diagram::Journey(j) = d else {
+            panic!("expected a journey")
+        };
+        assert!(j.steps.is_empty());
+        assert!(j.warnings.iter().any(|w| w.contains("没有步骤")));
     }
 }

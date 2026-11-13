@@ -28,7 +28,7 @@ use super::{draw, DiagramTheme};
 use crate::diagram::model::{
     series_color, Arrow, Diagram, Direction, Edge, Gantt, Graph, GroupKind, LineStyle, Node,
     NodeShape, NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
-    Task, Timeline, days_from_civil, format_day,
+    Journey, Task, Timeline, days_from_civil, format_day,
 };
 use crate::gfx::{Anchor, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -88,6 +88,7 @@ pub fn layout(
         Diagram::Pie(p) => layout_pie(p, diagram, &ctx),
         Diagram::Gantt(g) => layout_gantt(g, diagram, &ctx),
         Diagram::Timeline(t) => layout_timeline(t, diagram, &ctx),
+        Diagram::Journey(j) => layout_journey(j, diagram, &ctx),
     }
 }
 
@@ -1453,12 +1454,14 @@ fn layout_gantt(gantt: &Gantt, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
                 .cloned()
                 .unwrap_or_default();
             if !name.is_empty() {
+                // Left-aligned at the canvas edge: right-aligning would collide
+                // with the task-name column, which ends at the same x.
                 prims.push(Prim::anchored_text(
-                    [left_w, row_y + ctx.lh(section_font) * 0.5],
+                    [0.0, row_y + ctx.lh(section_font) * 0.5],
                     name,
                     section_font,
                     ctx.theme.cluster_text,
-                    Anchor::RightCenter,
+                    Anchor::LeftCenter,
                 ));
                 row_y += ctx.lh(section_font) + 6.0;
             }
@@ -1655,7 +1658,7 @@ fn layout_timeline(timeline: &Timeline, diagram: &Diagram, ctx: &Ctx) -> Diagram
             let card_y = if above {
                 axis_y - axis_gap - (slot as f32 + 1.0) * row_h + 10.0
             } else {
-                axis_y + axis_gap + ctx.lh(period_font) + slot as f32 * row_h
+                axis_y + axis_gap + ctx.lh(period_font) + 6.0 + slot as f32 * row_h
             };
             let card_w = (ctx.w(event, event_font) + card_pad * 2.0).min(col_w - 8.0);
             let rect = Rect::from_min_size(
@@ -1689,6 +1692,192 @@ fn layout_timeline(timeline: &Timeline, diagram: &Diagram, ctx: &Ctx) -> Diagram
                 event.clone(),
                 event_font,
                 ctx.theme.node_text,
+                Anchor::Center,
+            ));
+        }
+    }
+
+    finish(prims, ctx, None, warnings, summary)
+}
+
+
+// ===========================================================================
+// User journeys
+// ===========================================================================
+
+/// `journey` — steps plotted against a 1..5 satisfaction axis, grouped by
+/// section and joined by the path the user takes.
+fn layout_journey(journey: &Journey, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    if journey.steps.is_empty() {
+        push_warning(&mut warnings, "journey 没有步骤".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let step_font = ctx.small();
+    let score_font = ctx.small();
+    let actor_font = ctx.small_italic();
+    let section_font = ctx.small_bold();
+    let pad = 8.0;
+    let box_h = ctx.lh(step_font) + 10.0;
+    let score_gap = (ctx.base * 2.2).max(24.0);
+    let actor_h = if journey.steps.iter().any(|s| !s.actors.is_empty()) {
+        ctx.lh(actor_font) + 4.0
+    } else {
+        0.0
+    };
+
+    let gutter = ctx.w("5", score_font).max(ctx.w("100", score_font)) + 10.0;
+    let n = journey.steps.len();
+    let mut col_w = 0.0f32;
+    for step in &journey.steps {
+        col_w = col_w.max(ctx.w(&step.name, step_font) + pad * 2.0);
+        let actors = step.actors.join(", ");
+        col_w = col_w.max(ctx.w(&actors, actor_font) + pad);
+    }
+    let col_w = col_w.clamp(64.0, 200.0);
+    let plot_w = col_w * n as f32;
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut y = 0.0f32;
+
+    if let Some(title) = journey.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        prims.push(Prim::anchored_text(
+            [gutter + plot_w * 0.5, y],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::CenterTop,
+        ));
+        y += lh + 10.0;
+    }
+
+    // Section bands, same convention as the timeline.
+    let mut bands: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, step) in journey.steps.iter().enumerate() {
+        match bands.last_mut() {
+            Some((section, _, end)) if *section == step.section => *end = i,
+            _ => bands.push((step.section, i, i)),
+        }
+    }
+    let has_sections = journey.sections.iter().any(|s| !s.trim().is_empty());
+    if has_sections {
+        let band_h = ctx.lh(section_font) + 8.0;
+        for (section, start, end) in &bands {
+            let name = journey
+                .sections
+                .get(*section)
+                .cloned()
+                .unwrap_or_default();
+            if name.trim().is_empty() {
+                continue;
+            }
+            let x0 = gutter + *start as f32 * col_w;
+            let x1 = gutter + (*end + 1) as f32 * col_w;
+            let rect = Rect::from_min_size([x0, y], [x1 - x0, band_h]);
+            prims.push(Prim::filled_rect(
+                rect,
+                5.0,
+                ctx.theme.cluster_fill.lerp(series_color(*section), 0.10),
+            ));
+            prims.push(Prim::anchored_text(
+                [x0 + 8.0, y + band_h * 0.5],
+                name,
+                section_font,
+                ctx.theme.cluster_text,
+                Anchor::LeftCenter,
+            ));
+        }
+        y += band_h + 10.0;
+    }
+
+    // Score axis: 5 at the top, 1 at the bottom.
+    let plot_top = y;
+    let plot_h = score_gap * 4.0 + box_h;
+    let y_of_score = |score: u8| plot_top + (5.0 - score as f32) * score_gap + box_h * 0.5;
+
+    for score in 1..=5u8 {
+        let yc = y_of_score(score);
+        prims.push(Prim::line(
+            [gutter - 6.0, yc],
+            [gutter, yc],
+            draw::stroke(1.0, ctx.theme.node_stroke.fade(0.5)),
+        ));
+        prims.push(Prim::anchored_text(
+            [gutter - 10.0, yc],
+            score.to_string(),
+            score_font,
+            ctx.theme.node_text.fade(0.7),
+            Anchor::RightCenter,
+        ));
+        if score != 5 {
+            prims.push(Prim::line(
+                [gutter, yc],
+                [gutter + plot_w, yc],
+                draw::stroke(1.0, ctx.theme.node_stroke.fade(0.12)),
+            ));
+        }
+    }
+    // The axis itself.
+    prims.push(Prim::line(
+        [gutter, plot_top],
+        [gutter, plot_top + plot_h],
+        draw::stroke(1.4, ctx.theme.node_stroke.fade(0.6)),
+    ));
+
+    // Connector path through the step centres, drawn under the boxes.
+    let centres: Vec<[f32; 2]> = journey
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            [
+                gutter + (i as f32 + 0.5) * col_w,
+                y_of_score(step.score),
+            ]
+        })
+        .collect();
+    for pair in centres.windows(2) {
+        prims.push(Prim::line(
+            pair[0],
+            pair[1],
+            draw::stroke(1.6, ctx.theme.accent.fade(0.55)),
+        ));
+    }
+
+    // Step boxes, then the actors that take part in each one.
+    for (i, step) in journey.steps.iter().enumerate() {
+        let cx = centres[i][0];
+        let cy = centres[i][1];
+        let w = (ctx.w(&step.name, step_font) + pad * 2.0).min(col_w - 6.0);
+        let rect = Rect::from_min_size([cx - w * 0.5, cy - box_h * 0.5], [w, box_h]);
+        let accent = series_color(i);
+        prims.push(Prim::filled_rect(
+            rect,
+            5.0,
+            ctx.theme.node_fill.lerp(accent, 0.14),
+        ));
+        prims.push(Prim::stroked_rect(
+            rect,
+            5.0,
+            draw::stroke(1.0, accent.lerp(ctx.theme.node_stroke, 0.4)),
+        ));
+        prims.push(Prim::anchored_text(
+            [cx, cy],
+            step.name.clone(),
+            step_font,
+            ctx.theme.node_text,
+            Anchor::Center,
+        ));
+        if !step.actors.is_empty() && actor_h > 0.0 {
+            prims.push(Prim::anchored_text(
+                [cx, rect.max[1] + 3.0 + ctx.lh(actor_font) * 0.5],
+                step.actors.join(", "),
+                actor_font,
+                ctx.theme.node_text.fade(0.7),
                 Anchor::Center,
             ));
         }
@@ -2974,6 +3163,104 @@ mod tests {
             assert!(r.size[0] <= 200_000.0 && r.size[1] <= 200_000.0, "case {i} exploded");
         }
     }
+    #[test]
+    #[ignore = "writes primitive dumps for manual rasterisation"]
+    fn dump_diagram_prims() {
+        fn col(c: Rgba) -> String {
+            format!("[{},{},{},{}]", c.r, c.g, c.b, c.a)
+        }
+        fn stroke(s: &Option<Stroke>) -> String {
+            match s {
+                Some(s) => format!("{{\"w\":{},\"c\":{}}}", s.width, col(s.color)),
+                None => "null".to_owned(),
+            }
+        }
+        fn prim(p: &Prim) -> String {
+            match p {
+                Prim::Rect { rect, fill, stroke: st, .. } => format!(
+                    "{{\"k\":\"rect\",\"r\":[{},{},{},{}],\"fill\":{},\"stroke\":{}}}",
+                    rect.min[0], rect.min[1], rect.max[0], rect.max[1],
+                    fill.map_or("null".to_owned(), col), stroke(st)
+                ),
+                Prim::Line { from, to, stroke: st } => format!(
+                    "{{\"k\":\"line\",\"a\":[{},{}],\"b\":[{},{}],\"stroke\":{{\"w\":{},\"c\":{}}}}}",
+                    from[0], from[1], to[0], to[1], st.width, col(st.color)
+                ),
+                Prim::Path { points, closed, fill, stroke: st } => {
+                    let pts: Vec<String> = points
+                        .iter()
+                        .map(|q| format!("[{},{}]", q[0], q[1]))
+                        .collect();
+                    format!(
+                        "{{\"k\":\"path\",\"pts\":[{}],\"closed\":{},\"fill\":{},\"stroke\":{}}}",
+                        pts.join(","), closed,
+                        fill.map_or("null".to_owned(), col), stroke(st)
+                    )
+                }
+                Prim::Text { pos, text, font, color, anchor } => {
+                    let f = anchor.factor();
+                    let m = ApproxMeasure.measure(text, *font);
+                    format!(
+                        "{{\"k\":\"text\",\"pos\":[{},{}],\"s\":\"{}\",\"size\":{},\"w\":{},\"h\":{},\"af\":[{},{}],\"c\":{}}}",
+                        pos[0], pos[1], text.replace('"', "'"), font.size, m[0], m[1], f[0], f[1],
+                        col(*color)
+                    )
+                }
+                Prim::Circle { center, radius, fill, .. } => format!(
+                    "{{\"k\":\"circle\",\"p\":[{},{}],\"r\":{},\"fill\":{}}}",
+                    center[0], center[1], radius, fill.map_or("null".to_owned(), col)
+                ),
+                Prim::Ellipse { center, radii, fill, .. } => format!(
+                    "{{\"k\":\"ellipse\",\"p\":[{},{}],\"r\":[{},{}],\"fill\":{}}}",
+                    center[0], center[1], radii[0], radii[1], fill.map_or("null".to_owned(), col)
+                ),
+            }
+        }
+
+        let cases: [(&str, &str); 6] = [
+            (
+                "gantt",
+                "gantt\n section Design\n 需求分析 :done, a1, 2024-01-01, 5d\n 方案设计 :a2, after a1, 3d\n section Build\n 编码 :active, b1, after a2, 10d\n 里程碑 :milestone, m1, 2024-01-30, 0d",
+            ),
+            (
+                "timeline",
+                "timeline\n title 简史\n section 早期\n 2002 : LinkedIn\n 2004 : Facebook : Google\n section 后期\n 2006 : Twitter\n 2008 : GitHub",
+            ),
+            (
+                "mindmap",
+                "mindmap\n  root((中心))\n    A[分支一]\n      A1(叶子)\n    B[分支二]",
+            ),
+            (
+                "kanban",
+                "kanban\n  todo[待办]\n    t1[写解析器]\n    t2[补测试]\n  doing[进行中]\n    d1[修布局]",
+            ),
+            (
+                "journey",
+                "journey\n title 我的一天\n section 上班\n 泡茶: 5: 我\n 上楼: 3: 我\n 干活: 1: 我, 猫\n section 回家\n 下楼: 5: 我",
+            ),
+            (
+            "requirement",
+                "requirementDiagram\n  requirement test_req {\n  id: 1\n  text: 需求\n  }\n  element ent {\n  type: simulation\n  }\n  ent - satisfies -> test_req",
+            ),
+        ];
+
+        let mut out: Vec<String> = Vec::new();
+        for (name, src) in cases {
+            let d = crate::diagram::mermaid::parse(src);
+            let r = run(&d);
+            let prims = r.prims.iter().map(prim).collect::<Vec<_>>().join(",");
+            out.push(format!(
+                "{{\"expr\":\"{}\",\"size\":[{},{}],\"baseline\":0,\"prims\":[{}]}}",
+                name, r.size[0], r.size[1], prims
+            ));
+        }
+        std::fs::write(
+            "target/diagram_probe.json",
+            format!("[\n{}\n]\n", out.join(",\n")),
+        )
+        .expect("write probe");
+    }
+
     // -- gantt --------------------------------------------------------------
 
     #[test]
@@ -3159,6 +3446,102 @@ mod tests {
     #[test]
     fn an_empty_timeline_shows_the_placeholder_card() {
         let r = run(&Diagram::Timeline(Timeline::default()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
+    }
+    // -- journey ------------------------------------------------------------
+
+    #[test]
+    fn journey_draws_axis_boxes_and_actors() {
+        let journey = Journey {
+            title: Some("我的一天".to_owned()),
+            sections: vec!["上班".to_owned(), "回家".to_owned()],
+            steps: vec![
+                crate::diagram::model::JourneyStep {
+                    name: "泡茶".to_owned(),
+                    score: 5,
+                    actors: vec!["我".to_owned()],
+                    section: 0,
+                },
+                crate::diagram::model::JourneyStep {
+                    name: "干活".to_owned(),
+                    score: 1,
+                    actors: vec!["我".to_owned(), "猫".to_owned()],
+                    section: 0,
+                },
+                crate::diagram::model::JourneyStep {
+                    name: "回家".to_owned(),
+                    score: 4,
+                    actors: Vec::new(),
+                    section: 1,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let r = run(&Diagram::Journey(journey));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["我的一天", "上班", "回家", "泡茶", "干活", "我, 猫"] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        // The 1..5 score ladder is labelled on the axis.
+        for score in ["1", "3", "5"] {
+            assert!(texts.contains(&score), "缺少刻度 {score}: {texts:?}");
+        }
+    }
+
+    #[test]
+    fn journey_scores_decide_vertical_order() {
+        let journey = Journey {
+            title: None,
+            sections: vec![String::new()],
+            steps: vec![
+                crate::diagram::model::JourneyStep {
+                    name: "高".to_owned(),
+                    score: 5,
+                    actors: Vec::new(),
+                    section: 0,
+                },
+                crate::diagram::model::JourneyStep {
+                    name: "低".to_owned(),
+                    score: 1,
+                    actors: Vec::new(),
+                    section: 0,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let r = run(&Diagram::Journey(journey));
+        let y_of = |needle: &str| -> f32 {
+            r.prims
+                .iter()
+                .find_map(|p| match p {
+                    Prim::Text { text, pos, .. } if text == needle => Some(pos[1]),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("缺少 {needle}"))
+        };
+        assert!(y_of("高") < y_of("低"), "5 分应排在 1 分上方");
+    }
+
+    #[test]
+    fn an_empty_journey_shows_the_placeholder_card() {
+        let r = run(&Diagram::Journey(Journey::default()));
         assert_clean(&r);
         let texts: Vec<&str> = r
             .prims

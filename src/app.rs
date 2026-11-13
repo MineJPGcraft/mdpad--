@@ -3212,10 +3212,15 @@ mod tests {
 
     #[test]
     fn the_startup_report_is_written_with_the_real_geometry() {
-        // Its own file: the report path is process-wide and every shell test
-        // renders it, so a shared path makes this test order-dependent.
+        // One file per *thread*: the report path is a thread-local but the
+        // filename is not, so two shell tests rendering in parallel would
+        // otherwise write into the same file and make this assertion flaky.
+        let thread: String = format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
         let path = std::env::temp_dir().join(format!(
-            "mdpad-report-test-{}.log",
+            "mdpad-report-test-{}-{thread}.log",
             App::session_id()
         ));
         let previous = set_report_path(Some(path.clone()));

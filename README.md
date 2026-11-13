@@ -167,6 +167,7 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 - **requirementDiagram** — `requirement` / `element` 块变分类框（字段自动分格），
   `A - satisfies -> B` 与 `B <- derives - A` 两种关系方向。
 - **kanban** — 列变分组、卡片变节点，左→右排布。
+- **journey** — `section` 分带、`步骤: 分数: 参与者` 语法（分数夹在 1–5、缺省给 3）、1–5 分刻度轴与网格、步骤框按分数定位并用折线连成路径、参与者列在框下。
 - **timeline** — `section` 分带、`2002 : LinkedIn : Google` 一句多事件、卡片沿轴线上下交替、无事件的时期也占一列。
 - **gantt** — `section` 分组、`日期` 或 `after <id>` 起算、`30d`/`2w`/`3h`
   时长、`done` / `active` / `crit` / `milestone` 标记、`axisFormat` 刻度格式、

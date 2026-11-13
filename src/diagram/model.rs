@@ -26,6 +26,7 @@ pub enum DiagramKind {
     Kanban,
     Gantt,
     Timeline,
+    Journey,
 }
 
 impl DiagramKind {
@@ -42,6 +43,7 @@ impl DiagramKind {
             Self::Kanban => "kanban",
             Self::Gantt => "gantt",
             Self::Timeline => "timeline",
+            Self::Journey => "journey",
         }
     }
 }
@@ -613,6 +615,30 @@ pub struct Timeline {
 }
 
 // ---------------------------------------------------------------------------
+// User journeys
+// ---------------------------------------------------------------------------
+
+/// One step of a `journey` diagram.
+#[derive(Clone, Debug)]
+pub struct JourneyStep {
+    pub name: String,
+    /// Satisfaction score, 1..=5 in Mermaid.
+    pub score: u8,
+    pub actors: Vec<String>,
+    /// Index into [`Journey::sections`].
+    pub section: usize,
+}
+
+/// A parsed `journey` block.
+#[derive(Clone, Debug, Default)]
+pub struct Journey {
+    pub title: Option<String>,
+    pub sections: Vec<String>,
+    pub steps: Vec<JourneyStep>,
+    pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -623,6 +649,7 @@ pub enum Diagram {
     Pie(Pie),
     Gantt(Gantt),
     Timeline(Timeline),
+    Journey(Journey),
 }
 
 impl Diagram {
@@ -635,6 +662,7 @@ impl Diagram {
             Self::Pie(_) => DiagramKind::Pie,
             Self::Gantt(_) => DiagramKind::Gantt,
             Self::Timeline(_) => DiagramKind::Timeline,
+            Self::Journey(_) => DiagramKind::Journey,
         }
     }
 
@@ -645,6 +673,7 @@ impl Diagram {
             Self::Pie(p) => p.title.as_deref(),
             Self::Gantt(g) => g.title.as_deref(),
             Self::Timeline(t) => t.title.as_deref(),
+            Self::Journey(j) => j.title.as_deref(),
         }
     }
 
@@ -656,6 +685,7 @@ impl Diagram {
             Self::Pie(_) => &[],
             Self::Gantt(g) => &g.warnings,
             Self::Timeline(t) => &t.warnings,
+            Self::Journey(j) => &j.warnings,
         }
     }
 
@@ -666,6 +696,7 @@ impl Diagram {
             Self::Pie(p) => p.slices.is_empty(),
             Self::Gantt(g) => g.tasks.is_empty(),
             Self::Timeline(t) => t.periods.is_empty(),
+            Self::Journey(j) => j.steps.is_empty(),
         }
     }
 
@@ -693,6 +724,11 @@ impl Diagram {
                 "timeline · {} 个时期 · {} 个事件",
                 t.periods.len(),
                 t.periods.iter().map(|p| p.events.len()).sum::<usize>()
+            ),
+            Self::Journey(j) => format!(
+                "journey · {} 个步骤 · {} 个分组",
+                j.steps.len(),
+                j.sections.len()
             ),
         }
     }
