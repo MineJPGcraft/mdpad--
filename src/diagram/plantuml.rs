@@ -51,12 +51,17 @@ pub fn parse(src: &str) -> Diagram {
         | Some(DiagramKind::Gantt)
         | Some(DiagramKind::Timeline)
         | Some(DiagramKind::Journey)
+        | Some(DiagramKind::Quadrant)
         | None => Diagram::Graph(parse_fallback(&lines, &pre)),
     };
     match &mut diagram {
         Diagram::Graph(g) => apply_skin(g, &pre.skin),
         Diagram::Sequence(s) => apply_skin_sequence(s, &pre.skin),
-        Diagram::Pie(_) | Diagram::Gantt(_) | Diagram::Timeline(_) | Diagram::Journey(_) => {}
+        Diagram::Pie(_)
+        | Diagram::Gantt(_)
+        | Diagram::Timeline(_)
+        | Diagram::Journey(_)
+        | Diagram::Quadrant(_) => {}
     }
     diagram
 }

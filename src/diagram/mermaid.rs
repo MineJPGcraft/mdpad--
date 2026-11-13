@@ -24,7 +24,8 @@ use std::collections::BTreeSet;
 use crate::diagram::model::{
     Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Gantt, Graph, GroupKind, LineStyle,
     Journey, JourneyStep, Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Period, Pie,
-    SeqStep, Sequence, Slice, Task, Timeline, civil_from_days, days_from_civil, parse_color,
+    Quadrant, QuadrantPoint, SeqStep, Sequence, Slice, Task, Timeline, civil_from_days,
+    days_from_civil, parse_color,
 };
 use crate::gfx::Rgba;
 
@@ -69,6 +70,7 @@ pub fn parse(src: &str) -> Diagram {
         Header::Gantt => Diagram::Gantt(gantt_parse(&lines[1..], title)),
         Header::Timeline => Diagram::Timeline(timeline_parse(&lines[1..], title)),
         Header::Journey => Diagram::Journey(journey_parse(&lines[1..], title)),
+        Header::Quadrant => Diagram::Quadrant(quadrant_parse(&lines[1..], title)),
         Header::Unknown(name) => {
             let mut graph = if looks_like_edge(first) {
                 flowchart_graph(&lines, Direction::TopDown, None, title)
@@ -419,6 +421,7 @@ enum Header {
     Gantt,
     Timeline,
     Journey,
+    Quadrant,
     Unknown(String),
 }
 
@@ -450,6 +453,7 @@ fn detect_header(first: &str) -> Header {
         "gantt" => Header::Gantt,
         "timeline" => Header::Timeline,
         "journey" => Header::Journey,
+        "quadrantchart" => Header::Quadrant,
         _ => Header::Unknown(word.to_owned()),
     }
 }
@@ -3055,6 +3059,100 @@ fn journey_parse(lines: &[String], title: Option<String>) -> Journey {
     journey
 }
 
+// ---------------------------------------------------------------------------
+// quadrantChart
+// ---------------------------------------------------------------------------
+
+/// `quadrantChart` — points on a normalised 0..1 grid split into four labelled
+/// quadrants.
+fn quadrant_parse(lines: &[String], title: Option<String>) -> Quadrant {
+    let mut q = Quadrant {
+        title,
+        ..Quadrant::default()
+    };
+
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+
+        // `x-axis Low Reach --> High Reach`
+        if let Some(rest) = lower.strip_prefix("x-axis") {
+            let body = t.get(t.len() - rest.len()..).unwrap_or("").trim();
+            let (low, high) = axis_caption(body);
+            q.x_low = low;
+            q.x_high = high;
+            continue;
+        }
+        if let Some(rest) = lower.strip_prefix("y-axis") {
+            let body = t.get(t.len() - rest.len()..).unwrap_or("").trim();
+            let (low, high) = axis_caption(body);
+            q.y_low = low;
+            q.y_high = high;
+            continue;
+        }
+        // `quadrant-1 We should expand`
+        if let Some(rest) = lower.strip_prefix("quadrant-") {
+            let head = t.get(t.len() - rest.len()..).unwrap_or("").trim();
+            let mut parts = head.splitn(2, char::is_whitespace);
+            let index: usize = parts.next().unwrap_or("").parse().unwrap_or(0);
+            let label = parts.next().unwrap_or("").trim();
+            if (1..=4).contains(&index) {
+                q.quadrant_labels[index - 1] = strip_quotes(label);
+            }
+            continue;
+        }
+        // `Campaign A: [0.3, 0.6]`
+        if let Some((name, coords)) = t.split_once(':') {
+            let name = strip_quotes(name.trim());
+            let inner = coords.trim();
+            let inner = inner
+                .strip_prefix('[')
+                .and_then(|r| r.strip_suffix(']'))
+                .unwrap_or(inner);
+            let nums: Vec<f32> = inner
+                .split(',')
+                .filter_map(|n| n.trim().parse::<f32>().ok())
+                .collect();
+            if nums.len() >= 2 && !name.is_empty() {
+                q.points.push(QuadrantPoint {
+                    name,
+                    x: nums[0].clamp(0.0, 1.0),
+                    y: nums[1].clamp(0.0, 1.0),
+                });
+            } else {
+                q.warnings
+                    .push(format!("无法解析的数据点: {}", truncate(t, 40)));
+            }
+            continue;
+        }
+        // Style/limit directives have nothing to draw.
+        if lower.starts_with("chartwidth")
+            || lower.starts_with("chartheight")
+            || lower.starts_with("pointradius")
+        {
+            continue;
+        }
+        q.warnings
+            .push(format!("无法识别的 quadrant 语句: {}", truncate(t, 40)));
+    }
+
+    if q.points.is_empty() {
+        q.warnings.push("quadrantChart 没有数据点".to_owned());
+    }
+    q
+}
+
+/// Split `Low Reach --> High Reach` into its two captions.
+fn axis_caption(body: &str) -> (String, String) {
+    match body.split_once("-->") {
+        Some((low, high)) => (strip_quotes(low.trim()), strip_quotes(high.trim())),
+        None => (strip_quotes(body), String::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3848,5 +3946,55 @@ mod tests {
         };
         assert!(j.steps.is_empty());
         assert!(j.warnings.iter().any(|w| w.contains("没有步骤")));
+    }
+    // -- quadrantChart ------------------------------------------------------
+
+    #[test]
+    fn quadrant_parses_captions_labels_and_points() {
+        let d = parse(
+            "quadrantChart\n\
+             \x20 title 触达与互动\n\
+             \x20 x-axis 低触达 --> 高触达\n\
+             \x20 y-axis 低互动 --> 高互动\n\
+             \x20 quadrant-1 该扩张\n\
+             \x20 quadrant-2 该推广\n\
+             \x20 quadrant-3 重新评估\n\
+             \x20 quadrant-4 可以改进\n\
+             \x20 活动 A: [0.3, 0.6]\n\
+             \x20 活动 B: [0.45, 0.23]",
+        );
+        let Diagram::Quadrant(q) = d else {
+            panic!("expected a quadrant chart")
+        };
+        assert_eq!(q.title.as_deref(), Some("触达与互动"));
+        assert_eq!(q.x_low, "低触达");
+        assert_eq!(q.x_high, "高触达");
+        assert_eq!(q.y_low, "低互动");
+        assert_eq!(q.y_high, "高互动");
+        assert_eq!(q.quadrant_labels[0], "该扩张");
+        assert_eq!(q.quadrant_labels[3], "可以改进");
+        assert_eq!(q.points.len(), 2);
+        assert_eq!(q.points[0].name, "活动 A");
+        assert!((q.points[0].x - 0.3).abs() < 1e-6);
+        assert!(q.warnings.is_empty(), "{:?}", q.warnings);
+    }
+
+    #[test]
+    fn quadrant_clamps_points_to_the_unit_square() {
+        let d = parse("quadrantChart\n 远: [3, -2]");
+        let Diagram::Quadrant(q) = d else {
+            panic!("expected a quadrant chart")
+        };
+        assert_eq!(q.points[0].x, 1.0);
+        assert_eq!(q.points[0].y, 0.0);
+    }
+
+    #[test]
+    fn quadrant_without_points_warns() {
+        let d = parse("quadrantChart\n x-axis a --> b");
+        let Diagram::Quadrant(q) = d else {
+            panic!("expected a quadrant chart")
+        };
+        assert!(q.warnings.iter().any(|w| w.contains("没有数据点")));
     }
 }

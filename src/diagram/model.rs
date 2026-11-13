@@ -27,6 +27,7 @@ pub enum DiagramKind {
     Gantt,
     Timeline,
     Journey,
+    Quadrant,
 }
 
 impl DiagramKind {
@@ -44,6 +45,7 @@ impl DiagramKind {
             Self::Gantt => "gantt",
             Self::Timeline => "timeline",
             Self::Journey => "journey",
+            Self::Quadrant => "quadrant",
         }
     }
 }
@@ -639,6 +641,49 @@ pub struct Journey {
 }
 
 // ---------------------------------------------------------------------------
+// Quadrant charts
+// ---------------------------------------------------------------------------
+
+/// One plotted item, in normalised 0..1 chart coordinates.
+#[derive(Clone, Debug)]
+pub struct QuadrantPoint {
+    pub name: String,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// A parsed `quadrantChart` block.
+#[derive(Clone, Debug)]
+pub struct Quadrant {
+    pub title: Option<String>,
+    /// Axis captions: `low --> high` for x and y.
+    pub x_low: String,
+    pub x_high: String,
+    pub y_low: String,
+    pub y_high: String,
+    /// `quadrant-1` … `quadrant-4`: top-right, top-left, bottom-left,
+    /// bottom-right, in Mermaid's order.
+    pub quadrant_labels: [String; 4],
+    pub points: Vec<QuadrantPoint>,
+    pub warnings: Vec<String>,
+}
+
+impl Default for Quadrant {
+    fn default() -> Self {
+        Self {
+            title: None,
+            x_low: String::new(),
+            x_high: String::new(),
+            y_low: String::new(),
+            y_high: String::new(),
+            quadrant_labels: Default::default(),
+            points: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -650,6 +695,7 @@ pub enum Diagram {
     Gantt(Gantt),
     Timeline(Timeline),
     Journey(Journey),
+    Quadrant(Quadrant),
 }
 
 impl Diagram {
@@ -663,6 +709,7 @@ impl Diagram {
             Self::Gantt(_) => DiagramKind::Gantt,
             Self::Timeline(_) => DiagramKind::Timeline,
             Self::Journey(_) => DiagramKind::Journey,
+            Self::Quadrant(_) => DiagramKind::Quadrant,
         }
     }
 
@@ -674,6 +721,7 @@ impl Diagram {
             Self::Gantt(g) => g.title.as_deref(),
             Self::Timeline(t) => t.title.as_deref(),
             Self::Journey(j) => j.title.as_deref(),
+            Self::Quadrant(q) => q.title.as_deref(),
         }
     }
 
@@ -686,6 +734,7 @@ impl Diagram {
             Self::Gantt(g) => &g.warnings,
             Self::Timeline(t) => &t.warnings,
             Self::Journey(j) => &j.warnings,
+            Self::Quadrant(q) => &q.warnings,
         }
     }
 
@@ -697,6 +746,7 @@ impl Diagram {
             Self::Gantt(g) => g.tasks.is_empty(),
             Self::Timeline(t) => t.periods.is_empty(),
             Self::Journey(j) => j.steps.is_empty(),
+            Self::Quadrant(q) => q.points.is_empty(),
         }
     }
 
@@ -730,6 +780,7 @@ impl Diagram {
                 j.steps.len(),
                 j.sections.len()
             ),
+            Self::Quadrant(q) => format!("quadrant · {} 个数据点", q.points.len()),
         }
     }
 }

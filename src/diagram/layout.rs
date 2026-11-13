@@ -28,7 +28,7 @@ use super::{draw, DiagramTheme};
 use crate::diagram::model::{
     series_color, Arrow, Diagram, Direction, Edge, Gantt, Graph, GroupKind, LineStyle, Node,
     NodeShape, NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
-    Journey, Task, Timeline, days_from_civil, format_day,
+    Journey, Quadrant, Task, Timeline, days_from_civil, format_day,
 };
 use crate::gfx::{Anchor, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -89,6 +89,7 @@ pub fn layout(
         Diagram::Gantt(g) => layout_gantt(g, diagram, &ctx),
         Diagram::Timeline(t) => layout_timeline(t, diagram, &ctx),
         Diagram::Journey(j) => layout_journey(j, diagram, &ctx),
+        Diagram::Quadrant(q) => layout_quadrant(q, diagram, &ctx),
     }
 }
 
@@ -1886,6 +1887,172 @@ fn layout_journey(journey: &Journey, diagram: &Diagram, ctx: &Ctx) -> DiagramRen
     finish(prims, ctx, None, warnings, summary)
 }
 
+
+// ===========================================================================
+// Quadrant charts
+// ===========================================================================
+
+/// Quadrant fills, in Mermaid's order: top-right, top-left, bottom-left,
+/// bottom-right. Alpha is low so labels stay readable in both themes.
+const QUADRANT_TINTS: [u32; 4] = [0x4C8DFF, 0x34C759, 0xFF9F0A, 0xBF5AF2];
+
+/// `quadrantChart` — a square plot split into four labelled quadrants.
+fn layout_quadrant(q: &Quadrant, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    if q.points.is_empty() {
+        push_warning(&mut warnings, "quadrantChart 没有数据点".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let label_font = ctx.small();
+    let caption_font = ctx.small_bold();
+    let point_font = ctx.small();
+    let side = (ctx.base * 21.0).clamp(200.0, 420.0);
+    let gutter_left = ctx.w(&q.y_low, caption_font).max(ctx.w(&q.y_high, caption_font)) + 10.0;
+    let gutter_bottom = ctx.lh(label_font) + 10.0;
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut y = 0.0f32;
+
+    let left = gutter_left;
+    let top;
+    if let Some(title) = q.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        prims.push(Prim::anchored_text(
+            [gutter_left + side * 0.5, 0.0],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::CenterTop,
+        ));
+        y = lh + 12.0;
+    }
+    top = y;
+
+    let plot = Rect::from_min_size([left, top], [side, side]);
+    // Four tinted quadrants; Mermaid numbers them clockwise from top-right.
+    let half = side * 0.5;
+    let cells = [
+        (1.0, 0.0), // top-right
+        (0.0, 0.0), // top-left
+        (0.0, 1.0), // bottom-left
+        (1.0, 1.0), // bottom-right
+    ];
+    for (i, (cx, cy)) in cells.iter().enumerate() {
+        let rect = Rect::from_min_size(
+            [plot.min[0] + cx * half, plot.min[1] + cy * half],
+            [half, half],
+        );
+        prims.push(Prim::filled_rect(
+            rect,
+            0.0,
+            Rgba::hex(QUADRANT_TINTS[i]).with_alpha(26),
+        ));
+    }
+    // Frame + dividers.
+    prims.push(Prim::stroked_rect(
+        plot,
+        0.0,
+        draw::stroke(1.2, ctx.theme.node_stroke.fade(0.7)),
+    ));
+    let mid_x = plot.min[0] + half;
+    let mid_y = plot.min[1] + half;
+    prims.push(Prim::line(
+        [mid_x, plot.min[1]],
+        [mid_x, plot.max[1]],
+        draw::stroke(1.0, ctx.theme.node_stroke.fade(0.5)),
+    ));
+    prims.push(Prim::line(
+        [plot.min[0], mid_y],
+        [plot.max[0], mid_y],
+        draw::stroke(1.0, ctx.theme.node_stroke.fade(0.5)),
+    ));
+
+    // Quadrant captions sit in the outer corner of their cell.
+    let corners = [
+        (plot.max[0] - 6.0, plot.min[1] + 6.0, Anchor::RightTop),
+        (plot.min[0] + 6.0, plot.min[1] + 6.0, Anchor::LeftTop),
+        (plot.min[0] + 6.0, plot.max[1] - 6.0, Anchor::LeftBottom),
+        (plot.max[0] - 6.0, plot.max[1] - 6.0, Anchor::RightBottom),
+    ];
+    for (i, label) in q.quadrant_labels.iter().enumerate() {
+        if label.trim().is_empty() {
+            continue;
+        }
+        let (x, y, anchor) = corners[i];
+        prims.push(Prim::anchored_text(
+            [x, y],
+            label.clone(),
+            caption_font,
+            Rgba::hex(QUADRANT_TINTS[i]).lerp(ctx.theme.node_text, 0.45),
+            anchor,
+        ));
+    }
+
+    // Axis captions: low at the left/bottom, high at the right/top.
+    if !q.x_low.is_empty() {
+        prims.push(Prim::anchored_text(
+            [plot.min[0], plot.max[1] + gutter_bottom * 0.55],
+            q.x_low.clone(),
+            label_font,
+            ctx.theme.node_text.fade(0.75),
+            Anchor::LeftCenter,
+        ));
+    }
+    if !q.x_high.is_empty() {
+        prims.push(Prim::anchored_text(
+            [plot.max[0], plot.max[1] + gutter_bottom * 0.55],
+            q.x_high.clone(),
+            label_font,
+            ctx.theme.node_text.fade(0.75),
+            Anchor::RightCenter,
+        ));
+    }
+    if !q.y_high.is_empty() {
+        prims.push(Prim::anchored_text(
+            [plot.min[0] - 8.0, plot.min[1] + 2.0],
+            q.y_high.clone(),
+            label_font,
+            ctx.theme.node_text.fade(0.75),
+            Anchor::RightTop,
+        ));
+    }
+    if !q.y_low.is_empty() {
+        prims.push(Prim::anchored_text(
+            [plot.min[0] - 8.0, plot.max[1] - 2.0],
+            q.y_low.clone(),
+            label_font,
+            ctx.theme.node_text.fade(0.75),
+            Anchor::RightBottom,
+        ));
+    }
+
+    // Points: a filled dot plus its name, nudged right so the dot stays visible.
+    let r = 4.0;
+    for (i, point) in q.points.iter().enumerate() {
+        let px = plot.min[0] + point.x.clamp(0.0, 1.0) * side;
+        let py = plot.max[1] - point.y.clamp(0.0, 1.0) * side;
+        let color = series_color(i);
+        prims.push(Prim::circle([px, py], r, Some(color), None));
+        let flip = px > plot.max[0] - side * 0.35;
+        prims.push(Prim::anchored_text(
+            [px + if flip { -r - 4.0 } else { r + 4.0 }, py],
+            point.name.clone(),
+            point_font,
+            ctx.theme.node_text,
+            if flip {
+                Anchor::RightCenter
+            } else {
+                Anchor::LeftCenter
+            },
+        ));
+    }
+
+    finish(prims, ctx, None, warnings, summary)
+}
+
 // ===========================================================================
 // Sequence diagrams
 // ===========================================================================
@@ -3217,7 +3384,7 @@ mod tests {
             }
         }
 
-        let cases: [(&str, &str); 6] = [
+        let cases: [(&str, &str); 7] = [
             (
                 "gantt",
                 "gantt\n section Design\n 需求分析 :done, a1, 2024-01-01, 5d\n 方案设计 :a2, after a1, 3d\n section Build\n 编码 :active, b1, after a2, 10d\n 里程碑 :milestone, m1, 2024-01-30, 0d",
@@ -3235,7 +3402,11 @@ mod tests {
                 "kanban\n  todo[待办]\n    t1[写解析器]\n    t2[补测试]\n  doing[进行中]\n    d1[修布局]",
             ),
             (
-                "journey",
+                "quadrant",
+                "quadrantChart\n title 触达与互动\n x-axis 低触达 --> 高触达\n y-axis 低互动 --> 高互动\n quadrant-1 该扩张\n quadrant-2 该推广\n quadrant-3 重新评估\n quadrant-4 可以改进\n 活动 A: [0.3, 0.6]\n 活动 B: [0.45, 0.23]\n 活动 C: [0.9, 0.85]",
+            ),
+            (
+            "journey",
                 "journey\n title 我的一天\n section 上班\n 泡茶: 5: 我\n 上楼: 3: 我\n 干活: 1: 我, 猫\n section 回家\n 下楼: 5: 我",
             ),
             (
@@ -3542,6 +3713,103 @@ mod tests {
     #[test]
     fn an_empty_journey_shows_the_placeholder_card() {
         let r = run(&Diagram::Journey(Journey::default()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
+    }
+    // -- quadrantChart ------------------------------------------------------
+
+    fn quadrant_fixture() -> Quadrant {
+        Quadrant {
+            title: Some("触达与互动".to_owned()),
+            x_low: "低触达".to_owned(),
+            x_high: "高触达".to_owned(),
+            y_low: "低互动".to_owned(),
+            y_high: "高互动".to_owned(),
+            quadrant_labels: [
+                "该扩张".to_owned(),
+                "该推广".to_owned(),
+                "重新评估".to_owned(),
+                "可以改进".to_owned(),
+            ],
+            points: vec![
+                crate::diagram::model::QuadrantPoint {
+                    name: "活动 A".to_owned(),
+                    x: 0.3,
+                    y: 0.6,
+                },
+                crate::diagram::model::QuadrantPoint {
+                    name: "活动 B".to_owned(),
+                    x: 0.45,
+                    y: 0.23,
+                },
+                crate::diagram::model::QuadrantPoint {
+                    name: "活动 C".to_owned(),
+                    x: 0.95,
+                    y: 0.9,
+                },
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn quadrant_draws_frame_captions_and_points() {
+        let r = run(&Diagram::Quadrant(quadrant_fixture()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in [
+            "触达与互动", "低触达", "高触达", "低互动", "高互动", "该扩张", "可以改进", "活动 A",
+        ] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        // One dot per point, plus the four quadrant fills.
+        let dots = r
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Circle { .. }))
+            .count();
+        assert_eq!(dots, 3, "每个数据点一个圆点");
+        // A near-square plot: the frame is at least as tall as it is wide.
+        assert!(r.size[1] > r.size[0] * 0.8, "{:?}", r.size);
+    }
+
+    #[test]
+    fn quadrant_points_are_placed_by_coordinates() {
+        let r = run(&Diagram::Quadrant(quadrant_fixture()));
+        let dot_of = |needle: &str| -> [f32; 2] {
+            r.prims
+                .iter()
+                .find_map(|p| match p {
+                    Prim::Text { text, pos, .. } if text == needle => Some(*pos),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("缺少 {needle}"))
+        };
+        // B is lower and further right than A.
+        let a = dot_of("活动 A");
+        let b = dot_of("活动 B");
+        assert!(b[1] > a[1], "y 更小应更靠下");
+        assert!(b[0] > a[0], "x 更大应更靠右");
+    }
+
+    #[test]
+    fn an_empty_quadrant_shows_the_placeholder_card() {
+        let r = run(&Diagram::Quadrant(Quadrant::default()));
         assert_clean(&r);
         let texts: Vec<&str> = r
             .prims

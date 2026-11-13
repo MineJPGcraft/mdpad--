@@ -17,6 +17,25 @@ from PIL import Image, ImageDraw, ImageFont
 SCALE = 3  # supersample so thin rules and joins stay visible
 
 
+def flat(color):
+    """Blend an RGBA fill over white.
+
+    The canvas is RGB, so a translucent fill would otherwise be drawn at full
+    saturation and make a 10% quadrant tint look like a solid block.
+    """
+    if color is None:
+        return None
+    r, g, b, a = color
+    if a >= 255:
+        return (r, g, b)
+    t = a / 255.0
+    return (
+        round(r * t + 255 * (1 - t)),
+        round(g * t + 255 * (1 - t)),
+        round(b * t + 255 * (1 - t)),
+    )
+
+
 def load_font(size):
     candidates = [
         ("C:/Windows/Fonts/msyh.ttc", 0),
@@ -40,13 +59,13 @@ def draw_prim(d, p, band_h, ox, oy):
         x0, y0, x1, y1 = p["r"]
         box = [(ox + x0 * SCALE, oy + y0 * SCALE), (ox + x1 * SCALE, oy + y1 * SCALE)]
         if p["fill"]:
-            d.rectangle(box, fill=tuple(p["fill"]))
+            d.rectangle(box, fill=flat(p["fill"]))
         if p["stroke"]:
-            c = tuple(p["stroke"]["c"])
+            c = flat(p["stroke"]["c"])
             d.rectangle(box, outline=c, width=max(1, int(p["stroke"]["w"] * SCALE)))
     elif k == "line":
         (ax, ay), (bx, by) = p["a"], p["b"]
-        c = tuple(p["stroke"]["c"])
+        c = flat(p["stroke"]["c"])
         d.line(
             [(ox + ax * SCALE, oy + ay * SCALE), (ox + bx * SCALE, oy + by * SCALE)],
             fill=c,
@@ -55,9 +74,9 @@ def draw_prim(d, p, band_h, ox, oy):
     elif k == "path":
         pts = [(ox + x * SCALE, oy + y * SCALE) for x, y in p["pts"]]
         if p["fill"]:
-            d.polygon(pts, fill=tuple(p["fill"]))
+            d.polygon(pts, fill=flat(p["fill"]))
         if p["stroke"]:
-            c = tuple(p["stroke"]["c"])
+            c = flat(p["stroke"]["c"])
             w = max(1, int(p["stroke"]["w"] * SCALE))
             if len(pts) > 1:
                 d.line(pts, fill=c, width=w, joint="curve")
@@ -67,20 +86,20 @@ def draw_prim(d, p, band_h, ox, oy):
         cx, cy = p["p"]
         r = p["r"] * SCALE
         box = [ox + cx * SCALE - r, oy + cy * SCALE - r, ox + cx * SCALE + r, oy + cy * SCALE + r]
-        d.ellipse(box, fill=tuple(p["fill"]) if p["fill"] else None)
+        d.ellipse(box, fill=flat(p["fill"]) if p["fill"] else None)
     elif k == "ellipse":
         cx, cy = p["p"]
         rx, ry = p["r"]
         box = [ox + (cx - rx) * SCALE, oy + (cy - ry) * SCALE, ox + (cx + rx) * SCALE, oy + (cy + ry) * SCALE]
-        d.ellipse(box, fill=tuple(p["fill"]) if p["fill"] else None)
+        d.ellipse(box, fill=flat(p["fill"]) if p["fill"] else None)
     elif k == "text":
         w, h = p["w"] * SCALE, p["h"] * SCALE
         fx, fy = p["af"]
         x = ox + p["pos"][0] * SCALE - fx * w
         y = oy + p["pos"][1] * SCALE - fy * h
         # Faint box: the metric the layout actually used (ApproxMeasure).
-        d.rectangle([x, y, x + w, y + h], outline=(220, 220, 235))
-        d.text((x, y), p["s"], font=load_font(p["size"]), fill=tuple(p["c"]))
+        d.rectangle([x, y, x + w, y + h], outline=(228, 228, 238))
+        d.text((x, y), p["s"], font=load_font(p["size"]), fill=flat(p["c"]))
 
 
 def main():
