@@ -28,6 +28,7 @@ pub enum DiagramKind {
     Timeline,
     Journey,
     Quadrant,
+    XYChart,
 }
 
 impl DiagramKind {
@@ -46,6 +47,7 @@ impl DiagramKind {
             Self::Timeline => "timeline",
             Self::Journey => "journey",
             Self::Quadrant => "quadrant",
+            Self::XYChart => "xychart",
         }
     }
 }
@@ -684,6 +686,42 @@ impl Default for Quadrant {
 }
 
 // ---------------------------------------------------------------------------
+// XY charts (`xychart-beta`)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum XYSeriesKind {
+    Bar,
+    Line,
+}
+
+/// One `bar [...]` or `line [...]` series.
+#[derive(Clone, Debug)]
+pub struct XYSeries {
+    pub kind: XYSeriesKind,
+    pub name: String,
+    pub values: Vec<f32>,
+}
+
+/// A parsed `xychart-beta` block.
+#[derive(Clone, Debug, Default)]
+pub struct XYChart {
+    pub title: Option<String>,
+    pub x_label: String,
+    /// Category ticks; empty when the x axis is numeric.
+    pub x_categories: Vec<String>,
+    pub x_min: Option<f32>,
+    pub x_max: Option<f32>,
+    pub y_label: String,
+    pub y_min: Option<f32>,
+    pub y_max: Option<f32>,
+    pub series: Vec<XYSeries>,
+    /// `xychart-beta horizontal` was asked for; drawn vertically with a warning.
+    pub horizontal: bool,
+    pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -696,6 +734,7 @@ pub enum Diagram {
     Timeline(Timeline),
     Journey(Journey),
     Quadrant(Quadrant),
+    XYChart(XYChart),
 }
 
 impl Diagram {
@@ -710,6 +749,7 @@ impl Diagram {
             Self::Timeline(_) => DiagramKind::Timeline,
             Self::Journey(_) => DiagramKind::Journey,
             Self::Quadrant(_) => DiagramKind::Quadrant,
+            Self::XYChart(_) => DiagramKind::XYChart,
         }
     }
 
@@ -722,6 +762,7 @@ impl Diagram {
             Self::Timeline(t) => t.title.as_deref(),
             Self::Journey(j) => j.title.as_deref(),
             Self::Quadrant(q) => q.title.as_deref(),
+            Self::XYChart(c) => c.title.as_deref(),
         }
     }
 
@@ -735,6 +776,7 @@ impl Diagram {
             Self::Timeline(t) => &t.warnings,
             Self::Journey(j) => &j.warnings,
             Self::Quadrant(q) => &q.warnings,
+            Self::XYChart(c) => &c.warnings,
         }
     }
 
@@ -747,6 +789,7 @@ impl Diagram {
             Self::Timeline(t) => t.periods.is_empty(),
             Self::Journey(j) => j.steps.is_empty(),
             Self::Quadrant(q) => q.points.is_empty(),
+            Self::XYChart(c) => c.series.iter().all(|s| s.values.is_empty()),
         }
     }
 
@@ -781,6 +824,11 @@ impl Diagram {
                 j.sections.len()
             ),
             Self::Quadrant(q) => format!("quadrant · {} 个数据点", q.points.len()),
+            Self::XYChart(c) => format!(
+                "xychart · {} 条序列 · {} 个数据点",
+                c.series.len(),
+                c.series.iter().map(|s| s.values.len()).sum::<usize>()
+            ),
         }
     }
 }

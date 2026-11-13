@@ -24,8 +24,8 @@ use std::collections::BTreeSet;
 use crate::diagram::model::{
     Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Gantt, Graph, GroupKind, LineStyle,
     Journey, JourneyStep, Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Period, Pie,
-    Quadrant, QuadrantPoint, SeqStep, Sequence, Slice, Task, Timeline, civil_from_days,
-    days_from_civil, parse_color,
+    Quadrant, QuadrantPoint, SeqStep, Sequence, Slice, Task, Timeline, XYChart, XYSeries,
+    XYSeriesKind, civil_from_days, days_from_civil, parse_color,
 };
 use crate::gfx::Rgba;
 
@@ -71,6 +71,9 @@ pub fn parse(src: &str) -> Diagram {
         Header::Timeline => Diagram::Timeline(timeline_parse(&lines[1..], title)),
         Header::Journey => Diagram::Journey(journey_parse(&lines[1..], title)),
         Header::Quadrant => Diagram::Quadrant(quadrant_parse(&lines[1..], title)),
+        Header::XYChart(horizontal) => {
+            Diagram::XYChart(xychart_parse(&lines[1..], title, horizontal))
+        }
         Header::Unknown(name) => {
             let mut graph = if looks_like_edge(first) {
                 flowchart_graph(&lines, Direction::TopDown, None, title)
@@ -422,6 +425,7 @@ enum Header {
     Timeline,
     Journey,
     Quadrant,
+    XYChart(bool),
     Unknown(String),
 }
 
@@ -454,6 +458,9 @@ fn detect_header(first: &str) -> Header {
         "timeline" => Header::Timeline,
         "journey" => Header::Journey,
         "quadrantchart" => Header::Quadrant,
+        "xychart-beta" | "xychart" | "xychart-beta-vertical" => Header::XYChart(
+            rest.split_whitespace().any(|w| w.eq_ignore_ascii_case("horizontal")),
+        ),
         _ => Header::Unknown(word.to_owned()),
     }
 }
@@ -3153,6 +3160,140 @@ fn axis_caption(body: &str) -> (String, String) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// xychart-beta
+// ---------------------------------------------------------------------------
+
+/// `"label" rest` → `(Some(label), rest)`.
+///
+/// `strip_quote_pair` only matches a *fully* quoted string, which is not enough
+/// for `y-axis "金额" 0 --> 100` or `bar "销量" [1, 2]`.
+fn split_quoted_prefix(s: &str) -> (Option<String>, &str) {
+    let t = s.trim_start();
+    let Some(rest) = t.strip_prefix('"') else {
+        return (None, t);
+    };
+    match rest.find('"') {
+        Some(close) => (Some(rest[..close].to_owned()), rest[close + 1..].trim()),
+        None => (None, t),
+    }
+}
+
+/// Split `[1, 2, 3]` into numbers; empty on a malformed list.
+fn parse_number_list(text: &str) -> Vec<f32> {
+    let inner = text
+        .trim()
+        .strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .unwrap_or(text);
+    inner
+        .split(',')
+        .filter_map(|v| v.trim().parse::<f32>().ok())
+        .collect()
+}
+
+/// `"Revenue" 4000 --> 11000` → (label, min, max).
+fn parse_axis_spec(text: &str) -> (String, Option<f32>, Option<f32>) {
+    let (label, rest) = split_quoted_prefix(text);
+    let label = label.unwrap_or_default();
+    let rest = rest.trim();
+    let (min, max) = match rest.split_once("-->") {
+        Some((lo, hi)) => (
+            lo.trim().parse::<f32>().ok(),
+            hi.trim().parse::<f32>().ok(),
+        ),
+        None => (None, None),
+    };
+    (label, min, max)
+}
+
+/// `xychart-beta` — bars and/or lines over category or numeric axes.
+fn xychart_parse(lines: &[String], title: Option<String>, horizontal: bool) -> XYChart {
+    let mut chart = XYChart {
+        title,
+        horizontal,
+        ..XYChart::default()
+    };
+    if horizontal {
+        chart
+            .warnings
+            .push("xychart-beta horizontal 已按竖直方向绘制".to_owned());
+    }
+
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = first_word(t).to_ascii_lowercase();
+        let rest = after_first_word(t).trim();
+        match lower.as_str() {
+            "title" => {
+                let title = strip_quotes(rest);
+                if !title.is_empty() {
+                    chart.title = Some(title);
+                }
+            }
+            "x-axis" => {
+                if rest.starts_with('[') {
+                    chart.x_categories = rest
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .split(',')
+                        .map(|c| strip_quotes(c.trim()))
+                        .filter(|c| !c.is_empty())
+                        .collect();
+                } else {
+                    let (label, min, max) = parse_axis_spec(rest);
+                    chart.x_label = label;
+                    chart.x_min = min;
+                    chart.x_max = max;
+                }
+            }
+            "y-axis" => {
+                let (label, min, max) = parse_axis_spec(rest);
+                chart.y_label = label;
+                chart.y_min = min;
+                chart.y_max = max;
+            }
+            "bar" | "line" => {
+                // Optional series name in quotes, then the value list.
+                let (name, values_text) = split_quoted_prefix(rest);
+                let name = name.unwrap_or_default();
+                let values = parse_number_list(values_text);
+                if values.is_empty() {
+                    chart
+                        .warnings
+                        .push(format!("{} 系列没有数据: {}", lower, truncate(t, 40)));
+                    continue;
+                }
+                chart.series.push(XYSeries {
+                    kind: if lower == "bar" {
+                        XYSeriesKind::Bar
+                    } else {
+                        XYSeriesKind::Line
+                    },
+                    name,
+                    values,
+                });
+            }
+            // `x-axis` captions and other directives this renderer ignores.
+            _ => {
+                if !lower.starts_with("acc") {
+                    chart
+                        .warnings
+                        .push(format!("无法识别的 xychart 语句: {}", truncate(t, 40)));
+                }
+            }
+        }
+    }
+
+    if chart.series.is_empty() {
+        chart.warnings.push("xychart 没有数据序列".to_owned());
+    }
+    chart
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3996,5 +4137,63 @@ mod tests {
             panic!("expected a quadrant chart")
         };
         assert!(q.warnings.iter().any(|w| w.contains("没有数据点")));
+    }
+    // -- xychart-beta -------------------------------------------------------
+
+    #[test]
+    fn xychart_parses_axes_and_series() {
+        let d = parse(
+            "xychart-beta\n\
+             \x20 title \"销售\"\n\
+             \x20 x-axis [一月, 二月, 三月]\n\
+             \x20 y-axis \"金额\" 0 --> 100\n\
+             \x20 bar [20, 50, 80]\n\
+             \x20 line \"趋势\" [25, 45, 90]",
+        );
+        let Diagram::XYChart(c) = d else {
+            panic!("expected an xychart")
+        };
+        assert_eq!(c.title.as_deref(), Some("销售"));
+        assert_eq!(c.x_categories, vec!["一月", "二月", "三月"]);
+        assert_eq!(c.y_label, "金额");
+        assert_eq!(c.y_min, Some(0.0));
+        assert_eq!(c.y_max, Some(100.0));
+        assert_eq!(c.series.len(), 2);
+        assert_eq!(c.series[0].kind, XYSeriesKind::Bar);
+        assert_eq!(c.series[0].values, vec![20.0, 50.0, 80.0]);
+        assert_eq!(c.series[1].kind, XYSeriesKind::Line);
+        assert_eq!(c.series[1].name, "趋势");
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    }
+
+    #[test]
+    fn xychart_accepts_a_numeric_x_axis() {
+        let d = parse("xychart-beta\n x-axis \"t\" 0 --> 10\n line [1, 4, 9]");
+        let Diagram::XYChart(c) = d else {
+            panic!("expected an xychart")
+        };
+        assert!(c.x_categories.is_empty());
+        assert_eq!(c.x_label, "t");
+        assert_eq!(c.x_min, Some(0.0));
+        assert_eq!(c.x_max, Some(10.0));
+    }
+
+    #[test]
+    fn xychart_horizontal_is_reported_but_drawn_vertically() {
+        let d = parse("xychart-beta horizontal\n bar [1, 2]");
+        let Diagram::XYChart(c) = d else {
+            panic!("expected an xychart")
+        };
+        assert!(c.horizontal);
+        assert!(c.warnings.iter().any(|w| w.contains("竖直")));
+    }
+
+    #[test]
+    fn an_empty_xychart_warns() {
+        let d = parse("xychart-beta\n title \"空\"");
+        let Diagram::XYChart(c) = d else {
+            panic!("expected an xychart")
+        };
+        assert!(c.warnings.iter().any(|w| w.contains("没有数据序列")));
     }
 }

@@ -170,6 +170,7 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 - **journey** — `section` 分带、`步骤: 分数: 参与者` 语法（分数夹在 1–5、缺省给 3）、1–5 分刻度轴与网格、步骤框按分数定位并用折线连成路径、参与者列在框下。
 - **timeline** — `section` 分带、`2002 : LinkedIn : Google` 一句多事件、卡片沿轴线上下交替、无事件的时期也占一列。
 - **quadrantChart** — `x-axis 低 --> 高` / `y-axis` 轴标题、`quadrant-1..4` 四象限名（右上→左上→左下→右下）、`名称: [x, y]` 数据点（自动夹到 0–1）、点标签在靠近右边界时自动翻到左侧。
+- **xychart-beta** — `x-axis [分类…]` 或数值轴 `x-axis "标签" 0 --> 10`、`y-axis "标签" 0 --> 100`、`bar` / `line`（可带引号系列名）、多序列并列柱、刻度自动取整（1/2/5×10ⁿ）；`xychart-beta horizontal` 会按竖直方向绘制并在状态栏说明。
 - **gantt** — `section` 分组、`日期` 或 `after <id>` 起算、`30d`/`2w`/`3h`
   时长、`done` / `active` / `crit` / `milestone` 标记、`axisFormat` 刻度格式、
   `dateFormat` / `excludes` / `todayMarker` / `tickInterval` 等日历指令安全忽略。

@@ -28,7 +28,7 @@ use super::{draw, DiagramTheme};
 use crate::diagram::model::{
     series_color, Arrow, Diagram, Direction, Edge, Gantt, Graph, GroupKind, LineStyle, Node,
     NodeShape, NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
-    Journey, Quadrant, Task, Timeline, days_from_civil, format_day,
+    Journey, Quadrant, Task, Timeline, XYChart, XYSeriesKind, days_from_civil, format_day,
 };
 use crate::gfx::{Anchor, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -90,6 +90,7 @@ pub fn layout(
         Diagram::Timeline(t) => layout_timeline(t, diagram, &ctx),
         Diagram::Journey(j) => layout_journey(j, diagram, &ctx),
         Diagram::Quadrant(q) => layout_quadrant(q, diagram, &ctx),
+        Diagram::XYChart(c) => layout_xychart(c, diagram, &ctx),
     }
 }
 
@@ -170,6 +171,37 @@ impl Ctx<'_> {
     fn h(&self, text: &str, f: Font) -> f32 {
         draw::fin(self.m.measure(text, f)[1], 0.0).max(0.0)
     }
+}
+
+/// Choose a readable axis scale for `min..max`.
+///
+/// Returns `(step, first, last)` where `first..=last` are round multiples of
+/// `step`. Used by every chart with a numeric axis so the tick density stays
+/// consistent between gantt, journey and xychart.
+fn axis_ticks(min: f32, max: f32, target: usize) -> (f32, f32, f32) {
+    let (min, max) = if min.is_finite() && max.is_finite() && max > min {
+        (min, max)
+    } else {
+        (0.0, 1.0)
+    };
+    let span = max - min;
+    let raw = span / target.max(1) as f32;
+    let magnitude = 10f32.powf(raw.log10().floor());
+    let normalised = raw / magnitude;
+    let step = magnitude
+        * if normalised <= 1.0 {
+            1.0
+        } else if normalised <= 2.0 {
+            2.0
+        } else if normalised <= 5.0 {
+            5.0
+        } else {
+            10.0
+        };
+    let step = step.max(1e-6);
+    let first = (min / step).floor() * step;
+    let last = (max / step).ceil() * step;
+    (step, first, last)
 }
 
 // ---------------------------------------------------------------------------
@@ -2053,6 +2085,230 @@ fn layout_quadrant(q: &Quadrant, diagram: &Diagram, ctx: &Ctx) -> DiagramRender 
     finish(prims, ctx, None, warnings, summary)
 }
 
+
+// ===========================================================================
+// XY charts
+// ===========================================================================
+
+/// `xychart-beta` — bars and lines over a shared numeric y axis.
+fn layout_xychart(chart: &XYChart, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    let n = chart
+        .series
+        .iter()
+        .map(|s| s.values.len())
+        .max()
+        .unwrap_or(0);
+    if n == 0 {
+        push_warning(&mut warnings, "xychart 没有数据序列".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let tick_font = ctx.small();
+    let cat_font = ctx.small();
+    let label_font = ctx.small_bold();
+    let plot_w = (ctx.base * 26.0).clamp(220.0, 640.0);
+    let plot_h = (plot_w * 0.5).clamp(120.0, 300.0);
+
+    // Y range: explicit bounds win, otherwise fit the data (bars start at 0).
+    let data_min = chart
+        .series
+        .iter()
+        .flat_map(|s| s.values.iter().copied())
+        .fold(f32::INFINITY, f32::min);
+    let data_max = chart
+        .series
+        .iter()
+        .flat_map(|s| s.values.iter().copied())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let has_bar = chart
+        .series
+        .iter()
+        .any(|s| s.kind == XYSeriesKind::Bar);
+    let lo = chart.y_min.unwrap_or(if has_bar {
+        data_min.min(0.0)
+    } else {
+        data_min
+    });
+    let hi = chart.y_max.unwrap_or(data_max);
+    let (step, axis_lo, axis_hi) = axis_ticks(lo, hi, 5);
+    let span = (axis_hi - axis_lo).max(1e-6);
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut y = 0.0f32;
+    if let Some(title) = chart.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        prims.push(Prim::anchored_text(
+            [0.0, y],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::LeftTop,
+        ));
+        y += lh + 10.0;
+
+    // The y-axis caption gets its own band: drawing it over the tick column
+    // put it on top of the title.
+    if !chart.y_label.is_empty() {
+        prims.push(Prim::anchored_text(
+            [0.0, y],
+            chart.y_label.clone(),
+            label_font,
+            ctx.theme.node_text.fade(0.85),
+            Anchor::LeftTop,
+        ));
+        y += ctx.lh(label_font) * 1.8;
+    }
+    }
+
+    // Gutter widths depend on the widest tick / category text.
+    let mut tick_labels: Vec<(f32, String)> = Vec::new();
+    let mut value = axis_lo;
+    let mut guard = 0;
+    while value <= axis_hi + step * 0.01 && guard < 64 {
+        guard += 1;
+        tick_labels.push((value, format_tick(value)));
+        value += step;
+    }
+    let gutter_left = tick_labels
+        .iter()
+        .map(|(_, l)| ctx.w(l, tick_font))
+        .fold(0.0f32, f32::max)
+        + 10.0;
+    let gutter_bottom = ctx.lh(cat_font) + 12.0;
+
+    let plot = Rect::from_min_size([gutter_left, y], [plot_w, plot_h]);
+    let y_of = |v: f32| plot.max[1] - ((v - axis_lo) / span).clamp(0.0, 1.0) * plot_h;
+    let x_of_slot = |slot: usize| {
+        let count = n.max(1) as f32;
+        plot.min[0] + (slot as f32 + 0.5) / count * plot_w
+    };
+
+    // Horizontal grid + tick labels.
+    for (i, (v, label)) in tick_labels.iter().enumerate() {
+        let yy = y_of(*v);
+        prims.push(Prim::line(
+            [plot.min[0], yy],
+            [plot.max[0], yy],
+            draw::stroke(1.0, ctx.theme.node_stroke.fade(if i == 0 { 0.55 } else { 0.12 })),
+        ));
+        prims.push(Prim::anchored_text(
+            [plot.min[0] - 8.0, yy],
+            label.clone(),
+            tick_font,
+            ctx.theme.node_text.fade(0.75),
+            Anchor::RightCenter,
+        ));
+    }
+    // Frame.
+    prims.push(Prim::line(
+        [plot.min[0], plot.min[1]],
+        [plot.min[0], plot.max[1]],
+        draw::stroke(1.4, ctx.theme.node_stroke.fade(0.6)),
+    ));
+    prims.push(Prim::line(
+        [plot.min[0], plot.max[1]],
+        [plot.max[0], plot.max[1]],
+        draw::stroke(1.4, ctx.theme.node_stroke.fade(0.6)),
+    ));
+
+    // X labels: categories, or the numeric ticks when the axis is numeric.
+    if !chart.x_categories.is_empty() {
+        for (i, name) in chart.x_categories.iter().take(n).enumerate() {
+            prims.push(Prim::anchored_text(
+                [x_of_slot(i), plot.max[1] + 4.0 + ctx.lh(cat_font) * 0.5],
+                name.clone(),
+                cat_font,
+                ctx.theme.node_text.fade(0.8),
+                Anchor::Center,
+            ));
+        }
+    } else if let (Some(x0), Some(x1)) = (chart.x_min, chart.x_max) {
+        for i in 0..n {
+            let value = x0 + (x1 - x0) * (i as f32 + 0.5) / n as f32;
+            prims.push(Prim::anchored_text(
+                [x_of_slot(i), plot.max[1] + 4.0 + ctx.lh(cat_font) * 0.5],
+                format_tick(value),
+                cat_font,
+                ctx.theme.node_text.fade(0.8),
+                Anchor::Center,
+            ));
+        }
+    }
+
+    if !chart.x_label.is_empty() {
+        prims.push(Prim::anchored_text(
+            [plot.center()[0], plot.max[1] + gutter_bottom],
+            chart.x_label.clone(),
+            label_font,
+            ctx.theme.node_text.fade(0.85),
+            Anchor::CenterBottom,
+        ));
+    }
+
+    // Bars first (grouped side by side), then lines on top.
+    let bar_count = chart
+        .series
+        .iter()
+        .filter(|s| s.kind == XYSeriesKind::Bar)
+        .count();
+    let group_w = plot_w / n.max(1) as f32;
+    for (slot, series) in chart
+        .series
+        .iter()
+        .filter(|s| s.kind == XYSeriesKind::Bar)
+        .enumerate()
+    {
+        let color = series_color(slot);
+        let width = (group_w * 0.7 / bar_count.max(1) as f32).max(3.0);
+        let group_left = |i: usize| x_of_slot(i) - group_w * 0.35;
+        for (i, value) in series.values.iter().enumerate() {
+            let cx = group_left(i) + width * (slot as f32 + 0.5);
+            let top = y_of(*value);
+            let base = y_of(if axis_lo <= 0.0 { 0.0 } else { axis_lo });
+            let rect = Rect::from_min_size(
+                [cx - width * 0.5, top.min(base)],
+                [width, (base - top).abs().max(1.0)],
+            );
+            prims.push(Prim::filled_rect(rect, 2.0, color.with_alpha(220)));
+        }
+    }
+    for (index, series) in chart.series.iter().enumerate() {
+        if series.kind != XYSeriesKind::Line {
+            continue;
+        }
+        let color = series_color(index);
+        let points: Vec<[f32; 2]> = series
+            .values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| [x_of_slot(i), y_of(*v)])
+            .collect();
+        for pair in points.windows(2) {
+            prims.push(Prim::line(pair[0], pair[1], draw::stroke(2.0, color)));
+        }
+        for point in &points {
+            prims.push(Prim::circle(*point, 3.0, Some(color), None));
+        }
+    }
+
+    finish(prims, ctx, None, warnings, summary)
+}
+
+/// Axis tick text: whole numbers without a decimal tail, one decimal otherwise.
+fn format_tick(v: f32) -> String {
+    if !v.is_finite() {
+        return String::new();
+    }
+    if (v - v.round()).abs() < 0.001 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
 // ===========================================================================
 // Sequence diagrams
 // ===========================================================================
@@ -3384,7 +3640,7 @@ mod tests {
             }
         }
 
-        let cases: [(&str, &str); 7] = [
+        let cases: [(&str, &str); 8] = [
             (
                 "gantt",
                 "gantt\n section Design\n 需求分析 :done, a1, 2024-01-01, 5d\n 方案设计 :a2, after a1, 3d\n section Build\n 编码 :active, b1, after a2, 10d\n 里程碑 :milestone, m1, 2024-01-30, 0d",
@@ -3402,7 +3658,11 @@ mod tests {
                 "kanban\n  todo[待办]\n    t1[写解析器]\n    t2[补测试]\n  doing[进行中]\n    d1[修布局]",
             ),
             (
-                "quadrant",
+                "xychart",
+                "xychart-beta\n title \"销售\"\n x-axis [一月, 二月, 三月, 四月]\n y-axis \"金额\" 0 --> 100\n bar [20, 50, 80, 60]\n line \"趋势\" [25, 45, 90, 70]",
+            ),
+            (
+            "quadrant",
                 "quadrantChart\n title 触达与互动\n x-axis 低触达 --> 高触达\n y-axis 低互动 --> 高互动\n quadrant-1 该扩张\n quadrant-2 该推广\n quadrant-3 重新评估\n quadrant-4 可以改进\n 活动 A: [0.3, 0.6]\n 活动 B: [0.45, 0.23]\n 活动 C: [0.9, 0.85]",
             ),
             (
@@ -3820,5 +4080,116 @@ mod tests {
             })
             .collect();
         assert!(texts.contains(&"空图表"), "{texts:?}");
+    }
+    // -- xychart-beta -------------------------------------------------------
+
+    fn xychart_fixture() -> XYChart {
+        XYChart {
+            title: Some("销售".to_owned()),
+            x_label: String::new(),
+            x_categories: vec!["一月".to_owned(), "二月".to_owned(), "三月".to_owned()],
+            x_min: None,
+            x_max: None,
+            y_label: "金额".to_owned(),
+            y_min: Some(0.0),
+            y_max: Some(100.0),
+            series: vec![
+                crate::diagram::model::XYSeries {
+                    kind: XYSeriesKind::Bar,
+                    name: String::new(),
+                    values: vec![20.0, 50.0, 80.0],
+                },
+                crate::diagram::model::XYSeries {
+                    kind: XYSeriesKind::Line,
+                    name: "趋势".to_owned(),
+                    values: vec![25.0, 45.0, 90.0],
+                },
+            ],
+            horizontal: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn xychart_draws_ticks_bars_and_a_line() {
+        let r = run(&Diagram::XYChart(xychart_fixture()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .map(|p| match p {
+                Prim::Text { text, .. } => text.as_str(),
+                _ => "",
+            })
+            .filter(|t| !t.is_empty())
+            .collect();
+        for expected in ["销售", "金额", "一月", "三月", "0", "100"] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        // Three bars, three line markers.
+        let filled = r
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Rect { fill: Some(_), .. }))
+            .count();
+        assert!(filled >= 3, "应有至少三个柱");
+        let dots = r
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Circle { .. }))
+            .count();
+        assert_eq!(dots, 3, "折线上每个点一个标记");
+    }
+
+    #[test]
+    fn xychart_bars_sit_on_the_value_axis() {
+        let r = run(&Diagram::XYChart(xychart_fixture()));
+        // The 80 bar must be higher (smaller y) than the 20 bar.
+        let bars: Vec<(f32, f32)> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Rect {
+                    rect,
+                    fill: Some(_),
+                    ..
+                } => Some((rect.min[0], rect.min[1])),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bars.len(), 3);
+        let mut sorted = bars.clone();
+        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        assert!(
+            sorted[2].1 < sorted[0].1,
+            "80 应该比 20 更高：{:?}",
+            sorted
+        );
+    }
+
+    #[test]
+    fn an_empty_xychart_shows_the_placeholder_card() {
+        let r = run(&Diagram::XYChart(XYChart::default()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
+    }
+
+    #[test]
+    fn axis_ticks_pick_round_steps() {
+        let (step, lo, hi) = axis_ticks(0.0, 100.0, 5);
+        assert_eq!(step, 20.0);
+        assert_eq!((lo, hi), (0.0, 100.0));
+        let (step, _, _) = axis_ticks(3.0, 7.0, 4);
+        assert!(step >= 1.0, "{step}");
+        let (step, lo, hi) = axis_ticks(0.0, 1.0, 5);
+        assert!(step > 0.0 && lo <= 0.0 && hi >= 1.0);
     }
 }
