@@ -23,6 +23,8 @@ mod gfx;
 mod gfx_egui;
 mod icon;
 mod icon_data;
+// The MDX / Markdoc runtime: expression evaluation over document data.
+mod mdx;
 mod recovery;
 mod tex;
 mod theme;
