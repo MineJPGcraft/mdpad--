@@ -1,7 +1,7 @@
 [package]
 name = "mdpad--"
 version = "0.1.0"
-edition = "2024"
+edition = "2026"
 description = "MarkdownPad - a pure-Rust offline WYSIWYG Markdown / MDX / Markdoc editor"
 authors = ["MCJPG"]
 readme = "README.md"
