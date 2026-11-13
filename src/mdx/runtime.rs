@@ -28,7 +28,7 @@ use crate::doc::model::{
     Block, BlockKind, Callout, CalloutSyntax, CalloutVariant, MarkdocTagKind,
 };
 
-use super::expr::{Scope, Value, eval};
+use super::expr::{Scope, Value};
 use super::scope::scope_from_document;
 
 /// Maximum nesting of expanded containers; guards against pathological input.
@@ -39,6 +39,12 @@ const MAX_DEPTH: u32 = 32;
 pub struct Resolved {
     pub blocks: Vec<Block>,
     pub warnings: Vec<String>,
+    /// Text to show in place of a *value* block, keyed by the block's span start.
+    ///
+    /// A block only carries a byte range, so a resolved value has nowhere to live
+    /// in the IR. The view layer consults this map while painting and falls back
+    /// to showing the source when the block is focused for editing.
+    pub values: BTreeMap<usize, String>,
 }
 
 /// Expand `blocks` against `scope`, recursively.
@@ -90,10 +96,18 @@ fn expand_block(block: &Block, scope: &Scope, out: &mut Resolved, depth: u32) {
             },
             MarkdocTagKind::Pair if name == "for" => loop_block(attrs, body, scope, out, depth),
             MarkdocTagKind::Reference => {
-                // `$x` is a value (it needs the view layer to place text) and
-                // `#partial` is an include of a file that cannot be loaded.
-                if name.starts_with('$') {
-                    warn(out, format!("{{% {name} %}} 的值需要视图层插值"));
+                // `$x` is a value we can resolve; `#partial` is an include of a
+                // file that cannot be loaded offline.
+                if let Some(expr) = name.strip_prefix('$') {
+                    match super::expr::eval(expr, scope) {
+                        Ok(value) => {
+                            // The block stays in the list so editing still works;
+                            // the view paints `values[span]` instead of the tag.
+                            out.values.insert(block.span.start, value.to_display());
+                            out.blocks.push(block.clone());
+                        }
+                        Err(e) => warn(out, format!("{{% {name} %}} 求值失败: {e}")),
+                    }
                 } else {
                     warn(out, format!("Markdoc 引用 {name} 无法在离线状态解析"));
                 }
@@ -489,14 +503,31 @@ count: 3
     }
 
     #[test]
-    fn variable_references_are_reported_not_drawn() {
-        let text = "\n{% $page.count %}\n";
+    fn variable_references_resolve_into_the_value_map() {
+        let text = "---\ncount: 7\n---\n\n{% $page.count %}\n";
         let resolved = resolve(text, Flavor::Markdoc);
-        assert!(resolved.blocks.is_empty());
-        assert!(
-            resolved.warnings.iter().any(|w| w.contains("视图层插值")),
-            "{:?}",
-            resolved.warnings
+        // The block stays so it can be focused for editing, and its span carries
+        // the resolved text for the view layer to paint.
+        assert_eq!(resolved.blocks.len(), 1, "{:?}", kinds(&resolved));
+        let start = resolved.blocks[0].span.start;
+        assert_eq!(
+            resolved.values.get(&start).map(String::as_str),
+            Some("7")
+        );
+        assert!(resolved.warnings.is_empty(), "{:?}", resolved.warnings);
+    }
+
+    #[test]
+    fn a_broken_reference_warns_and_draws_nothing() {
+        let text = "\n{% $missing.deep %}\n";
+        let resolved = resolve(text, Flavor::Markdoc);
+        // Unresolvable paths evaluate to null, which has no text to show.
+        let start = resolved.blocks.first().map(|b| b.span.start);
+        assert!(start.is_some());
+        assert_eq!(
+            resolved.values.get(&start.expect("block span")).map(String::as_str),
+            Some(""),
+            "null 渲染为空字符串"
         );
     }
 

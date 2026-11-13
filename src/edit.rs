@@ -76,9 +76,9 @@ struct MathEntry {
 #[derive(Default)]
 pub struct ViewState {
     pub active: Option<EditSession>,
-    /// Expanded MDX / Markdoc blocks, keyed by the document revision they came
-    /// from. `None` for plain Markdown, which needs no expansion.
-    mdx_cache: Option<(u64, Vec<Block>)>,
+    /// Expanded MDX / Markdoc blocks plus resolved `$values`, keyed by the
+    /// document revision they came from. `None` for plain Markdown.
+    mdx_cache: Option<(u64, Vec<Block>, std::collections::BTreeMap<usize, String>)>,
     diagram_cache: HashMap<u64, DiagramEntry>,
     math_cache: HashMap<u64, MathEntry>,
     /// Shown under the toolbar for a few seconds.
@@ -102,19 +102,26 @@ impl ViewState {
     ///
     /// The expanded list is cached by document revision; `take`/`put` keeps the
     /// borrow checker happy without cloning on every frame.
-    fn take_mdx(&mut self, doc: &Document) -> Option<Vec<Block>> {
+    fn take_mdx(
+        &mut self,
+        doc: &Document,
+    ) -> Option<(Vec<Block>, std::collections::BTreeMap<usize, String>)> {
         if doc.flavor == crate::doc::model::Flavor::Markdown {
             return None;
         }
-        if let Some((revision, blocks)) = &self.mdx_cache
+        if let Some((revision, blocks, values)) = &self.mdx_cache
             && *revision == doc.revision
         {
             // Hand out a copy: the caller may draw from it while we stay borrowed.
-            return Some(blocks.clone());
+            return Some((blocks.clone(), values.clone()));
         }
         let resolved = crate::mdx::expand_document(&doc.blocks, &doc.text);
-        self.mdx_cache = Some((doc.revision, resolved.blocks.clone()));
-        Some(resolved.blocks)
+        self.mdx_cache = Some((
+            doc.revision,
+            resolved.blocks.clone(),
+            resolved.values.clone(),
+        ));
+        Some((resolved.blocks, resolved.values))
     }
 
     /// Drops caches after a theme or zoom change.
@@ -238,7 +245,11 @@ pub fn document_ui(
     // blocks, so a path is resolved by span rather than by position. This has to
     // happen before `ctx` takes the mutable borrow of `state`.
     let expanded = state.take_mdx(doc);
-    let rendered: &[Block] = expanded.as_deref().unwrap_or(&doc.blocks);
+    let (rendered, mdx_values): (&[Block], Option<&std::collections::BTreeMap<usize, String>>) =
+        match &expanded {
+            Some((blocks, values)) => (blocks.as_slice(), Some(values)),
+            None => (doc.blocks.as_slice(), None),
+        };
     let doc_index: std::collections::HashMap<usize, usize> = doc
         .blocks
         .iter()
@@ -252,6 +263,7 @@ pub fn document_ui(
         theme,
         opts,
         level: 0,
+        mdx_values,
     };
     diag::clear();
     diag::push(format!(
@@ -293,6 +305,8 @@ fn merge_action(current: &mut Option<EditorAction>, next: EditorAction) {
 struct BlockCtx<'a> {
     state: &'a mut ViewState,
     doc: &'a Document,
+    /// Resolved `{% $var %}` text, keyed by block span start (MDX/Markdoc only).
+    mdx_values: Option<&'a std::collections::BTreeMap<usize, String>>,
     theme: &'a Theme,
     opts: &'a RenderOpts,
     level: usize,
@@ -300,6 +314,18 @@ struct BlockCtx<'a> {
 
 impl BlockCtx<'_> {
     /// Renders one block. Returns an action if the user did something.
+    /// Resolved text for a value block, or `None` when it should show source.
+    fn mdx_value(&self, block: &Block, path: &[usize]) -> Option<String> {
+        let values = self.mdx_values?;
+        // While this block is being edited the source must win.
+        if let Some(session) = &self.state.active
+            && session.path == path
+        {
+            return None;
+        }
+        values.get(&block.span.start).cloned()
+    }
+
     fn block_ui(&mut self, ui: &mut Ui, block: &Block, path: &[usize]) -> Option<EditorAction> {
         // Vertical rhythm.
         //
@@ -395,7 +421,30 @@ impl BlockCtx<'_> {
                 attrs,
                 body,
                 ..
-            } => self.markdoc_ui(ui, path, *kind, name, attrs, body, block),
+            } => {
+                // A resolved value is painted as text; focusing the block shows
+                // the source again, exactly like math and diagram blocks.
+                if *kind == MarkdocTagKind::Reference
+                    && let Some(text) = self.mdx_value(block, path)
+                {
+                    let resp = ui.add(
+                        egui::Label::new(
+                            RichText::new(text)
+                                .size(self.theme.typo.body())
+                                .color(self.theme.palette.text.to_egui()),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    if resp.clicked() {
+                        return Some(EditorAction::Focus {
+                            path: path.to_vec(),
+                            caret: 0,
+                        });
+                    }
+                    return None;
+                }
+                self.markdoc_ui(ui, path, *kind, name, attrs, body, block)
+            }
         }
     }
 
@@ -2570,7 +2619,7 @@ mod repro_tests {
         let text = "{% if false %}\n隐藏段落\n{% /if %}\n\n可见段落\n";
         let doc = flavoured(text, crate::doc::model::Flavor::Markdoc);
         let mut state = ViewState::default();
-        let expanded = state.take_mdx(&doc).expect("Markdoc 应展开");
+        let (expanded, _values) = state.take_mdx(&doc).expect("Markdoc 应展开");
         assert!(
             expanded.len() < doc.blocks.len(),
             "未命中的分支应被丢弃：{} vs {}",
@@ -2590,9 +2639,9 @@ mod repro_tests {
         let text = "{% if true %}\n保留\n{% /if %}\n";
         let doc = flavoured(text, crate::doc::model::Flavor::Markdoc);
         let mut state = ViewState::default();
-        let first = state.take_mdx(&doc).expect("展开");
+        let (first, _) = state.take_mdx(&doc).expect("展开");
         // Same revision → the cached list comes back (same length and spans).
-        let second = state.take_mdx(&doc).expect("展开");
+        let (second, _) = state.take_mdx(&doc).expect("展开");
         assert_eq!(
             first.iter().map(|b| b.span.clone()).collect::<Vec<_>>(),
             second.iter().map(|b| b.span.clone()).collect::<Vec<_>>()
@@ -2604,7 +2653,7 @@ mod repro_tests {
         // Editing is what bumps the revision; `reparse` on its own does not.
         changed.revision = doc.revision + 1;
         assert_ne!(changed.revision, doc.revision);
-        let third = state.take_mdx(&changed).expect("展开");
+        let (third, _) = state.take_mdx(&changed).expect("展开");
         assert!(third.len() < first.len(), "假条件之后应没有段落");
     }
 }
