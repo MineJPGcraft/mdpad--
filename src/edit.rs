@@ -76,6 +76,9 @@ struct MathEntry {
 #[derive(Default)]
 pub struct ViewState {
     pub active: Option<EditSession>,
+    /// Expanded MDX / Markdoc blocks, keyed by the document revision they came
+    /// from. `None` for plain Markdown, which needs no expansion.
+    mdx_cache: Option<(u64, Vec<Block>)>,
     diagram_cache: HashMap<u64, DiagramEntry>,
     math_cache: HashMap<u64, MathEntry>,
     /// Shown under the toolbar for a few seconds.
@@ -94,8 +97,29 @@ impl ViewState {
         self.pending_selection = None;
     }
 
+    /// Blocks to draw: the document's own list for Markdown, the expanded list
+    /// for MDX / Markdoc.
+    ///
+    /// The expanded list is cached by document revision; `take`/`put` keeps the
+    /// borrow checker happy without cloning on every frame.
+    fn take_mdx(&mut self, doc: &Document) -> Option<Vec<Block>> {
+        if doc.flavor == crate::doc::model::Flavor::Markdown {
+            return None;
+        }
+        if let Some((revision, blocks)) = &self.mdx_cache
+            && *revision == doc.revision
+        {
+            // Hand out a copy: the caller may draw from it while we stay borrowed.
+            return Some(blocks.clone());
+        }
+        let resolved = crate::mdx::expand_document(&doc.blocks, &doc.text);
+        self.mdx_cache = Some((doc.revision, resolved.blocks.clone()));
+        Some(resolved.blocks)
+    }
+
     /// Drops caches after a theme or zoom change.
     pub fn invalidate(&mut self) {
+        self.mdx_cache = None;
         self.diagram_cache.clear();
         self.math_cache.clear();
     }
@@ -209,6 +233,19 @@ pub fn document_ui(
 
     let mut action: Option<EditorAction> = None;
     let active_path = state.active.as_ref().map(|s| s.path.clone());
+    // MDX / Markdoc documents render the *expanded* blocks: conditionals are
+    // decided, loops repeated, components rewritten. Expansion may drop or repeat
+    // blocks, so a path is resolved by span rather than by position. This has to
+    // happen before `ctx` takes the mutable borrow of `state`.
+    let expanded = state.take_mdx(doc);
+    let rendered: &[Block] = expanded.as_deref().unwrap_or(&doc.blocks);
+    let doc_index: std::collections::HashMap<usize, usize> = doc
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.span.start, i))
+        .collect();
+
     let mut ctx = BlockCtx {
         state,
         doc,
@@ -223,8 +260,12 @@ pub fn document_ui(
         doc.flavor,
         opts.measure,
     ));
-    for (i, block) in doc.blocks.iter().enumerate() {
-        let path = vec![i];
+    for (i, block) in rendered.iter().enumerate() {
+        let path = if expanded.is_some() {
+            vec![*doc_index.get(&block.span.start).unwrap_or(&i)]
+        } else {
+            vec![i]
+        };
         if let Some(a) = ctx.block_ui(ui, block, &path) {
             merge_action(&mut action, a);
         }
@@ -2504,5 +2545,66 @@ mod repro_tests {
             "most geometry landed off-screen: visible={visible} outside={outside}"
         );
         out.drop_without_applying_deltas();
+    }
+
+    // -- MDX / Markdoc runtime wiring --------------------------------------
+
+    /// A document whose flavour is set explicitly (the default is Markdown).
+    fn flavoured(text: &str, flavor: crate::doc::model::Flavor) -> Document {
+        let mut doc = Document::new();
+        doc.flavor = flavor;
+        doc.text = text.to_owned();
+        doc.reparse();
+        doc
+    }
+
+    #[test]
+    fn markdown_documents_are_not_expanded() {
+        let doc = flavoured("# 标题\n\n正文\n", crate::doc::model::Flavor::Markdown);
+        let mut state = ViewState::default();
+        assert!(state.take_mdx(&doc).is_none(), "Markdown 不做展开");
+    }
+
+    #[test]
+    fn markdoc_documents_render_the_expanded_blocks() {
+        let text = "{% if false %}\n隐藏段落\n{% /if %}\n\n可见段落\n";
+        let doc = flavoured(text, crate::doc::model::Flavor::Markdoc);
+        let mut state = ViewState::default();
+        let expanded = state.take_mdx(&doc).expect("Markdoc 应展开");
+        assert!(
+            expanded.len() < doc.blocks.len(),
+            "未命中的分支应被丢弃：{} vs {}",
+            expanded.len(),
+            doc.blocks.len()
+        );
+        // The surviving block still points at the document's own source range.
+        let spans: Vec<_> = expanded.iter().map(|b| b.span.clone()).collect();
+        assert!(
+            spans.iter().all(|s| doc.blocks.iter().any(|b| b.span == *s)),
+            "展开结果必须沿用原文区间: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn expansion_is_cached_until_the_document_changes() {
+        let text = "{% if true %}\n保留\n{% /if %}\n";
+        let doc = flavoured(text, crate::doc::model::Flavor::Markdoc);
+        let mut state = ViewState::default();
+        let first = state.take_mdx(&doc).expect("展开");
+        // Same revision → the cached list comes back (same length and spans).
+        let second = state.take_mdx(&doc).expect("展开");
+        assert_eq!(
+            first.iter().map(|b| b.span.clone()).collect::<Vec<_>>(),
+            second.iter().map(|b| b.span.clone()).collect::<Vec<_>>()
+        );
+        // A new revision invalidates it and re-expands.
+        let mut changed = doc.clone();
+        changed.text = "{% if false %}\n隐藏\n{% /if %}\n".to_owned();
+        changed.reparse();
+        // Editing is what bumps the revision; `reparse` on its own does not.
+        changed.revision = doc.revision + 1;
+        assert_ne!(changed.revision, doc.revision);
+        let third = state.take_mdx(&changed).expect("展开");
+        assert!(third.len() < first.len(), "假条件之后应没有段落");
     }
 }
