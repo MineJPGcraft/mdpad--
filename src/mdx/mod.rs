@@ -18,11 +18,14 @@
 //! expressions over data. See [`expr`] for the supported subset.
 
 pub mod expr;
+pub mod runtime;
 pub mod scope;
 
 // The runtime surface is wider than the current UI consumes — the block
 // expander lands next and uses all of it. Re-exporting keeps callers from
 // needing to know which submodule a type lives in.
+#[allow(unused_imports)]
+pub use runtime::{Resolved, expand, expand_document};
 #[allow(unused_imports)]
 pub use scope::scope_from_document;
 #[allow(unused_imports)]

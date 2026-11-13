@@ -591,7 +591,12 @@ impl Parser<'_> {
         let raw = line.content.trim().to_owned();
 
         // A container tag consumes everything up to its closing tag.
-        let is_pair = matches!(kind, MarkdocTagKind::Pair | MarkdocTagKind::Conditional)
+        // Comments and loop bodies own a body too, so they must be grouped
+        // before the runtime can drop or repeat them.
+        let is_pair = matches!(
+            kind,
+            MarkdocTagKind::Pair | MarkdocTagKind::Conditional | MarkdocTagKind::Comment
+        )
             && !inner.ends_with('/');
         if is_pair && let Some(close) = markdoc_close(lines, i + 1, to, &name) {
             let body = self.parse_lines(lines, i + 1, close, depth + 1);
@@ -1113,16 +1118,21 @@ fn classify_markdoc(inner: &str) -> (MarkdocTagKind, String, String) {
     let mut parts = inner.splitn(2, char::is_whitespace);
     let head = parts.next().unwrap_or("");
     let attrs = parts.next().unwrap_or("").trim().to_owned();
-    let kind = if let Some(name) = head.strip_prefix('#') {
-        return (MarkdocTagKind::Reference, name.to_owned(), attrs);
-    } else if let Some(name) = head.strip_prefix('$') {
-        return (MarkdocTagKind::Reference, name.to_owned(), attrs);
+    // A reference keeps its sigil: `$x` is a value and `#partial` is an
+    // include, and the runtime has to tell them apart.
+    let kind = if head.starts_with('#') {
+        return (MarkdocTagKind::Reference, head.to_owned(), attrs);
+    } else if head.starts_with('$') {
+        return (MarkdocTagKind::Reference, head.to_owned(), attrs);
     } else if let Some(name) = head.strip_prefix('/') {
         return (MarkdocTagKind::Pair, name.to_owned(), attrs);
     } else {
         match head {
             "if" | "else" | "elsif" | "unless" => MarkdocTagKind::Conditional,
             "comment" => MarkdocTagKind::Comment,
+            // `{% for %} … {% /for %}` owns a body, so it is a container. The
+            // runtime repeats it; the parser only has to group it.
+            "for" => MarkdocTagKind::Pair,
             _ => MarkdocTagKind::Leaf,
         }
     };
@@ -1785,7 +1795,8 @@ mod tests {
         match &blocks[0].kind {
             BlockKind::MarkdocTag { kind, name, .. } => {
                 assert_eq!(*kind, MarkdocTagKind::Reference);
-                assert_eq!(name, "partial");
+                // The sigil is kept: `#partial` is an include, `$x` is a value.
+                assert_eq!(name, "#partial");
             }
             other => panic!("expected markdoc, got {other:?}"),
         }
