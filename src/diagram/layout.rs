@@ -28,8 +28,8 @@ use super::{draw, DiagramTheme};
 use crate::diagram::model::{
     series_color, Arrow, Diagram, Direction, Edge, Gantt, Graph, GroupKind, LineStyle, Node,
     NodeShape, NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
-    CommitKind, GitGraph, Journey, Packet, Quadrant, Sankey, Task, Timeline, XYChart,
-    XYSeriesKind, days_from_civil, format_day,
+    ActNode, Activity, CommitKind, GitGraph, Journey, LoopKind, Packet, Quadrant, Sankey, Task,
+    Terminal, Timeline, XYChart, XYSeriesKind, days_from_civil, format_day,
 };
 use crate::gfx::{Anchor, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -95,6 +95,7 @@ pub fn layout(
         Diagram::Packet(p) => layout_packet(p, diagram, &ctx),
         Diagram::Sankey(k) => layout_sankey(k, diagram, &ctx),
         Diagram::GitGraph(g) => layout_gitgraph(g, diagram, &ctx),
+        Diagram::Activity(a) => layout_activity(a, diagram, &ctx),
     }
 }
 
@@ -128,6 +129,11 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// Caption colour for activity/partition frames.
+    fn cluster_label(&self) -> Rgba {
+        self.theme.cluster_text
+    }
+
     fn font(&self, size: f32, weight: Weight, slant: Slant) -> Font {
         Font {
             size: draw::fin(size, self.base).max(0.5),
@@ -2729,6 +2735,396 @@ fn layout_gitgraph(git: &GitGraph, diagram: &Diagram, ctx: &Ctx) -> DiagramRende
     finish(prims, ctx, None, warnings, summary)
 }
 
+
+// ===========================================================================
+// Activity diagrams (PlantUML)
+// ===========================================================================
+
+/// Result of laying out one activity fragment.
+#[derive(Clone, Copy, Debug, Default)]
+struct Flow {
+    width: f32,
+    height: f32,
+}
+
+/// `activity` — a single main column, with branches and fork lanes side by side.
+fn layout_activity(activity: &Activity, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    if activity.is_blank() {
+        push_warning(&mut warnings, "activity 没有内容".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut y = 0.0f32;
+    if let Some(title) = activity.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        prims.push(Prim::anchored_text(
+            [0.0, 0.0],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::LeftTop,
+        ));
+        y = lh + 12.0;
+    }
+
+    let column = (ctx.base * 11.0).clamp(150.0, 320.0);
+    let mut cursor = Cursor {
+        ctx,
+        column,
+        x: column * 0.5,
+        y,
+    };
+    for node in &activity.nodes {
+        cursor.emit(node, &mut prims);
+    }
+
+    finish(prims, ctx, None, warnings, summary)
+}
+
+/// Carries the main-column geometry while the tree is walked.
+struct Cursor<'a, 'b> {
+    ctx: &'a Ctx<'b>,
+    /// Width of the main column.
+    column: f32,
+    /// Horizontal centre of the main column.
+    x: f32,
+    /// Current bottom edge.
+    y: f32,
+}
+
+impl Cursor<'_, '_> {
+    fn gap(&self) -> f32 {
+        self.ctx.base * 0.6
+    }
+
+    fn action_box(&self, label: &str, fill: Option<Rgba>) -> (Rect, Vec<String>) {
+        let font = self.ctx.body();
+        let inner = self.column - 24.0;
+        let lines = wrap_lines(&split_lines(label), font, inner, self.ctx);
+        let h = self.ctx.lh(font) * lines.len().max(1) as f32 + 14.0;
+        let rect = Rect::from_min_size([self.x - self.column * 0.5, self.y], [self.column, h]);
+        let _ = fill;
+        (rect, lines)
+    }
+
+    /// Draw a connector from `from_y` down to `to_y` on the main column.
+    fn arrow(&self, prims: &mut Vec<Prim>, from_y: f32, to_y: f32) {
+        if to_y <= from_y + 0.5 {
+            return;
+        }
+        prims.push(Prim::line(
+            [self.x, from_y],
+            [self.x, to_y - 6.0],
+            draw::stroke(1.4, self.ctx.theme.edge),
+        ));
+        prims.push(Prim::path(
+            vec![
+                [self.x - 4.0, to_y - 6.0],
+                [self.x + 4.0, to_y - 6.0],
+                [self.x, to_y],
+            ],
+            true,
+            Some(self.ctx.theme.edge),
+            None,
+        ));
+    }
+
+    fn emit(&mut self, node: &ActNode, prims: &mut Vec<Prim>) {
+        match node {
+            ActNode::Terminal(kind) => {
+                let r = (self.ctx.base * 0.42).clamp(5.0, 9.0);
+                let cy = self.y + r + 2.0;
+                let centre = [self.x, cy];
+                match kind {
+                    Terminal::Start => {
+                        prims.push(Prim::circle(centre, r, Some(self.ctx.theme.node_stroke), None));
+                    }
+                    Terminal::Stop => {
+                        prims.push(Prim::circle(
+                            centre,
+                            r + 1.5,
+                            None,
+                            Some(draw::stroke(1.6, self.ctx.theme.node_stroke)),
+                        ));
+                        prims.push(Prim::circle(centre, r * 0.75, Some(self.ctx.theme.node_stroke), None));
+                    }
+                }
+                self.y = cy + r + 2.0;
+            }
+            ActNode::Action { label, fill } => {
+                let (rect, lines) = self.action_box(label, *fill);
+                let fill = fill.unwrap_or(self.ctx.theme.node_fill);
+                prims.push(Prim::filled_rect(rect, 8.0, fill));
+                prims.push(Prim::stroked_rect(
+                    rect,
+                    8.0,
+                    draw::stroke(1.2, self.ctx.theme.node_stroke),
+                ));
+                draw_centered(
+                    prims,
+                    &lines,
+                    self.ctx.body(),
+                    readable_on(fill, self.ctx.theme.node_text),
+                    rect.center()[0],
+                    rect.min[1] + 7.0,
+                    self.ctx,
+                );
+                self.y = rect.max[1];
+            }
+            ActNode::If { branches } => self.emit_if(branches, prims),
+            ActNode::Loop {
+                kind,
+                test,
+                yes,
+                no,
+                body,
+            } => self.emit_loop(*kind, test, yes, no, body, prims),
+            ActNode::Fork { lanes } => self.emit_fork(lanes, prims),
+            ActNode::Partition { label, body } => self.emit_partition(label, body, prims),
+        }
+    }
+
+    /// `if` — a diamond on the main column, then one sub-column per branch.
+    fn emit_if(&mut self, branches: &[crate::diagram::model::ActBranch], prims: &mut Vec<Prim>) {
+        let top = self.y;
+        let h = (self.ctx.base * 1.9).max(22.0);
+        let w = (self.column * 0.8).max(90.0);
+        let cy = top + h * 0.5;
+        // Diamond: the condition itself is not part of the IR (only branch
+        // labels are), so it carries a generic marker.
+        prims.push(Prim::path(
+            vec![
+                [self.x, top],
+                [self.x + w * 0.5, cy],
+                [self.x, top + h],
+                [self.x - w * 0.5, cy],
+            ],
+            true,
+            Some(self.ctx.theme.node_fill),
+            Some(draw::stroke(1.2, self.ctx.theme.node_stroke)),
+        ));
+        prims.push(Prim::anchored_text(
+            [self.x, cy],
+            "?",
+            self.ctx.small_bold(),
+            self.ctx.theme.node_text.fade(0.8),
+            Anchor::Center,
+        ));
+        self.y = top + h;
+
+        let gap = self.gap() * 1.6;
+        let lane_gap = self.column * 0.35;
+        let mut widths: Vec<f32> = Vec::new();
+        // Measure each branch by laying it out at a throw-away cursor.
+        let mut heights: Vec<f32> = Vec::new();
+        for branch in branches {
+            let mut probe = Cursor {
+                ctx: self.ctx,
+                column: self.column * 0.85,
+                x: 0.0,
+                y: 0.0,
+            };
+            let mut scratch: Vec<Prim> = Vec::new();
+            for node in &branch.body {
+                probe.emit(node, &mut scratch);
+            }
+            widths.push(self.column * 0.85);
+            heights.push(probe.y.max(self.ctx.base));
+        }
+
+        let total_w: f32 = widths.iter().sum::<f32>() + lane_gap * (widths.len().saturating_sub(1)) as f32;
+        let mut lane_x = self.x - total_w * 0.5;
+        let branch_top = self.y + gap;
+        let mut max_bottom = branch_top;
+        for (i, branch) in branches.iter().enumerate() {
+            let cx = lane_x + widths[i] * 0.5;
+            // Branch label beside the connector.
+            prims.push(Prim::anchored_text(
+                [cx, self.y + gap * 0.45],
+                branch.label.clone(),
+                self.ctx.small(),
+                self.ctx.theme.edge_text,
+                Anchor::Center,
+            ));
+            let mut sub = Cursor {
+                ctx: self.ctx,
+                column: widths[i],
+                x: cx,
+                y: branch_top,
+            };
+            for node in &branch.body {
+                sub.emit(node, prims);
+            }
+            max_bottom = max_bottom.max(sub.y);
+            lane_x += widths[i] + lane_gap;
+        }
+        self.y = max_bottom;
+    }
+
+    /// `while` / `repeat` — the body wrapped in a labelled frame.
+    fn emit_loop(
+        &mut self,
+        kind: LoopKind,
+        test: &str,
+        yes: &str,
+        no: &str,
+        body: &[ActNode],
+        prims: &mut Vec<Prim>,
+    ) {
+        let pad = 12.0;
+        let header = self.ctx.lh(self.ctx.small()) + 8.0;
+        let frame_x = self.x - self.column * 0.5 - pad;
+        let frame_w = self.column + pad * 2.0;
+        let top = self.y;
+
+        // The frame is inserted *behind* the body once its size is known.
+        let start_index = prims.len();
+        let mut inner = Cursor {
+            ctx: self.ctx,
+            column: self.column,
+            x: self.x,
+            y: top + header,
+        };
+        for node in body {
+            inner.emit(node, prims);
+        }
+        let bottom = inner.y;
+
+        let frame = Rect::from_min_size(
+            [frame_x, top],
+            [frame_w, (bottom - top) + header + 6.0],
+        );
+        let radius = draw_radius(kind);
+        prims.insert(
+            start_index,
+            Prim::filled_rect(frame, radius, self.ctx.theme.cluster_fill.fade(0.55)),
+        );
+        prims.insert(
+            start_index + 1,
+            Prim::stroked_rect(
+                frame,
+                radius,
+                draw::stroke(1.2, self.ctx.theme.cluster_stroke),
+            ),
+        );
+        let caption = if test.is_empty() {
+            "loop".to_owned()
+        } else {
+            format!("loop  {test}")
+        };
+        prims.push(Prim::anchored_text(
+            [frame.min[0] + 8.0, top + header * 0.5],
+            caption,
+            self.ctx.small_bold(),
+            self.ctx.cluster_label(),
+            Anchor::LeftCenter,
+        ));
+        let tail = match kind {
+            LoopKind::While => format!("{yes} / {no}"),
+            LoopKind::Repeat => format!("repeat while  {yes} / {no}"),
+        };
+        prims.push(Prim::anchored_text(
+            [frame.max[0] - 8.0, frame.max[1] - header * 0.4],
+            tail,
+            self.ctx.small(),
+            self.ctx.theme.edge_text,
+            Anchor::RightCenter,
+        ));
+        self.y = frame.max[1];
+    }
+
+    /// `fork` — lanes side by side between two thick bars.
+    fn emit_fork(&mut self, lanes: &[Vec<ActNode>], prims: &mut Vec<Prim>) {
+        let gap = self.gap();
+        let lane_gap = self.column * 0.3;
+        let lane_w = self.column * 0.8;
+        let count = lanes.len().max(1) as f32;
+        let total_w = lane_w * count + lane_gap * (count - 1.0);
+        let left = self.x - total_w * 0.5;
+        let bar_top = self.y;
+        let bar_span = (self.ctx.base * 0.9).max(8.0);
+
+        prims.push(Prim::filled_rect(
+            Rect::from_min_size([left, bar_top], [total_w, bar_span * 0.5]),
+            0.0,
+            self.ctx.theme.node_stroke.fade(0.85),
+        ));
+        let mut max_bottom = bar_top + bar_span + gap;
+        for (i, lane) in lanes.iter().enumerate() {
+            let cx = left + lane_w * (i as f32 + 0.5) + lane_gap * i as f32;
+            let mut sub = Cursor {
+                ctx: self.ctx,
+                column: lane_w,
+                x: cx,
+                y: bar_top + bar_span + gap * 0.5,
+            };
+            for node in lane {
+                sub.emit(node, prims);
+            }
+            max_bottom = max_bottom.max(sub.y);
+        }
+        prims.push(Prim::filled_rect(
+            Rect::from_min_size([left, max_bottom + gap * 0.5], [total_w, bar_span * 0.5]),
+            0.0,
+            self.ctx.theme.node_stroke.fade(0.85),
+        ));
+        self.y = max_bottom + gap * 0.5 + bar_span * 0.5;
+    }
+
+    /// `partition "name" { … }` — a labelled frame.
+    fn emit_partition(&mut self, label: &str, body: &[ActNode], prims: &mut Vec<Prim>) {
+        let pad = 14.0;
+        let header = self.ctx.lh(self.ctx.small_bold()) + 8.0;
+        let top = self.y;
+        let start_index = prims.len();
+        let mut inner = Cursor {
+            ctx: self.ctx,
+            column: self.column,
+            x: self.x,
+            y: top + header,
+        };
+        for node in body {
+            inner.emit(node, prims);
+        }
+        let frame = Rect::from_min_size(
+            [self.x - self.column * 0.5 - pad, top],
+            [self.column + pad * 2.0, (inner.y - top) + header + 6.0],
+        );
+        prims.insert(
+            start_index,
+            Prim::filled_rect(frame, 4.0, self.ctx.theme.cluster_fill.fade(0.5)),
+        );
+        prims.insert(
+            start_index + 1,
+            Prim::stroked_rect(
+                frame,
+                4.0,
+                draw::stroke(1.2, self.ctx.theme.cluster_stroke.fade(0.8)),
+            ),
+        );
+        prims.push(Prim::anchored_text(
+            [frame.min[0] + 8.0, top + header * 0.5],
+            label.to_owned(),
+            self.ctx.small_bold(),
+            self.ctx.cluster_label(),
+            Anchor::LeftCenter,
+        ));
+        self.y = frame.max[1];
+    }
+}
+
+/// `while` frames use a tab-like radius, `repeat` frames stay square.
+fn draw_radius(kind: LoopKind) -> f32 {
+    match kind {
+        LoopKind::While => 10.0,
+        LoopKind::Repeat => 4.0,
+    }
+}
+
 // ===========================================================================
 // Sequence diagrams
 // ===========================================================================
@@ -4060,7 +4456,7 @@ mod tests {
             }
         }
 
-        let cases: [(&str, &str); 11] = [
+        let cases: [(&str, &str); 12] = [
             (
                 "gantt",
                 "gantt\n section Design\n 需求分析 :done, a1, 2024-01-01, 5d\n 方案设计 :a2, after a1, 3d\n section Build\n 编码 :active, b1, after a2, 10d\n 里程碑 :milestone, m1, 2024-01-30, 0d",
@@ -4076,6 +4472,10 @@ mod tests {
             (
                 "kanban",
                 "kanban\n  todo[待办]\n    t1[写解析器]\n    t2[补测试]\n  doing[进行中]\n    d1[修布局]",
+            ),
+            (
+                "activity",
+                "@startuml\nstart\n:准备;\nif (有权限?) then (是)\n :执行;\nelse (否)\n :拒绝;\nendif\nwhile (还有任务?) is (是)\n :处理一个;\nendwhile\nfork\n :甲;\nfork again\n :乙;\nend fork\npartition \"阶段二\" {\n :收尾;\n}\nstop\n@enduml",
             ),
             (
                 "gitgraph",
@@ -4109,7 +4509,11 @@ mod tests {
 
         let mut out: Vec<String> = Vec::new();
         for (name, src) in cases {
-            let d = crate::diagram::mermaid::parse(src);
+            let d = if src.starts_with("@startuml") {
+                crate::diagram::plantuml::parse(src)
+            } else {
+                crate::diagram::mermaid::parse(src)
+            };
             let r = run(&d);
             let prims = r.prims.iter().map(prim).collect::<Vec<_>>().join(",");
             out.push(format!(
@@ -4893,6 +5297,103 @@ mod tests {
     #[test]
     fn an_empty_gitgraph_shows_the_placeholder_card() {
         let r = run(&Diagram::GitGraph(GitGraph::default()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
+    }    // -- activity -----------------------------------------------------------
+
+    fn activity_fixture() -> Activity {
+        Activity {
+            title: Some("流程".to_owned()),
+            nodes: vec![
+                ActNode::Terminal(Terminal::Start),
+                ActNode::Action {
+                    label: "准备".to_owned(),
+                    fill: None,
+                },
+                ActNode::If {
+                    branches: vec![
+                        crate::diagram::model::ActBranch {
+                            label: "是".to_owned(),
+                            body: vec![ActNode::Action {
+                                label: "执行".to_owned(),
+                                fill: None,
+                            }],
+                        },
+                        crate::diagram::model::ActBranch {
+                            label: "否".to_owned(),
+                            body: vec![ActNode::Action {
+                                label: "拒绝".to_owned(),
+                                fill: None,
+                            }],
+                        },
+                    ],
+                },
+                ActNode::Loop {
+                    kind: LoopKind::While,
+                    test: "还有任务?".to_owned(),
+                    yes: "是".to_owned(),
+                    no: "否".to_owned(),
+                    body: vec![ActNode::Action {
+                        label: "处理".to_owned(),
+                        fill: None,
+                    }],
+                },
+                ActNode::Terminal(Terminal::Stop),
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn activity_lays_out_branches_and_loops() {
+        let r = run(&Diagram::Activity(activity_fixture()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["流程", "准备", "执行", "拒绝", "处理", "是", "否"] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        assert!(
+            texts.iter().any(|t| t.starts_with("loop")),
+            "循环应有带条件的框: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn activity_branches_sit_side_by_side() {
+        let r = run(&Diagram::Activity(activity_fixture()));
+        let x_of = |needle: &str| -> f32 {
+            r.prims
+                .iter()
+                .find_map(|p| match p {
+                    Prim::Text { text, pos, .. } if text == needle => Some(pos[0]),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("缺少 {needle}"))
+        };
+        assert!(
+            x_of("执行") < x_of("拒绝"),
+            "第一个分支应在左、else 在右"
+        );
+    }
+
+    #[test]
+    fn an_empty_activity_shows_the_placeholder_card() {
+        let r = run(&Diagram::Activity(Activity::default()));
         assert_clean(&r);
         let texts: Vec<&str> = r
             .prims

@@ -190,6 +190,10 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 - **类图** — `abstract class` / `interface` / `enum` / 立体标记，
   成员按字段与方法分格，继承/依赖/组合/聚合全套关系，多重性，
   `package`/`namespace` 嵌套。
+- **活动图（activity，beta 语法）** — `start`/`stop`、`:动作;`（可带 `#颜色`）、
+  `if (条件) then (标签) / else / elseif / endif`、`while … endwhile`、
+  `repeat … repeat while (条件) is (是) not (否)`、`fork / fork again / end fork`、
+  `partition "名称" { … }`；分支并排、循环与分区带底色框、分叉用双横杠。
 - **用例图 / 组件图**、**状态图**、**ER / IE**。
 
 ### 提醒框：四种语法

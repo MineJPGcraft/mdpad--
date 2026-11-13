@@ -20,9 +20,9 @@
 //! ```
 
 use crate::diagram::model::{
-    Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Graph, GroupKind, LineStyle, Node,
-    NodeShape, NodeStyle, NotePosition, ParticipantKind, SeqStep, Sequence,
-    parse_color,
+    ActBranch, ActNode, Activity, Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Graph,
+    GroupKind, LineStyle, LoopKind, Node, NodeShape, NodeStyle, NotePosition, ParticipantKind,
+    SeqStep, Sequence, Terminal, parse_color,
 };
 use crate::gfx::Rgba;
 
@@ -42,6 +42,7 @@ pub fn parse(src: &str) -> Diagram {
         Some(DiagramKind::State) => Diagram::Graph(parse_state(&lines, &pre)),
         Some(DiagramKind::Entity) => Diagram::Graph(parse_er(&lines, &pre)),
         Some(DiagramKind::Flowchart) => Diagram::Graph(parse_flow(&lines, &pre)),
+        Some(DiagramKind::Activity) => Diagram::Activity(parse_activity(&lines, &pre)),
         // `Pie` and the Mermaid-only families never come out of detection, but
         // the match has to stay total.
         Some(DiagramKind::Pie)
@@ -69,7 +70,8 @@ pub fn parse(src: &str) -> Diagram {
         | Diagram::XYChart(_)
         | Diagram::Packet(_)
         | Diagram::Sankey(_)
-        | Diagram::GitGraph(_) => {}
+        | Diagram::GitGraph(_)
+        | Diagram::Activity(_) => {}
     }
     diagram
 }
@@ -407,6 +409,7 @@ fn detect_type(lines: &[Line]) -> Option<DiagramKind> {
         }
     }
 
+    let mut activity_kw = false;
     let mut class_kw = false;
     let mut pkg_kw = false;
     let mut state_kw = false;
@@ -452,9 +455,25 @@ fn detect_type(lines: &[Line]) -> Option<DiagramKind> {
         if find_message_arrow(&strip_colors(&split_label(t).0)).is_some() {
             seq_kw = true;
         }
+        // Activity statements: `:action;`, `start`, `if (…) then (…)`, `fork`, …
+        if t.starts_with(':')
+            || first == "fork"
+            || first == "endfork"
+            || first == "endwhile"
+            || first == "endif"
+            || first == "partition"
+            || first == "repeat"
+            || (first == "start" && t.len() <= 6)
+            || (first == "stop" && t.len() <= 6)
+            || (first == "if" && t.contains("then"))
+        {
+            activity_kw = true;
+        }
     }
 
-    if class_kw {
+    if activity_kw {
+        Some(DiagramKind::Activity)
+    } else if class_kw {
         Some(DiagramKind::Class)
     } else if state_kw {
         Some(DiagramKind::State)
@@ -1913,6 +1932,429 @@ fn parse_fallback(lines: &[Line], pre: &Preamble) -> Graph {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Activity diagrams (PlantUML "beta" syntax)
+// ---------------------------------------------------------------------------
+
+/// Cursor over the activity statements.
+struct ActParser<'a> {
+    lines: &'a [Line],
+    i: usize,
+    warnings: Vec<String>,
+}
+
+impl<'a> ActParser<'a> {
+    fn peek(&self) -> Option<&'a str> {
+        self.lines.get(self.i).map(|l| l.text.trim())
+    }
+
+    fn bump(&mut self) {
+        self.i += 1;
+    }
+
+    fn warn(&mut self, msg: String) {
+        if !self.warnings.iter().any(|w| *w == msg) {
+            self.warnings.push(msg);
+        }
+    }
+
+    /// Parse statements until one of `stops`. The stop keyword is left for the
+    /// caller so `if`/`while`/`fork` can decide how to close themselves.
+    fn block(&mut self, stops: &[&str]) -> Vec<ActNode> {
+        let mut out = Vec::new();
+        while let Some(text) = self.peek() {
+            if text.is_empty() {
+                self.bump();
+                continue;
+            }
+            let (word, rest) = split_first_word(text);
+            let lower = word.to_ascii_lowercase();
+            if text == "}" || stops.iter().any(|s| lower == *s) {
+                break;
+            }
+            match lower.as_str() {
+                "start" => {
+                    out.push(ActNode::Terminal(Terminal::Start));
+                    self.bump();
+                }
+                "stop" | "end" | "kill" | "detach" => {
+                    out.push(ActNode::Terminal(Terminal::Stop));
+                    self.bump();
+                }
+                "if" => {
+                    if let Some(node) = self.parse_if(rest) {
+                        out.push(node);
+                    }
+                }
+                "while" => {
+                    if let Some(node) = self.parse_while(rest) {
+                        out.push(node);
+                    }
+                }
+                "repeat" => {
+                    if let Some(node) = self.parse_repeat() {
+                        out.push(node);
+                    }
+                }
+                "fork" => {
+                    if let Some(node) = self.parse_fork() {
+                        out.push(node);
+                    }
+                }
+                "partition" => {
+                    if let Some(node) = self.parse_partition(rest) {
+                        out.push(node);
+                    }
+                }
+                "note" | "floating" => {
+                    self.warn(format!("activity note 已忽略: {}", truncate_text(text, 40)));
+                    self.bump();
+                }
+                "switch" | "case" | "label" | "goto" | "backward" => {
+                    self.warn(format!("activity 暂不支持: {}", truncate_text(text, 40)));
+                    self.bump();
+                }
+                _ => {
+                    // Arrow-only connectors (`-> label;`) carry nothing to draw.
+                    if text.starts_with("->") || text.starts_with(';') {
+                        self.bump();
+                        continue;
+                    }
+                    if let Some(node) = self.parse_action(text) {
+                        out.push(node);
+                    } else {
+                        self.warn(format!(
+                            "无法识别的 activity 语句: {}",
+                            truncate_text(text, 40)
+                        ));
+                        self.bump();
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `:label;`, optionally preceded by `#colour`.
+    fn parse_action(&mut self, text: &str) -> Option<ActNode> {
+        let body = text.strip_prefix(':')?;
+        let body = body.strip_suffix(';').unwrap_or(body);
+        let (fill, label) = match body.trim().strip_prefix('#') {
+            Some(rest) => {
+                let (color, label) = split_first_word(rest);
+                (parse_color(color), label.trim().to_owned())
+            }
+            None => (None, body.trim().to_owned()),
+        };
+        self.bump();
+        if label.is_empty() {
+            return None;
+        }
+        Some(ActNode::Action {
+            label: label.replace("\\n", "\n"),
+            fill,
+        })
+    }
+
+    fn parse_if(&mut self, rest: &str) -> Option<ActNode> {
+        let cond = between(rest, '(', ')').unwrap_or_else(|| rest.trim().to_owned());
+        let then_label = rest
+            .split("then")
+            .nth(1)
+            .map(|tail| between(tail, '(', ')').unwrap_or_default())
+            .unwrap_or_default();
+        let cond = if cond.is_empty() { then_label.clone() } else { cond };
+        self.bump();
+
+        let mut branches = vec![ActBranch {
+            label: if then_label.is_empty() {
+                "yes".to_owned()
+            } else {
+                then_label
+            },
+            body: self.block(&["else", "elseif", "endif"]),
+        }];
+        while let Some(text) = self.peek() {
+            let (word, tail) = split_first_word(text);
+            match word.to_ascii_lowercase().as_str() {
+                "elseif" => {
+                    let label = between(tail, '(', ')').unwrap_or_else(|| tail.trim().to_owned());
+                    self.bump();
+                    branches.push(ActBranch {
+                        label,
+                        body: self.block(&["else", "elseif", "endif"]),
+                    });
+                }
+                "else" => {
+                    let label = between(tail, '(', ')').unwrap_or_default();
+                    self.bump();
+                    branches.push(ActBranch {
+                        label: if label.is_empty() {
+                            "else".to_owned()
+                        } else {
+                            label
+                        },
+                        body: self.block(&["endif"]),
+                    });
+                }
+                "endif" => {
+                    self.bump();
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let _ = cond;
+        Some(ActNode::If { branches })
+    }
+
+    fn parse_while(&mut self, rest: &str) -> Option<ActNode> {
+        let test = between(rest, '(', ')').unwrap_or_else(|| rest.trim().to_owned());
+        let yes = rest
+            .split(" is ")
+            .nth(1)
+            .map(|tail| between(tail, '(', ')').unwrap_or_default())
+            .unwrap_or_default();
+        let no = rest
+            .split(" not ")
+            .nth(1)
+            .map(|tail| between(tail, '(', ')').unwrap_or_default())
+            .unwrap_or_default();
+        self.bump();
+        let body = self.block(&["endwhile"]);
+        if self
+            .peek()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("endwhile"))
+        {
+            self.bump();
+        }
+        Some(ActNode::Loop {
+            kind: LoopKind::While,
+            test,
+            yes: if yes.is_empty() { "yes".to_owned() } else { yes },
+            no: if no.is_empty() { "no".to_owned() } else { no },
+            body,
+        })
+    }
+
+    fn parse_repeat(&mut self) -> Option<ActNode> {
+        self.bump();
+        let body = self.block(&["repeat"]);
+        let mut test = String::new();
+        let mut yes = "yes".to_owned();
+        let mut no = "no".to_owned();
+        if let Some(text) = self.peek() {
+            let lower = text.to_ascii_lowercase();
+            if lower.starts_with("repeat while") || lower.starts_with("repeatwhile") {
+                let rest = text.split_once("while").map(|(_, r)| r).unwrap_or(text);
+                test = between(rest, '(', ')').unwrap_or_else(|| rest.trim().to_owned());
+                if let Some(tail) = rest.split(" is ").nth(1) {
+                    let label = between(tail, '(', ')').unwrap_or_default();
+                    if !label.is_empty() {
+                        yes = label;
+                    }
+                }
+                if let Some(tail) = rest.split(" not ").nth(1) {
+                    let label = between(tail, '(', ')').unwrap_or_default();
+                    if !label.is_empty() {
+                        no = label;
+                    }
+                }
+            }
+            self.bump();
+        }
+        Some(ActNode::Loop {
+            kind: LoopKind::Repeat,
+            test,
+            yes,
+            no,
+            body,
+        })
+    }
+
+    fn parse_fork(&mut self) -> Option<ActNode> {
+        self.bump();
+        let mut lanes = vec![self.block(&["fork", "end", "endfork"])];
+        while let Some(text) = self.peek() {
+            let lower = text.to_ascii_lowercase();
+            if lower == "fork again" || lower == "forkagain" {
+                self.bump();
+                lanes.push(self.block(&["fork", "end", "endfork"]));
+            } else {
+                break;
+            }
+        }
+        if self
+            .peek()
+            .is_some_and(|t| t.eq_ignore_ascii_case("end fork") || t.eq_ignore_ascii_case("endfork") || t == "end")
+        {
+            self.bump();
+        }
+        Some(ActNode::Fork { lanes })
+    }
+
+    fn parse_partition(&mut self, rest: &str) -> Option<ActNode> {
+        let label = unquote(rest.trim().trim_end_matches('{'))
+            .trim()
+            .to_owned();
+        self.bump();
+        let body = self.block(&[]);
+        if self.peek() == Some("}") {
+            self.bump();
+        }
+        Some(ActNode::Partition {
+            label: if label.is_empty() {
+                "分区".to_owned()
+            } else {
+                label
+            },
+            body,
+        })
+    }
+}
+
+/// Text inside the first `open`…`close` pair.
+fn between(text: &str, open: char, close: char) -> Option<String> {
+    let start = text.find(open)?;
+    let rest = &text[start + 1..];
+    let end = rest.find(close)?;
+    Some(rest[..end].trim().to_owned())
+}
+
+/// Shorten a statement for a warning message.
+fn truncate_text(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+/// Parse a PlantUML activity diagram. Never panics.
+fn parse_activity(lines: &[Line], pre: &Preamble) -> Activity {
+    let mut parser = ActParser {
+        lines,
+        i: 0,
+        warnings: Vec::new(),
+    };
+    let nodes = parser.block(&[]);
+    Activity {
+        title: pre.title.clone(),
+        nodes,
+        warnings: parser.warnings,
+    }
+}
+
+
+    // -- activity -----------------------------------------------------------
+
+    #[test]
+    fn activity_parses_the_beta_syntax() {
+        let d = parse(
+            "@startuml\n\
+             start\n\
+             :准备;\n\
+             if (有权限?) then (是)\n\
+             \x20 :执行;\n\
+             else (否)\n\
+             \x20 :拒绝;\n\
+             endif\n\
+             while (还有任务?) is (是)\n\
+             \x20 :处理一个;\n\
+             endwhile\n\
+             fork\n\
+             \x20 :甲;\n\
+             fork again\n\
+             \x20 :乙;\n\
+             end fork\n\
+             partition \"阶段二\" {\n\
+             \x20 :收尾;\n\
+             }\n\
+             stop\n\
+             @enduml",
+        );
+        let Diagram::Activity(a) = d else {
+            panic!("expected an activity diagram")
+        };
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+        // start, action, if, while, fork, partition, stop
+        assert_eq!(a.nodes.len(), 7);
+
+        match &a.nodes[1] {
+            ActNode::Action { label, .. } => assert_eq!(label, "准备"),
+            other => panic!("expected an action, got {other:?}"),
+        }
+        match &a.nodes[2] {
+            ActNode::If { branches } => {
+                assert_eq!(branches.len(), 2);
+                assert_eq!(branches[0].label, "是");
+                assert_eq!(branches[1].label, "否");
+                assert_eq!(branches[0].body.len(), 1);
+            }
+            other => panic!("expected an if, got {other:?}"),
+        }
+        match &a.nodes[3] {
+            ActNode::Loop { kind, yes, body, .. } => {
+                assert_eq!(*kind, LoopKind::While);
+                assert_eq!(yes, "是");
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected a loop, got {other:?}"),
+        }
+        match &a.nodes[4] {
+            ActNode::Fork { lanes } => {
+                assert_eq!(lanes.len(), 2);
+                assert_eq!(lanes[0].len(), 1);
+                assert_eq!(lanes[1].len(), 1);
+            }
+            other => panic!("expected a fork, got {other:?}"),
+        }
+        match &a.nodes[5] {
+            ActNode::Partition { label, body } => {
+                assert_eq!(label, "阶段二");
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("expected a partition, got {other:?}"),
+        }
+        assert!(matches!(a.nodes[6], ActNode::Terminal(Terminal::Stop)));
+    }
+
+    #[test]
+    fn activity_parses_repeat_and_coloured_actions() {
+        let d = parse(
+            "start\nrepeat\n :#lightblue 重试;\nrepeat while (成功?) is (否) not (是)\nstop",
+        );
+        let Diagram::Activity(a) = d else {
+            panic!("expected an activity diagram")
+        };
+        let ActNode::Loop { kind, test, yes, no, body } = &a.nodes[1] else {
+            panic!("expected a repeat loop: {:?}", a.nodes)
+        };
+        assert_eq!(*kind, LoopKind::Repeat);
+        assert_eq!(test, "成功?");
+        assert_eq!(yes, "否");
+        assert_eq!(no, "是");
+        match &body[0] {
+            ActNode::Action { label, fill } => {
+                assert_eq!(label, "重试");
+                assert!(fill.is_some(), "#lightblue 应被解析成填充色");
+            }
+            other => panic!("expected an action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activity_warns_about_unsupported_statements() {
+        let d = parse("start\n:ok;\nnote right: 说明\nswitch (x)\nstop");
+        let Diagram::Activity(a) = d else {
+            panic!("expected an activity diagram")
+        };
+        assert!(a.warnings.iter().any(|w| w.contains("note")));
+        assert!(a.warnings.iter().any(|w| w.contains("switch")));
+        // The supported statements still parse.
+        assert!(a.nodes.len() >= 3);
+    }
 
 #[cfg(test)]
 mod tests {

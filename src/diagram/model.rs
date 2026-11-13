@@ -32,6 +32,7 @@ pub enum DiagramKind {
     Packet,
     Sankey,
     GitGraph,
+    Activity,
 }
 
 impl DiagramKind {
@@ -54,6 +55,7 @@ impl DiagramKind {
             Self::Packet => "packet",
             Self::Sankey => "sankey",
             Self::GitGraph => "gitGraph",
+            Self::Activity => "activity",
         }
     }
 }
@@ -837,6 +839,74 @@ impl GitGraph {
 }
 
 // ---------------------------------------------------------------------------
+// Activity diagrams (PlantUML)
+// ---------------------------------------------------------------------------
+
+/// One branch of an `if`: a condition (empty for `else`) plus its body.
+#[derive(Clone, Debug)]
+pub struct ActBranch {
+    pub label: String,
+    pub body: Vec<ActNode>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoopKind {
+    /// `while (cond) … endwhile` — tested before the body.
+    While,
+    /// `repeat … repeat while (cond)` — tested after the body.
+    Repeat,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Terminal {
+    Start,
+    Stop,
+}
+
+/// A statement in an activity diagram.
+#[derive(Clone, Debug)]
+pub enum ActNode {
+    Action {
+        label: String,
+        /// `#colour` prefix on the action.
+        fill: Option<Rgba>,
+    },
+    If {
+        branches: Vec<ActBranch>,
+    },
+    Loop {
+        kind: LoopKind,
+        test: String,
+        yes: String,
+        no: String,
+        body: Vec<ActNode>,
+    },
+    Fork {
+        lanes: Vec<Vec<ActNode>>,
+    },
+    Partition {
+        label: String,
+        body: Vec<ActNode>,
+    },
+    Terminal(Terminal),
+}
+
+/// A parsed PlantUML activity diagram.
+#[derive(Clone, Debug, Default)]
+pub struct Activity {
+    pub title: Option<String>,
+    pub nodes: Vec<ActNode>,
+    pub warnings: Vec<String>,
+}
+
+impl Activity {
+    /// `true` when nothing at all was parsed.
+    pub fn is_blank(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -853,6 +923,7 @@ pub enum Diagram {
     Packet(Packet),
     Sankey(Sankey),
     GitGraph(GitGraph),
+    Activity(Activity),
 }
 
 impl Diagram {
@@ -871,6 +942,7 @@ impl Diagram {
             Self::Packet(_) => DiagramKind::Packet,
             Self::Sankey(_) => DiagramKind::Sankey,
             Self::GitGraph(_) => DiagramKind::GitGraph,
+            Self::Activity(_) => DiagramKind::Activity,
         }
     }
 
@@ -887,6 +959,7 @@ impl Diagram {
             Self::Packet(p) => p.title.as_deref(),
             Self::Sankey(k) => k.title.as_deref(),
             Self::GitGraph(g) => g.title.as_deref(),
+            Self::Activity(a) => a.title.as_deref(),
         }
     }
 
@@ -904,6 +977,7 @@ impl Diagram {
             Self::Packet(p) => &p.warnings,
             Self::Sankey(k) => &k.warnings,
             Self::GitGraph(g) => &g.warnings,
+            Self::Activity(a) => &a.warnings,
         }
     }
 
@@ -920,6 +994,7 @@ impl Diagram {
             Self::Packet(p) => p.fields.is_empty(),
             Self::Sankey(k) => k.links.is_empty(),
             Self::GitGraph(g) => g.commits.is_empty(),
+            Self::Activity(a) => a.is_blank(),
         }
     }
 
@@ -970,6 +1045,7 @@ impl Diagram {
                 g.commits.len(),
                 g.branches.len()
             ),
+            Self::Activity(a) => format!("activity · {} 个顶层节点", a.nodes.len()),
         }
     }
 }
