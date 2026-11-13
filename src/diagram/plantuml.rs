@@ -55,6 +55,7 @@ pub fn parse(src: &str) -> Diagram {
         | Some(DiagramKind::XYChart)
         | Some(DiagramKind::Packet)
         | Some(DiagramKind::Sankey)
+        | Some(DiagramKind::GitGraph)
         | None => Diagram::Graph(parse_fallback(&lines, &pre)),
     };
     match &mut diagram {
@@ -67,7 +68,8 @@ pub fn parse(src: &str) -> Diagram {
         | Diagram::Quadrant(_)
         | Diagram::XYChart(_)
         | Diagram::Packet(_)
-        | Diagram::Sankey(_) => {}
+        | Diagram::Sankey(_)
+        | Diagram::GitGraph(_) => {}
     }
     diagram
 }

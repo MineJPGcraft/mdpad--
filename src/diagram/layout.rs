@@ -28,8 +28,8 @@ use super::{draw, DiagramTheme};
 use crate::diagram::model::{
     series_color, Arrow, Diagram, Direction, Edge, Gantt, Graph, GroupKind, LineStyle, Node,
     NodeShape, NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
-    Journey, Packet, Quadrant, Sankey, Task, Timeline, XYChart, XYSeriesKind, days_from_civil,
-    format_day,
+    CommitKind, GitGraph, Journey, Packet, Quadrant, Sankey, Task, Timeline, XYChart,
+    XYSeriesKind, days_from_civil, format_day,
 };
 use crate::gfx::{Anchor, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -94,6 +94,7 @@ pub fn layout(
         Diagram::XYChart(c) => layout_xychart(c, diagram, &ctx),
         Diagram::Packet(p) => layout_packet(p, diagram, &ctx),
         Diagram::Sankey(k) => layout_sankey(k, diagram, &ctx),
+        Diagram::GitGraph(g) => layout_gitgraph(g, diagram, &ctx),
     }
 }
 
@@ -2595,6 +2596,139 @@ fn layout_sankey(sankey: &Sankey, diagram: &Diagram, ctx: &Ctx) -> DiagramRender
     finish(prims, ctx, None, warnings, summary)
 }
 
+
+// ===========================================================================
+// Git graphs
+// ===========================================================================
+
+/// `gitGraph` — commits on branch lanes, oldest at the top.
+///
+/// Lane assignment happens in the parser (one lane per branch); this layout only
+/// turns lane/row into coordinates and draws the parent links, so a branch that
+/// is created late still gets a stable column.
+fn layout_gitgraph(git: &GitGraph, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    if git.commits.is_empty() {
+        push_warning(&mut warnings, "gitGraph 没有提交".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let dot_font = ctx.small_bold();
+    let label_font = ctx.small();
+    let lane_gap = (ctx.base * 2.6).clamp(30.0, 56.0);
+    let row_gap = (ctx.base * 2.2).clamp(26.0, 44.0);
+    let dot_r = (ctx.base * 0.34).clamp(4.0, 7.0);
+    let left = lane_gap * 0.5 + 4.0;
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut top = 0.0f32;
+    if let Some(title) = git.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        prims.push(Prim::anchored_text(
+            [0.0, 0.0],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::LeftTop,
+        ));
+        top = lh + 12.0;
+    }
+
+    let x_of = |lane: usize| left + lane as f32 * lane_gap;
+    let y_of = |row: usize| top + row as f32 * row_gap;
+
+    // Parent links first, so the dots and labels sit on top of them.
+    for (i, commit) in git.commits.iter().enumerate() {
+        let color = series_color(commit.lane);
+        for parent in &commit.parents {
+            let Some(p) = git.commits.get(*parent) else {
+                continue;
+            };
+            let (x0, y0) = (x_of(p.lane), y_of(*parent));
+            let (x1, y1) = (x_of(commit.lane), y_of(i));
+            let stroke = draw::stroke(1.6, color);
+            if (x0 - x1).abs() < 0.01 {
+                prims.push(Prim::line([x0, y0], [x1, y1], stroke));
+            } else {
+                // Elbow: down from the parent, across, then down to the child.
+                let mid = (y0 + y1) * 0.5;
+                prims.push(Prim::line([x0, y0], [x0, mid], stroke));
+                prims.push(Prim::line([x0, mid], [x1, mid], stroke));
+                prims.push(Prim::line([x1, mid], [x1, y1], stroke));
+            }
+        }
+    }
+
+    for (i, commit) in git.commits.iter().enumerate() {
+        let cx = x_of(commit.lane);
+        let cy = y_of(i);
+        let color = series_color(commit.lane);
+        let fill = match commit.kind {
+            CommitKind::Reverse => ctx.theme.node_fill,
+            CommitKind::Normal => color,
+            CommitKind::Highlight => color,
+        };
+        prims.push(Prim::circle([cx, cy], dot_r, Some(fill), Some(draw::stroke(1.2, color))));
+        if commit.kind == CommitKind::Highlight {
+            // A ring marks the emphasised commit without changing its size.
+            prims.push(Prim::circle(
+                [cx, cy],
+                dot_r + 2.6,
+                None,
+                Some(draw::stroke(1.2, color.fade(0.8))),
+            ));
+        }
+
+        let mut text = commit.id.clone();
+        if let Some(tag) = commit.tag.as_deref() {
+            text = format!("{text}  [{tag}]");
+        }
+        prims.push(Prim::anchored_text(
+            [cx + dot_r + 6.0, cy],
+            text,
+            if commit.tag.is_some() {
+                dot_font
+            } else {
+                label_font
+            },
+            ctx.theme.node_text,
+            Anchor::LeftCenter,
+        ));
+    }
+
+    // Branch legend at the bottom: per-lane labels ran into each other.
+    let legend_y = y_of(git.commits.len()) - row_gap * 0.35;
+    let mut legend_x = 0.0f32;
+    for (branch, name) in git.branches.iter().enumerate() {
+        let lane = git
+            .commits
+            .iter()
+            .filter(|c| c.branch == branch)
+            .map(|c| c.lane)
+            .next()
+            .unwrap_or(branch);
+        let color = series_color(lane);
+        prims.push(Prim::circle(
+            [legend_x + 3.0, legend_y],
+            3.0,
+            Some(color),
+            None,
+        ));
+        prims.push(Prim::anchored_text(
+            [legend_x + 10.0, legend_y],
+            name.clone(),
+            dot_font,
+            ctx.theme.node_text,
+            Anchor::LeftCenter,
+        ));
+        legend_x += 10.0 + ctx.w(name, dot_font) + 16.0;
+    }
+
+    finish(prims, ctx, None, warnings, summary)
+}
+
 // ===========================================================================
 // Sequence diagrams
 // ===========================================================================
@@ -3926,7 +4060,7 @@ mod tests {
             }
         }
 
-        let cases: [(&str, &str); 10] = [
+        let cases: [(&str, &str); 11] = [
             (
                 "gantt",
                 "gantt\n section Design\n 需求分析 :done, a1, 2024-01-01, 5d\n 方案设计 :a2, after a1, 3d\n section Build\n 编码 :active, b1, after a2, 10d\n 里程碑 :milestone, m1, 2024-01-30, 0d",
@@ -3944,7 +4078,11 @@ mod tests {
                 "kanban\n  todo[待办]\n    t1[写解析器]\n    t2[补测试]\n  doing[进行中]\n    d1[修布局]",
             ),
             (
-                "sankey",
+                "gitgraph",
+                "gitGraph\n commit id: \"init\"\n branch develop\n commit id: \"feat\" tag: \"v0.1\"\n commit id: \"feat2\"\n checkout main\n commit id: \"fix\" type: HIGHLIGHT\n merge develop id: \"merge\" tag: \"v1.0\"",
+            ),
+            (
+            "sankey",
                 "sankey-beta\n 输入,处理,60\n 输入,丢弃,20\n 处理,输出,45\n 处理,再加工,15\n 再加工,输出,15",
             ),
             (
@@ -4666,6 +4804,95 @@ mod tests {
     #[test]
     fn an_empty_sankey_shows_the_placeholder_card() {
         let r = run(&Diagram::Sankey(Sankey::default()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
+    }    // -- gitGraph -----------------------------------------------------------
+
+    fn gitgraph_fixture() -> GitGraph {
+        GitGraph {
+            title: Some("版本历史".to_owned()),
+            branches: vec!["main".to_owned(), "develop".to_owned()],
+            commits: vec![
+                crate::diagram::model::GitCommit {
+                    id: "init".to_owned(),
+                    kind: CommitKind::Normal,
+                    tag: None,
+                    branch: 0,
+                    lane: 0,
+                    parents: Vec::new(),
+                },
+                crate::diagram::model::GitCommit {
+                    id: "feat".to_owned(),
+                    kind: CommitKind::Normal,
+                    tag: Some("v0.1".to_owned()),
+                    branch: 1,
+                    lane: 1,
+                    parents: vec![0],
+                },
+                crate::diagram::model::GitCommit {
+                    id: "merge".to_owned(),
+                    kind: CommitKind::Highlight,
+                    tag: None,
+                    branch: 0,
+                    lane: 0,
+                    parents: vec![0, 1],
+                },
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn gitgraph_draws_dots_labels_and_lanes() {
+        let r = run(&Diagram::GitGraph(gitgraph_fixture()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["版本历史", "init", "feat  [v0.1]", "merge", "main", "develop"] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        // One dot per commit plus the highlight ring.
+        // The legend markers use a smaller radius, so filter on size.
+        let dots = r
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Circle { radius, .. } if *radius > 3.5))
+            .count();
+        assert_eq!(dots, 4, "3 个提交 + 1 个高亮环");
+    }
+
+    #[test]
+    fn gitgraph_branches_are_offset_horizontally() {
+        let r = run(&Diagram::GitGraph(gitgraph_fixture()));
+        let x_of = |needle: &str| -> f32 {
+            r.prims
+                .iter()
+                .find_map(|p| match p {
+                    Prim::Text { text, pos, .. } if text == needle => Some(pos[0]),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("缺少 {needle}"))
+        };
+        assert!(x_of("feat  [v0.1]") > x_of("init"), "第二条泳道应更靠右");
+    }
+
+    #[test]
+    fn an_empty_gitgraph_shows_the_placeholder_card() {
+        let r = run(&Diagram::GitGraph(GitGraph::default()));
         assert_clean(&r);
         let texts: Vec<&str> = r
             .prims

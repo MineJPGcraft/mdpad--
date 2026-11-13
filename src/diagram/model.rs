@@ -31,6 +31,7 @@ pub enum DiagramKind {
     XYChart,
     Packet,
     Sankey,
+    GitGraph,
 }
 
 impl DiagramKind {
@@ -52,6 +53,7 @@ impl DiagramKind {
             Self::XYChart => "xychart",
             Self::Packet => "packet",
             Self::Sankey => "sankey",
+            Self::GitGraph => "gitGraph",
         }
     }
 }
@@ -791,6 +793,50 @@ impl Sankey {
 }
 
 // ---------------------------------------------------------------------------
+// Git graphs
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CommitKind {
+    #[default]
+    Normal,
+    /// `commit type: REVERSE` — a revert.
+    Reverse,
+    /// `commit type: HIGHLIGHT` — emphasised commit.
+    Highlight,
+}
+
+/// One commit node.
+#[derive(Clone, Debug)]
+pub struct GitCommit {
+    pub id: String,
+    pub kind: CommitKind,
+    pub tag: Option<String>,
+    /// Index into [`GitGraph::branches`].
+    pub branch: usize,
+    /// Column the commit is drawn in; one per branch.
+    pub lane: usize,
+    /// Parent commit indices (0, 1 or 2 for merges).
+    pub parents: Vec<usize>,
+}
+
+/// A parsed `gitGraph` block.
+#[derive(Clone, Debug, Default)]
+pub struct GitGraph {
+    pub title: Option<String>,
+    pub branches: Vec<String>,
+    pub commits: Vec<GitCommit>,
+    pub warnings: Vec<String>,
+}
+
+impl GitGraph {
+    /// Deepest lane in use, at least 0.
+    pub fn max_lane(&self) -> usize {
+        self.commits.iter().map(|c| c.lane).max().unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -806,6 +852,7 @@ pub enum Diagram {
     XYChart(XYChart),
     Packet(Packet),
     Sankey(Sankey),
+    GitGraph(GitGraph),
 }
 
 impl Diagram {
@@ -823,6 +870,7 @@ impl Diagram {
             Self::XYChart(_) => DiagramKind::XYChart,
             Self::Packet(_) => DiagramKind::Packet,
             Self::Sankey(_) => DiagramKind::Sankey,
+            Self::GitGraph(_) => DiagramKind::GitGraph,
         }
     }
 
@@ -838,6 +886,7 @@ impl Diagram {
             Self::XYChart(c) => c.title.as_deref(),
             Self::Packet(p) => p.title.as_deref(),
             Self::Sankey(k) => k.title.as_deref(),
+            Self::GitGraph(g) => g.title.as_deref(),
         }
     }
 
@@ -854,6 +903,7 @@ impl Diagram {
             Self::XYChart(c) => &c.warnings,
             Self::Packet(p) => &p.warnings,
             Self::Sankey(k) => &k.warnings,
+            Self::GitGraph(g) => &g.warnings,
         }
     }
 
@@ -869,6 +919,7 @@ impl Diagram {
             Self::XYChart(c) => c.series.iter().all(|s| s.values.is_empty()),
             Self::Packet(p) => p.fields.is_empty(),
             Self::Sankey(k) => k.links.is_empty(),
+            Self::GitGraph(g) => g.commits.is_empty(),
         }
     }
 
@@ -913,6 +964,11 @@ impl Diagram {
                 "sankey · {} 条流量 · {} 个节点",
                 k.links.len(),
                 k.nodes().len()
+            ),
+            Self::GitGraph(g) => format!(
+                "gitGraph · {} 个提交 · {} 个分支",
+                g.commits.len(),
+                g.branches.len()
             ),
         }
     }

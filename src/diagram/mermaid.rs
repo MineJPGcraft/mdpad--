@@ -24,8 +24,9 @@ use std::collections::BTreeSet;
 use crate::diagram::model::{
     Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Gantt, Graph, GroupKind, LineStyle,
     Journey, JourneyStep, Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Period, Pie,
-    Packet, PacketField, Quadrant, QuadrantPoint, Sankey, SankeyLink, SeqStep, Sequence, Slice,
-    Task, Timeline, XYChart, XYSeries, XYSeriesKind, civil_from_days, days_from_civil, parse_color,
+    CommitKind, GitCommit, GitGraph, Packet, PacketField, Quadrant, QuadrantPoint, Sankey,
+    SankeyLink, SeqStep, Sequence, Slice, Task, Timeline, XYChart, XYSeries, XYSeriesKind,
+    civil_from_days, days_from_civil, parse_color,
 };
 use crate::gfx::Rgba;
 
@@ -76,6 +77,7 @@ pub fn parse(src: &str) -> Diagram {
         }
         Header::Packet => Diagram::Packet(packet_parse(&lines[1..], title)),
         Header::Sankey => Diagram::Sankey(sankey_parse(&lines[1..], title)),
+        Header::GitGraph => Diagram::GitGraph(gitgraph_parse(&lines[1..], title)),
         Header::Unknown(name) => {
             let mut graph = if looks_like_edge(first) {
                 flowchart_graph(&lines, Direction::TopDown, None, title)
@@ -430,6 +432,7 @@ enum Header {
     XYChart(bool),
     Packet,
     Sankey,
+    GitGraph,
     Unknown(String),
 }
 
@@ -464,6 +467,7 @@ fn detect_header(first: &str) -> Header {
         "quadrantchart" => Header::Quadrant,
         "packet" | "packet-beta" => Header::Packet,
         "sankey-beta" | "sankey" => Header::Sankey,
+        "gitgraph" => Header::GitGraph,
         "xychart-beta" | "xychart" | "xychart-beta-vertical" => Header::XYChart(
             rest.split_whitespace().any(|w| w.eq_ignore_ascii_case("horizontal")),
         ),
@@ -3460,6 +3464,212 @@ fn sankey_parse(lines: &[String], title: Option<String>) -> Sankey {
     sankey
 }
 
+// ---------------------------------------------------------------------------
+// gitGraph
+// ---------------------------------------------------------------------------
+
+/// Split `key: "value"` attributes out of a commit/merge line.
+fn git_attributes(rest: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut text = rest.trim();
+    while !text.is_empty() {
+        let Some(colon) = text.find(':') else { break };
+        let key = text[..colon].trim().to_ascii_lowercase();
+        let after = text[colon + 1..].trim_start();
+        let (value, rest) = if let Some(inner) = after.strip_prefix('"') {
+            match inner.find('"') {
+                Some(close) => (
+                    inner[..close].to_owned(),
+                    inner[close + 1..].trim_start(),
+                ),
+                None => (inner.to_owned(), ""),
+            }
+        } else {
+            // Bare value: everything up to the next `key:` pair.
+            let end = after.find(" id:").or_else(|| after.find(" tag:"))
+                .or_else(|| after.find(" type:"))
+                .unwrap_or(after.len());
+            (after[..end].trim().to_owned(), after[end..].trim_start())
+        };
+        if !key.is_empty() {
+            out.push((key, value));
+        }
+        text = rest;
+    }
+    out
+}
+
+/// `gitGraph` — commits on lanes, one lane per branch.
+fn gitgraph_parse(lines: &[String], title: Option<String>) -> GitGraph {
+    let mut graph = GitGraph {
+        title,
+        ..GitGraph::default()
+    };
+    graph.branches.push("main".to_owned());
+
+    let mut current: usize = 0;
+    // Lane per branch, assigned the first time the branch is used.
+    let mut lanes: Vec<usize> = vec![0];
+    let mut heads: Vec<Option<usize>> = vec![None];
+
+    let branch_index = |graph: &mut GitGraph, lanes: &mut Vec<usize>, name: &str| -> usize {
+        match graph.branches.iter().position(|b| b == name) {
+            Some(i) => i,
+            None => {
+                graph.branches.push(name.to_owned());
+                lanes.push(lanes.len());
+                graph.branches.len() - 1
+            }
+        }
+    };
+
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let head = first_word(t).to_ascii_lowercase();
+        let rest = after_first_word(t);
+        match head.as_str() {
+            "commit" => {
+                let attrs = git_attributes(rest);
+                let mut kind = CommitKind::Normal;
+                let mut id = String::new();
+                let mut tag = None;
+                for (key, value) in attrs {
+                    match key.as_str() {
+                        "id" => id = value,
+                        "tag" => tag = Some(value),
+                        "type" => {
+                            kind = if value.eq_ignore_ascii_case("reverse") {
+                                CommitKind::Reverse
+                            } else if value.eq_ignore_ascii_case("highlight") {
+                                CommitKind::Highlight
+                            } else {
+                                CommitKind::Normal
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let index = graph.commits.len();
+                if id.is_empty() {
+                    id = format!("{}", index);
+                }
+                let parents: Vec<usize> = heads[current].into_iter().collect();
+                graph.commits.push(GitCommit {
+                    id,
+                    kind,
+                    tag,
+                    branch: current,
+                    lane: lanes[current],
+                    parents,
+                });
+                heads[current] = Some(index);
+            }
+            "branch" | "checkout" | "switch" => {
+                let name = strip_quotes(rest.trim());
+                if name.is_empty() {
+                    graph
+                        .warnings
+                        .push(format!("{head} 缺少分支名"));
+                    continue;
+                }
+                let before = graph.branches.len();
+                let idx = branch_index(&mut graph, &mut lanes, &name);
+                if heads.len() < graph.branches.len() {
+                    heads.resize(graph.branches.len(), None);
+                }
+                if graph.branches.len() > before {
+                    // A new branch starts where HEAD already is, like `checkout -b`.
+                    heads[idx] = heads[current];
+                }
+                current = idx;
+            }
+            "merge" => {
+                // `merge develop id: "x" tag: "y"`
+                let first = first_word(rest);
+                let name = strip_quotes(first);
+                if name.is_empty() {
+                    graph.warnings.push("merge 缺少分支名".to_owned());
+                    continue;
+                }
+                let merged = branch_index(&mut graph, &mut lanes, &name);
+                if heads.len() < graph.branches.len() {
+                    heads.resize(graph.branches.len(), None);
+                }
+                let attrs = git_attributes(after_first_word(rest));
+                let mut id = String::new();
+                let mut tag = None;
+                for (key, value) in attrs {
+                    match key.as_str() {
+                        "id" => id = value,
+                        "tag" => tag = Some(value),
+                        _ => {}
+                    }
+                }
+                let index = graph.commits.len();
+                if id.is_empty() {
+                    id = format!("{index}");
+                }
+                let mut parents: Vec<usize> = Vec::new();
+                if let Some(parent) = heads[current] {
+                    parents.push(parent);
+                }
+                if let Some(parent) = heads[merged] {
+                    if !parents.contains(&parent) {
+                        parents.push(parent);
+                    }
+                }
+                graph.commits.push(GitCommit {
+                    id,
+                    kind: CommitKind::Highlight,
+                    tag,
+                    branch: current,
+                    lane: lanes[current],
+                    parents,
+                });
+                heads[current] = Some(index);
+            }
+            "cherry-pick" => {
+                // Drawn as a commit on the current branch; the picked commit is
+                // recorded as its parent so the line still shows the history.
+                let attrs = git_attributes(rest);
+                let mut id = String::new();
+                for (key, value) in attrs {
+                    if key == "id" {
+                        id = value;
+                    }
+                }
+                let index = graph.commits.len();
+                if id.is_empty() {
+                    id = format!("{index}");
+                }
+                let parents: Vec<usize> = heads[current].into_iter().collect();
+                graph.commits.push(GitCommit {
+                    id,
+                    kind: CommitKind::Reverse,
+                    tag: None,
+                    branch: current,
+                    lane: lanes[current],
+                    parents,
+                });
+                heads[current] = Some(index);
+            }
+            // Presentation-only directives.
+            "%%" | "acc_title" | "acc_descr" | "options" => {}
+            _ => graph
+                .warnings
+                .push(format!("无法识别的 gitGraph 语句: {}", truncate(t, 40))),
+        }
+    }
+
+    if graph.commits.is_empty() {
+        graph.warnings.push("gitGraph 没有提交".to_owned());
+    }
+    graph
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4448,5 +4658,63 @@ mod tests {
             panic!("expected a sankey")
         };
         assert!(k.warnings.iter().any(|w| w.contains("没有流量")));
+    }    // -- gitGraph -----------------------------------------------------------
+
+    #[test]
+    fn gitgraph_builds_branches_lanes_and_merges() {
+        let d = parse(
+            "gitGraph\n\
+             \x20 commit id: \"init\"\n\
+             \x20 branch develop\n\
+             \x20 commit id: \"feat\" tag: \"v0.1\"\n\
+             \x20 checkout main\n\
+             \x20 commit id: \"fix\" type: HIGHLIGHT\n\
+             \x20 merge develop id: \"merge\"",
+        );
+        let Diagram::GitGraph(g) = d else {
+            panic!("expected a git graph")
+        };
+        assert_eq!(g.branches, vec!["main", "develop"]);
+        assert_eq!(g.commits.len(), 4);
+
+        assert_eq!(g.commits[0].id, "init");
+        assert_eq!(g.commits[0].lane, 0);
+        assert!(g.commits[0].parents.is_empty());
+
+        assert_eq!(g.commits[1].lane, 1, "develop 应占第二条泳道");
+        assert_eq!(g.commits[1].parents, vec![0]);
+        assert_eq!(g.commits[1].tag.as_deref(), Some("v0.1"));
+
+        assert_eq!(g.commits[2].lane, 0, "回到 main");
+        assert_eq!(g.commits[2].kind, CommitKind::Highlight);
+
+        // The merge commit has two parents and sits on main's lane.
+        let merge = &g.commits[3];
+        assert_eq!(merge.id, "merge");
+        assert_eq!(merge.lane, 0);
+        assert_eq!(merge.parents, vec![2, 1]);
+        assert_eq!(g.max_lane(), 1);
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    }
+
+    #[test]
+    fn gitgraph_accepts_bare_ids_and_implicit_first_commit() {
+        let d = parse("gitGraph\n commit\n commit id: \"two\"");
+        let Diagram::GitGraph(g) = d else {
+            panic!("expected a git graph")
+        };
+        assert_eq!(g.commits.len(), 2);
+        assert_eq!(g.commits[0].id, "0", "缺省 id 用序号");
+        assert_eq!(g.commits[1].parents, vec![0]);
+    }
+
+    #[test]
+    fn an_empty_gitgraph_warns() {
+        let d = parse("gitGraph\n branch develop");
+        let Diagram::GitGraph(g) = d else {
+            panic!("expected a git graph")
+        };
+        assert!(g.commits.is_empty());
+        assert!(g.warnings.iter().any(|w| w.contains("没有提交")));
     }
 }

@@ -170,6 +170,7 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 - **journey** — `section` 分带、`步骤: 分数: 参与者` 语法（分数夹在 1–5、缺省给 3）、1–5 分刻度轴与网格、步骤框按分数定位并用折线连成路径、参与者列在框下。
 - **timeline** — `section` 分带、`2002 : LinkedIn : Google` 一句多事件、卡片沿轴线上下交替、无事件的时期也占一列。
 - **quadrantChart** — `x-axis 低 --> 高` / `y-axis` 轴标题、`quadrant-1..4` 四象限名（右上→左上→左下→右下）、`名称: [x, y]` 数据点（自动夹到 0–1）、点标签在靠近右边界时自动翻到左侧。
+- **gitGraph** — `commit id:/tag:/type:` 三种类型（NORMAL / REVERSE / HIGHLIGHT）、`branch` / `checkout` / `switch`（新分支从当前 HEAD 起算，与 `checkout -b` 一致）、`merge`（双亲连线）、`cherry-pick`；每条分支一条泳道，底部带分支图例。
 - **packet-beta** — `0-15: "字段"` 位范围、`+16: "字段"` 相对宽度、单比特 `3: "标志"`；每 32 位自动换行，顶部有 8 位刻度，超长字段名自动省略号截断。
 - **sankey-beta** — `源,目标,流量` CSV 行（支持引号内含逗号），流量带宽按值等比、节点按最长路径分层、节点标签带底色以在流带上方可读。
 - **xychart-beta** — `x-axis [分类…]` 或数值轴 `x-axis "标签" 0 --> 10`、`y-axis "标签" 0 --> 100`、`bar` / `line`（可带引号系列名）、多序列并列柱、刻度自动取整（1/2/5×10ⁿ）；`xychart-beta horizontal` 会按竖直方向绘制并在状态栏说明。
