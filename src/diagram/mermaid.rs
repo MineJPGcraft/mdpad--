@@ -23,8 +23,8 @@ use std::collections::BTreeSet;
 
 use crate::diagram::model::{
     Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Gantt, Graph, GroupKind, LineStyle,
-    Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Pie, SeqStep, Sequence, Slice, Task,
-    civil_from_days, days_from_civil, parse_color,
+    Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Period, Pie, SeqStep, Sequence,
+    Slice, Task, Timeline, civil_from_days, days_from_civil, parse_color,
 };
 use crate::gfx::Rgba;
 
@@ -67,6 +67,7 @@ pub fn parse(src: &str) -> Diagram {
         Header::Requirement => Diagram::Graph(requirement_parse(&lines[1..], title)),
         Header::Kanban => Diagram::Graph(kanban_parse(src, title)),
         Header::Gantt => Diagram::Gantt(gantt_parse(&lines[1..], title)),
+        Header::Timeline => Diagram::Timeline(timeline_parse(&lines[1..], title)),
         Header::Unknown(name) => {
             let mut graph = if looks_like_edge(first) {
                 flowchart_graph(&lines, Direction::TopDown, None, title)
@@ -415,6 +416,7 @@ enum Header {
     Requirement,
     Kanban,
     Gantt,
+    Timeline,
     Unknown(String),
 }
 
@@ -444,6 +446,7 @@ fn detect_header(first: &str) -> Header {
         "requirementdiagram" => Header::Requirement,
         "kanban" => Header::Kanban,
         "gantt" => Header::Gantt,
+        "timeline" => Header::Timeline,
         _ => Header::Unknown(word.to_owned()),
     }
 }
@@ -2925,6 +2928,62 @@ fn gantt_parse(lines: &[String], title: Option<String>) -> Gantt {
     gantt
 }
 
+// ---------------------------------------------------------------------------
+// timeline
+// ---------------------------------------------------------------------------
+
+/// `timeline` — periods along a line, each with one or more events.
+fn timeline_parse(lines: &[String], title: Option<String>) -> Timeline {
+    let mut timeline = Timeline {
+        title,
+        ..Timeline::default()
+    };
+    let mut section = usize::MAX;
+
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = first_word(t).to_ascii_lowercase();
+        if lower == "section" {
+            timeline
+                .sections
+                .push(after_first_word(t).trim().to_owned());
+            section = timeline.sections.len() - 1;
+            continue;
+        }
+        // `2002 : LinkedIn : Google` — the head is the period label.
+        let mut parts = t.split(':').map(|p| p.trim());
+        let Some(label) = parts.next() else { continue };
+        if label.is_empty() {
+            continue;
+        }
+        let events: Vec<String> = parts
+            .filter(|e| !e.is_empty())
+            .map(|e| strip_quotes(e))
+            .collect();
+        let section = if section == usize::MAX {
+            if timeline.sections.is_empty() {
+                timeline.sections.push(String::new());
+            }
+            0
+        } else {
+            section
+        };
+        timeline.periods.push(Period {
+            label: strip_quotes(label),
+            events,
+            section,
+        });
+    }
+
+    if timeline.periods.is_empty() {
+        timeline.warnings.push("timeline 没有时期".to_owned());
+    }
+    timeline
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3624,5 +3683,51 @@ mod tests {
         };
         assert!(g.tasks.is_empty());
         assert!(g.warnings.iter().any(|w| w.contains("没有任务")));
+    }
+    // -- timeline -----------------------------------------------------------
+
+    #[test]
+    fn timeline_parses_sections_and_events() {
+        let d = parse(
+            "timeline\n\
+             \x20 title 社交平台简史\n\
+             \x20 section 早期\n\
+             \x20 2002 : LinkedIn\n\
+             \x20 2004 : Facebook : Google\n\
+             \x20 section 后期\n\
+             \x20 2006 : Twitter",
+        );
+        let Diagram::Timeline(t) = d else {
+            panic!("expected a timeline")
+        };
+        assert_eq!(t.title.as_deref(), Some("社交平台简史"));
+        assert_eq!(t.sections, vec!["早期", "后期"]);
+        assert_eq!(t.periods.len(), 3);
+        assert_eq!(t.periods[0].label, "2002");
+        assert_eq!(t.periods[0].events, vec!["LinkedIn"]);
+        assert_eq!(t.periods[1].events, vec!["Facebook", "Google"]);
+        assert_eq!(t.periods[2].section, 1);
+        assert!(t.warnings.is_empty(), "{:?}", t.warnings);
+    }
+
+    #[test]
+    fn timeline_allows_periods_without_events() {
+        let d = parse("timeline\n 2020\n 2021 : 事件");
+        let Diagram::Timeline(t) = d else {
+            panic!("expected a timeline")
+        };
+        assert_eq!(t.periods.len(), 2);
+        assert!(t.periods[0].events.is_empty());
+        assert_eq!(t.periods[1].events, vec!["事件"]);
+    }
+
+    #[test]
+    fn an_empty_timeline_warns() {
+        let d = parse("timeline\n section 空");
+        let Diagram::Timeline(t) = d else {
+            panic!("expected a timeline")
+        };
+        assert!(t.periods.is_empty());
+        assert!(t.warnings.iter().any(|w| w.contains("没有时期")));
     }
 }

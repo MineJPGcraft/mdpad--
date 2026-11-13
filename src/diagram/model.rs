@@ -25,6 +25,7 @@ pub enum DiagramKind {
     Requirement,
     Kanban,
     Gantt,
+    Timeline,
 }
 
 impl DiagramKind {
@@ -40,6 +41,7 @@ impl DiagramKind {
             Self::Requirement => "requirement",
             Self::Kanban => "kanban",
             Self::Gantt => "gantt",
+            Self::Timeline => "timeline",
         }
     }
 }
@@ -589,6 +591,28 @@ fn month_name(m: u32) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Timelines
+// ---------------------------------------------------------------------------
+
+/// One column of a `timeline`: a period and the events it holds.
+#[derive(Clone, Debug)]
+pub struct Period {
+    pub label: String,
+    pub events: Vec<String>,
+    /// Index into [`Timeline::sections`].
+    pub section: usize,
+}
+
+/// A parsed `timeline` block.
+#[derive(Clone, Debug, Default)]
+pub struct Timeline {
+    pub title: Option<String>,
+    pub sections: Vec<String>,
+    pub periods: Vec<Period>,
+    pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -598,6 +622,7 @@ pub enum Diagram {
     Sequence(Sequence),
     Pie(Pie),
     Gantt(Gantt),
+    Timeline(Timeline),
 }
 
 impl Diagram {
@@ -609,6 +634,7 @@ impl Diagram {
             Self::Sequence(_) => DiagramKind::Sequence,
             Self::Pie(_) => DiagramKind::Pie,
             Self::Gantt(_) => DiagramKind::Gantt,
+            Self::Timeline(_) => DiagramKind::Timeline,
         }
     }
 
@@ -618,6 +644,7 @@ impl Diagram {
             Self::Sequence(s) => s.title.as_deref(),
             Self::Pie(p) => p.title.as_deref(),
             Self::Gantt(g) => g.title.as_deref(),
+            Self::Timeline(t) => t.title.as_deref(),
         }
     }
 
@@ -628,6 +655,7 @@ impl Diagram {
             Self::Sequence(s) => &s.warnings,
             Self::Pie(_) => &[],
             Self::Gantt(g) => &g.warnings,
+            Self::Timeline(t) => &t.warnings,
         }
     }
 
@@ -637,6 +665,7 @@ impl Diagram {
             Self::Sequence(s) => s.participants.is_empty() && s.steps.is_empty(),
             Self::Pie(p) => p.slices.is_empty(),
             Self::Gantt(g) => g.tasks.is_empty(),
+            Self::Timeline(t) => t.periods.is_empty(),
         }
     }
 
@@ -659,6 +688,11 @@ impl Diagram {
                 "gantt · {} 个任务 · {} 个分组",
                 g.tasks.len(),
                 g.sections.len()
+            ),
+            Self::Timeline(t) => format!(
+                "timeline · {} 个时期 · {} 个事件",
+                t.periods.len(),
+                t.periods.iter().map(|p| p.events.len()).sum::<usize>()
             ),
         }
     }

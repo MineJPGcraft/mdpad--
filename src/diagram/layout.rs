@@ -28,7 +28,7 @@ use super::{draw, DiagramTheme};
 use crate::diagram::model::{
     series_color, Arrow, Diagram, Direction, Edge, Gantt, Graph, GroupKind, LineStyle, Node,
     NodeShape, NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
-    Task, days_from_civil, format_day,
+    Task, Timeline, days_from_civil, format_day,
 };
 use crate::gfx::{Anchor, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -87,6 +87,7 @@ pub fn layout(
         Diagram::Sequence(s) => layout_sequence(s, diagram, &ctx),
         Diagram::Pie(p) => layout_pie(p, diagram, &ctx),
         Diagram::Gantt(g) => layout_gantt(g, diagram, &ctx),
+        Diagram::Timeline(t) => layout_timeline(t, diagram, &ctx),
     }
 }
 
@@ -1516,6 +1517,186 @@ fn layout_gantt(gantt: &Gantt, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
     finish(prims, ctx, None, warnings, summary)
 }
 
+
+// ===========================================================================
+// Timelines
+// ===========================================================================
+
+/// `timeline` — a horizontal axis with event cards alternating above and below.
+fn layout_timeline(timeline: &Timeline, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    if timeline.periods.is_empty() {
+        push_warning(&mut warnings, "timeline 没有时期".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let period_font = ctx.small_bold();
+    let event_font = ctx.small();
+    let section_font = ctx.small_bold();
+    let card_pad = 8.0;
+    let card_h = ctx.lh(event_font) + 10.0;
+    let row_h = card_h + 10.0;
+    let axis_gap = 14.0;
+
+    // Cards alternate above / below the axis, so the row counts decide the
+    // height on each side.
+    let mut above_rows = 0usize;
+    let mut below_rows = 0usize;
+    for period in &timeline.periods {
+        let n = period.events.len();
+        above_rows = above_rows.max(n.div_ceil(2));
+        below_rows = below_rows.max(n / 2);
+    }
+    if above_rows == 0 {
+        above_rows = 1;
+    }
+
+    // Column width: widest event card, but never wider than a readable line.
+    let mut col_w = 0.0f32;
+    for period in &timeline.periods {
+        let mut w = ctx.w(&period.label, period_font);
+        for event in &period.events {
+            w = w.max(ctx.w(event, event_font) + card_pad * 2.0);
+        }
+        col_w = col_w.max(w);
+    }
+    let col_w = (col_w + 18.0).clamp(70.0, 240.0);
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut y = 0.0;
+
+    if let Some(title) = timeline.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        let total_w = col_w * timeline.periods.len() as f32;
+        prims.push(Prim::anchored_text(
+            [total_w * 0.5, y],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::CenterTop,
+        ));
+        y += lh + 12.0;
+    }
+
+    // Section bands, drawn as labelled groups above the cards.
+    let mut section_bands: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, period) in timeline.periods.iter().enumerate() {
+        match section_bands.last_mut() {
+            Some((section, _, end)) if *section == period.section => *end = i,
+            _ => section_bands.push((period.section, i, i)),
+        }
+    }
+    let has_sections = timeline
+        .sections
+        .iter()
+        .any(|name| !name.trim().is_empty());
+    if has_sections {
+        let band_h = ctx.lh(section_font) + 8.0;
+        for (section, start, end) in &section_bands {
+            let name = timeline
+                .sections
+                .get(*section)
+                .cloned()
+                .unwrap_or_default();
+            if name.trim().is_empty() {
+                continue;
+            }
+            let x0 = *start as f32 * col_w;
+            let x1 = (*end + 1) as f32 * col_w;
+            let rect = Rect::from_min_size([x0, y], [x1 - x0, band_h]);
+            prims.push(Prim::filled_rect(
+                rect,
+                5.0,
+                ctx.theme.cluster_fill.lerp(series_color(*section), 0.10),
+            ));
+            prims.push(Prim::anchored_text(
+                [x0 + 8.0, y + band_h * 0.5],
+                name,
+                section_font,
+                ctx.theme.cluster_text,
+                Anchor::LeftCenter,
+            ));
+        }
+        y += band_h + 8.0;
+    }
+
+    let axis_y = y + above_rows as f32 * row_h + axis_gap;
+    let total_w = col_w * timeline.periods.len() as f32;
+
+    // The axis itself.
+    prims.push(Prim::line(
+        [0.0, axis_y],
+        [total_w, axis_y],
+        draw::stroke(1.6, ctx.theme.node_stroke.fade(0.7)),
+    ));
+
+    for (i, period) in timeline.periods.iter().enumerate() {
+        let cx = (i as f32 + 0.5) * col_w;
+        // Tick + period label under the axis.
+        prims.push(Prim::circle(
+            [cx, axis_y],
+            3.2,
+            Some(ctx.theme.accent),
+            None,
+        ));
+        prims.push(Prim::anchored_text(
+            [cx, axis_y + axis_gap * 0.5 + ctx.lh(period_font) * 0.5],
+            period.label.clone(),
+            period_font,
+            ctx.theme.node_text,
+            Anchor::Center,
+        ));
+
+        for (k, event) in period.events.iter().enumerate() {
+            let above = k % 2 == 0;
+            let slot = k / 2;
+            let card_y = if above {
+                axis_y - axis_gap - (slot as f32 + 1.0) * row_h + 10.0
+            } else {
+                axis_y + axis_gap + ctx.lh(period_font) + slot as f32 * row_h
+            };
+            let card_w = (ctx.w(event, event_font) + card_pad * 2.0).min(col_w - 8.0);
+            let rect = Rect::from_min_size(
+                [cx - card_w * 0.5, card_y],
+                [card_w.max(24.0), card_h],
+            );
+            let accent = series_color(i);
+            prims.push(Prim::filled_rect(
+                rect,
+                5.0,
+                ctx.theme.node_fill.lerp(accent, 0.12),
+            ));
+            prims.push(Prim::stroked_rect(
+                rect,
+                5.0,
+                draw::stroke(1.0, accent.lerp(ctx.theme.node_stroke, 0.4)),
+            ));
+            // Short connector back to the axis.
+            let (from_y, to_y) = if above {
+                (rect.max[1], axis_y - 3.0)
+            } else {
+                (rect.min[1], axis_y + 3.0)
+            };
+            prims.push(Prim::line(
+                [cx, from_y],
+                [cx, to_y],
+                draw::stroke(1.0, ctx.theme.node_stroke.fade(0.55)),
+            ));
+            prims.push(Prim::anchored_text(
+                [cx, rect.center()[1]],
+                event.clone(),
+                event_font,
+                ctx.theme.node_text,
+                Anchor::Center,
+            ));
+        }
+    }
+
+    finish(prims, ctx, None, warnings, summary)
+}
+
 // ===========================================================================
 // Sequence diagrams
 // ===========================================================================
@@ -2895,6 +3076,89 @@ mod tests {
     #[test]
     fn an_empty_gantt_shows_the_placeholder_card() {
         let r = run(&Diagram::Gantt(Gantt::default()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
+    }
+    // -- timeline -----------------------------------------------------------
+
+    fn timeline_fixture() -> Timeline {
+        Timeline {
+            title: Some("简史".to_owned()),
+            sections: vec!["早期".to_owned(), "后期".to_owned()],
+            periods: vec![
+                crate::diagram::model::Period {
+                    label: "2002".to_owned(),
+                    events: vec!["LinkedIn".to_owned()],
+                    section: 0,
+                },
+                crate::diagram::model::Period {
+                    label: "2004".to_owned(),
+                    events: vec!["Facebook".to_owned(), "Google".to_owned()],
+                    section: 0,
+                },
+                crate::diagram::model::Period {
+                    label: "2006".to_owned(),
+                    events: vec!["Twitter".to_owned()],
+                    section: 1,
+                },
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn timeline_draws_axis_cards_and_section_bands() {
+        let r = run(&Diagram::Timeline(timeline_fixture()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["简史", "2002", "2004", "2006", "LinkedIn", "Twitter", "早期", "后期"] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        // One stroked card per event.
+        let cards = r
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Rect { stroke: Some(_), .. }))
+            .count();
+        assert_eq!(cards, 4, "每个事件一张卡片");
+    }
+
+    #[test]
+    fn timeline_alternates_cards_around_the_axis() {
+        let r = run(&Diagram::Timeline(timeline_fixture()));
+        let y_of = |needle: &str| -> f32 {
+            r.prims
+                .iter()
+                .find_map(|p| match p {
+                    Prim::Text { text, pos, .. } if text == needle => Some(pos[1]),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("缺少 {needle}"))
+        };
+        // In the 2004 column the first event sits above the axis, the second below.
+        assert!(y_of("Facebook") < y_of("Google"));
+        // And the period label sits under the axis, i.e. below the upper card.
+        assert!(y_of("Facebook") < y_of("2004"));
+    }
+
+    #[test]
+    fn an_empty_timeline_shows_the_placeholder_card() {
+        let r = run(&Diagram::Timeline(Timeline::default()));
         assert_clean(&r);
         let texts: Vec<&str> = r
             .prims
