@@ -306,9 +306,12 @@ src/
   1em = 10pt 的参考字号换算。`\frac` 不做行内自动缩放（行内分母取 0.72 倍字号），
   连字符与断行等 TeX 细节未做。`\mathbb` 对 Unicode 无对应字形的字母会退化为下划线。
   上下标不会自动拉开避让（同一位置上的 `x_i^2` 叠得很紧）。
-- **Mermaid / PlantUML** 覆盖了常用语法，但主题（`classDef`、皮肤参数）
-  只解析不生效，绘制采用编辑器统一配色。时序图 activation 条按语句
-  配对，遇到不配对的 `deactivate` 会安全忽略而非报错。
+- **Mermaid / PlantUML** 覆盖了常用语法，主题也**真的生效**：Mermaid 的
+  `classDef` / `class` / `A:::cls` / `style` / `linkStyle` 与 PlantUML 的
+  `skinparam`（含 `skinparam class { … }` 块写法）、`#颜色` 后缀会改变填充、
+  描边、文字色与线宽，`stroke-dasharray` 走虚线。没有对应语义的声明
+  （`font-weight`、`opacity`、`rx` 等）仍然只解析不生效。时序图 activation
+  条按语句配对，遇到不配对的 `deactivate` 会安全忽略而非报错。
 - **表格**可正常渲染与编辑，但不是所见即所得的单元格网格——表格整块
   通过「编辑表格源码」进入源码态编辑，因为 Markdown 表格的行内语法
   很容易在直接改列宽时被破坏。

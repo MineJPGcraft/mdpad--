@@ -263,6 +263,19 @@ fn push_warning(warnings: &mut Vec<String>, msg: String) {
     }
 }
 
+/// Pick a label colour that stays readable on `fill`.
+///
+/// A `classDef` / `skinparam` the user wrote can turn a node dark; keeping the
+/// theme's (also dark) text would render it invisible, so the preferred colour
+/// is only used when it contrasts enough with the fill.
+fn readable_on(fill: Rgba, preferred: Rgba) -> Rgba {
+    let lf = fill.luminance();
+    if (preferred.luminance() - lf).abs() >= 0.35 {
+        return preferred;
+    }
+    if lf > 0.5 { Rgba::BLACK } else { Rgba::WHITE }
+}
+
 // ---------------------------------------------------------------------------
 // Text helpers
 // ---------------------------------------------------------------------------
@@ -883,12 +896,19 @@ fn node_prims(node: &Node, rect: Rect, ctx: &Ctx) -> Vec<Prim> {
         return classifier_prims(node, rect, ctx);
     }
 
+    // A `classDef` / `style` / `#colour` override wins over the theme.
+    let fill = node.fill.unwrap_or(ctx.theme.node_fill);
+    let stroke_color = node.stroke.unwrap_or(ctx.theme.node_stroke);
+    let text_color = node
+        .text_color
+        .unwrap_or_else(|| readable_on(fill, ctx.theme.node_text));
+
     let mut out = Vec::new();
     out.extend(shape_prims(
         node.shape,
         rect,
-        Some(ctx.theme.node_fill),
-        Some(draw::stroke(1.2, ctx.theme.node_stroke)),
+        Some(fill),
+        Some(draw::stroke(node.stroke_width.unwrap_or(1.2), stroke_color)),
     ));
 
     let area = label_area(node.shape, rect);
@@ -915,14 +935,14 @@ fn node_prims(node: &Node, rect: Rect, ctx: &Ctx) -> Vec<Prim> {
             &mut out,
             &stereo,
             small,
-            ctx.theme.node_text.fade(0.8),
+            text_color.fade(0.8),
             area.center()[0],
             top,
             ctx,
         );
         top += ctx.lh(small) * stereo.len().max(1) as f32 + 2.0;
     }
-    draw_centered(&mut out, &lines, body, ctx.theme.node_text, area.center()[0], top, ctx);
+    draw_centered(&mut out, &lines, body, text_color, area.center()[0], top, ctx);
     out
 }
 
@@ -950,14 +970,16 @@ fn classifier_size(node: &Node, ctx: &Ctx) -> [f32; 2] {
 }
 
 fn classifier_prims(node: &Node, rect: Rect, ctx: &Ctx) -> Vec<Prim> {
-    let stroke = draw::stroke(1.2, ctx.theme.node_stroke);
+    let fill = node.fill.unwrap_or(ctx.theme.node_fill);
+    let text_color = node
+        .text_color
+        .unwrap_or_else(|| readable_on(fill, ctx.theme.node_text));
+    let stroke = draw::stroke(
+        node.stroke_width.unwrap_or(1.2),
+        node.stroke.unwrap_or(ctx.theme.node_stroke),
+    );
     let mut out = Vec::new();
-    out.extend(draw::round_rect(
-        rect,
-        4.0,
-        Some(ctx.theme.node_fill),
-        Some(stroke),
-    ));
+    out.extend(draw::round_rect(rect, 4.0, Some(fill), Some(stroke)));
 
     let pad_x = 10.0;
     let name_font = ctx.body_bold();
@@ -970,7 +992,7 @@ fn classifier_prims(node: &Node, rect: Rect, ctx: &Ctx) -> Vec<Prim> {
             &mut out,
             &lines,
             comp_font,
-            ctx.theme.node_text.fade(0.8),
+            text_color.fade(0.8),
             rect.center()[0],
             y,
             ctx,
@@ -979,7 +1001,7 @@ fn classifier_prims(node: &Node, rect: Rect, ctx: &Ctx) -> Vec<Prim> {
     }
 
     let name = wrap_lines(&node.label_lines(), name_font, rect.width() - pad_x * 2.0, ctx);
-    draw_centered(&mut out, &name, name_font, ctx.theme.node_text, rect.center()[0], y, ctx);
+    draw_centered(&mut out, &name, name_font, text_color, rect.center()[0], y, ctx);
     y += ctx.lh(name_font) * name.len().max(1) as f32 + 5.0;
 
     for comp in &node.compartments {
@@ -995,7 +1017,7 @@ fn classifier_prims(node: &Node, rect: Rect, ctx: &Ctx) -> Vec<Prim> {
                 [rect.min[0] + pad_x, y + lh * 0.5],
                 line.clone(),
                 comp_font,
-                ctx.theme.node_text,
+                text_color,
                 Anchor::LeftCenter,
             ));
             y += lh;
@@ -1070,14 +1092,22 @@ fn cluster_prims(
         let mut r = b.expand(14.0);
         r.min[1] -= label_h + 4.0;
         let accent = series_color(ci);
-        let fill = ctx.theme.cluster_fill.lerp(accent, 0.10);
-        let stroke = draw::stroke(1.2, ctx.theme.cluster_stroke.lerp(accent, 0.35));
+        let fill = cluster
+            .fill
+            .unwrap_or_else(|| ctx.theme.cluster_fill.lerp(accent, 0.10));
+        let stroke_color = cluster
+            .stroke
+            .unwrap_or_else(|| ctx.theme.cluster_stroke.lerp(accent, 0.35));
+        let text_color = cluster
+            .text_color
+            .unwrap_or_else(|| readable_on(fill, ctx.theme.cluster_text));
+        let stroke = draw::stroke(1.2, stroke_color);
         out.extend(draw::round_rect(r, 10.0, Some(fill), Some(stroke)));
         out.push(Prim::anchored_text(
             [r.min[0] + 10.0, r.min[1] + label_h * 0.5 + 4.0],
             cluster.label.clone(),
             font,
-            ctx.theme.cluster_text,
+            text_color,
             Anchor::LeftCenter,
         ));
     }
@@ -1214,7 +1244,8 @@ fn edge_prims(e: &Edge, from: Rect, to: Rect, dir: Direction, ctx: &Ctx) -> Vec<
     }
 
     let mut out = Vec::new();
-    let stroke = draw::stroke(1.3, ctx.theme.edge);
+    let color = e.color.unwrap_or(ctx.theme.edge);
+    let stroke = draw::stroke(e.width.unwrap_or(1.3), color);
     for w in pts.windows(2) {
         out.extend(draw::segment(w[0], w[1], stroke, e.line));
     }
@@ -1224,7 +1255,7 @@ fn edge_prims(e: &Edge, from: Rect, to: Rect, dir: Direction, ctx: &Ctx) -> Vec<
             *last,
             [last[0] - prev[0], last[1] - prev[1]],
             e.head,
-            ctx.theme.edge,
+            color,
             draw::ARROW_SIZE,
         ));
     }
@@ -1235,7 +1266,7 @@ fn edge_prims(e: &Edge, from: Rect, to: Rect, dir: Direction, ctx: &Ctx) -> Vec<
             *first,
             [first[0] - next[0], first[1] - next[1]],
             e.tail,
-            ctx.theme.edge,
+            color,
             draw::ARROW_SIZE,
         ));
     }
@@ -1256,7 +1287,8 @@ fn self_loop(node: Rect, e: &Edge, ctx: &Ctx) -> Vec<Prim> {
     let pts = [[x, y0], [x + w, y0], [x + w, y1], [x, y1]];
 
     let mut out = Vec::new();
-    let stroke = draw::stroke(1.3, ctx.theme.edge);
+    let color = e.color.unwrap_or(ctx.theme.edge);
+    let stroke = draw::stroke(e.width.unwrap_or(1.3), color);
     for p in pts.windows(2) {
         out.extend(draw::segment(p[0], p[1], stroke, e.line));
     }
@@ -1264,7 +1296,7 @@ fn self_loop(node: Rect, e: &Edge, ctx: &Ctx) -> Vec<Prim> {
         [x, y1],
         [-1.0, 0.0],
         e.head,
-        ctx.theme.edge,
+        color,
         draw::ARROW_SIZE,
     ));
     if let Some(label) = e.label.as_deref()
@@ -1670,11 +1702,14 @@ fn note_rect(
 
 fn participant_prims(p: &Participant, rect: Rect, ctx: &Ctx) -> Vec<Prim> {
     let mut out = Vec::new();
+    let fill = p.fill.unwrap_or(ctx.theme.node_fill);
+    let stroke_color = p.stroke.unwrap_or(ctx.theme.node_stroke);
+    let text_color = readable_on(fill, ctx.theme.node_text);
     out.extend(draw::round_rect(
         rect,
         6.0,
-        Some(ctx.theme.node_fill),
-        Some(draw::stroke(1.2, ctx.theme.node_stroke)),
+        Some(fill),
+        Some(draw::stroke(1.2, stroke_color)),
     ));
 
     let font = ctx.body();
@@ -1694,7 +1729,7 @@ fn participant_prims(p: &Participant, rect: Rect, ctx: &Ctx) -> Vec<Prim> {
         [rect.center()[0], rect.min[1] + pad + gh + lh * 0.5],
         title_case(&p.label),
         font,
-        ctx.theme.node_text,
+        text_color,
         Anchor::Center,
     ));
     out
@@ -2050,12 +2085,14 @@ mod tests {
             label: "alice".into(),
             kind: ParticipantKind::Default,
             declared: true,
+                ..Default::default()
         });
         s.participants.push(Participant {
             id: "B".into(),
             label: "bob".into(),
             kind: ParticipantKind::Default,
             declared: true,
+                ..Default::default()
         });
         for i in 0..count {
             s.steps.push(SeqStep::Message {
@@ -2273,12 +2310,14 @@ mod tests {
             label: "alice".into(),
             kind: ParticipantKind::Actor,
             declared: true,
+                ..Default::default()
         });
         s.participants.push(Participant {
             id: "B".into(),
             label: "bob".into(),
             kind: ParticipantKind::Store,
             declared: true,
+                ..Default::default()
         });
         s.steps.push(SeqStep::GroupOpen {
             kind: GroupKind::Alt,
@@ -2367,6 +2406,7 @@ mod tests {
             label: "empty".into(),
             members: Vec::new(),
             parent: None,
+                ..Default::default()
         });
         cases.push(Diagram::Graph(g));
 
@@ -2378,6 +2418,7 @@ mod tests {
             label: "ghostly".into(),
             members: vec!["missing".into()],
             parent: Some(0),
+                ..Default::default()
         });
         cases.push(Diagram::Graph(g));
 
@@ -2427,6 +2468,7 @@ mod tests {
             label: "A".into(),
             kind: ParticipantKind::Default,
             declared: false,
+                ..Default::default()
         });
         s.steps.push(SeqStep::Message {
             index: 1,
@@ -2453,6 +2495,7 @@ mod tests {
             label: "A".into(),
             kind: ParticipantKind::Default,
             declared: false,
+                ..Default::default()
         });
         s.steps.push(SeqStep::GroupClose { depth: 0 });
         s.steps.push(SeqStep::GroupElse {
@@ -2468,6 +2511,7 @@ mod tests {
             label: "A".into(),
             kind: ParticipantKind::Default,
             declared: false,
+                ..Default::default()
         });
         s.steps.push(SeqStep::Message {
             index: 1,
@@ -2526,6 +2570,7 @@ mod tests {
             label: "orphan".into(),
             members: vec!["A".into()],
             parent: Some(9),
+                ..Default::default()
         });
         cases.push(Diagram::Graph(g));
 

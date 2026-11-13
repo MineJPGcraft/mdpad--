@@ -10,6 +10,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::gfx::Rgba;
+
 /// Which diagram family a parsed document belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DiagramKind {
@@ -124,6 +126,12 @@ pub struct Node {
     pub compartments: Vec<Vec<String>>,
     /// Index into [`Graph::clusters`] when the node belongs to a subgraph.
     pub cluster: Option<usize>,
+    /// Explicit colours from `classDef` / `style` / `#colour` suffixes.
+    pub fill: Option<Rgba>,
+    pub stroke: Option<Rgba>,
+    pub text_color: Option<Rgba>,
+    /// `stroke-width:2px`, in points.
+    pub stroke_width: Option<f32>,
 }
 
 impl Node {
@@ -136,6 +144,10 @@ impl Node {
             style: NodeStyle::Default,
             compartments: Vec::new(),
             cluster: None,
+            fill: None,
+            stroke: None,
+            text_color: None,
+            stroke_width: None,
         }
     }
 
@@ -190,6 +202,10 @@ pub struct Edge {
     pub line: LineStyle,
     /// Extra margin for edge labels, in points.
     pub label_pad: f32,
+    /// `linkStyle ... stroke:#f00`.
+    pub color: Option<Rgba>,
+    /// `linkStyle ... stroke-width:3px`, in points.
+    pub width: Option<f32>,
 }
 
 impl Edge {
@@ -202,17 +218,37 @@ impl Edge {
             tail: Arrow::None,
             line: LineStyle::Solid,
             label_pad: 0.0,
+            color: None,
+            width: None,
         }
     }
 }
 
 /// A `subgraph` / `package` / `namespace` grouping.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Cluster {
     pub id: String,
     pub label: String,
     pub members: Vec<String>,
     pub parent: Option<usize>,
+    /// `style subgraphId fill:#f9f`.
+    pub fill: Option<Rgba>,
+    pub stroke: Option<Rgba>,
+    pub text_color: Option<Rgba>,
+}
+
+impl Cluster {
+    pub fn new(id: impl Into<String>, label: impl Into<String>, parent: Option<usize>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            members: Vec::new(),
+            parent,
+            fill: None,
+            stroke: None,
+            text_color: None,
+        }
+    }
 }
 
 /// Flowchart / class / state / ER documents.
@@ -252,9 +288,10 @@ impl Graph {
 // Sequence diagrams
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ParticipantKind {
     /// Plain box with a name.
+    #[default]
     Default,
     /// Stick-figure `actor`.
     Actor,
@@ -268,13 +305,30 @@ pub enum ParticipantKind {
     Queue,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Participant {
     pub id: String,
     pub label: String,
     pub kind: ParticipantKind,
     /// `true` when declared with an explicit `participant` statement.
     pub declared: bool,
+    /// Explicit colours (`participant A #red`, `skinparam`).
+    pub fill: Option<Rgba>,
+    pub stroke: Option<Rgba>,
+}
+
+impl Participant {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        let id = id.into();
+        Self {
+            label: label.into(),
+            id,
+            kind: ParticipantKind::Default,
+            declared: false,
+            fill: None,
+            stroke: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -353,12 +407,7 @@ impl Sequence {
         if let Some(idx) = self.participants.iter().position(|p| p.id == id) {
             &mut self.participants[idx]
         } else {
-            self.participants.push(Participant {
-                id: id.to_owned(),
-                label: id.to_owned(),
-                kind: ParticipantKind::Default,
-                declared: false,
-            });
+            self.participants.push(Participant::new(id, id));
             self.participants.last_mut().expect("just pushed")
         }
     }
@@ -465,6 +514,166 @@ pub const SERIES_PALETTE: [u32; 10] = [
 
 pub fn series_color(index: usize) -> crate::gfx::Rgba {
     crate::gfx::Rgba::hex(SERIES_PALETTE[index % SERIES_PALETTE.len()])
+}
+
+// ---------------------------------------------------------------------------
+// Colours
+// ---------------------------------------------------------------------------
+
+/// Parse a colour literal written in a diagram source.
+///
+/// Both front-ends share this: Mermaid writes CSS-ish values (`fill:#f9f`,
+/// `stroke:rgb(20,30,40)`), PlantUML writes `#lightblue` or a bare colour name.
+/// Anything unrecognised returns `None` so the theme default stays in charge.
+pub fn parse_color(raw: &str) -> Option<Rgba> {
+    let s = raw.trim().trim_matches('"').trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower == "transparent" {
+        return Some(Rgba::TRANSPARENT);
+    }
+    if let Some(hex) = s.strip_prefix('#') {
+        let digits: Vec<u8> = hex
+            .chars()
+            .filter_map(|c| c.to_digit(16).map(|d| d as u8))
+            .collect();
+        return match digits.len() {
+            3 => Some(Rgba::new(
+                digits[0] * 17,
+                digits[1] * 17,
+                digits[2] * 17,
+                255,
+            )),
+            4 => Some(Rgba::new(
+                digits[0] * 17,
+                digits[1] * 17,
+                digits[2] * 17,
+                digits[3] * 17,
+            )),
+            6 => Some(Rgba::new(
+                digits[0] * 16 + digits[1],
+                digits[2] * 16 + digits[3],
+                digits[4] * 16 + digits[5],
+                255,
+            )),
+            8 => Some(Rgba::new(
+                digits[0] * 16 + digits[1],
+                digits[2] * 16 + digits[3],
+                digits[4] * 16 + digits[5],
+                digits[6] * 16 + digits[7],
+            )),
+            _ => None,
+        };
+    }
+    for prefix in ["rgba(", "rgb("] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let body = rest.trim_end_matches(')');
+            let parts: Vec<f32> = body
+                .split(',')
+                .filter_map(|p| p.trim().parse::<f32>().ok())
+                .collect();
+            if parts.len() >= 3 {
+                let ch = |v: f32| v.clamp(0.0, 255.0).round() as u8;
+                let a = parts
+                    .get(3)
+                    .map(|v| {
+                        // `rgba(0,0,0,0.5)` writes alpha as a fraction.
+                        let v = if *v <= 1.0 { *v * 255.0 } else { *v };
+                        ch(v)
+                    })
+                    .unwrap_or(255);
+                return Some(Rgba::new(ch(parts[0]), ch(parts[1]), ch(parts[2]), a));
+            }
+        }
+    }
+    let rgb = match lower.as_str() {
+        "black" => 0x000000,
+        "white" => 0xFFFF_FF,
+        "red" => 0xFF_0000,
+        "green" => 0x00_8000,
+        "lime" => 0x00_FF00,
+        "blue" => 0x00_00FF,
+        "yellow" => 0xFF_FF00,
+        "orange" => 0xFF_A5_00,
+        "purple" => 0x80_0080,
+        "violet" => 0xEE_82EE,
+        "indigo" => 0x4B_0082,
+        "brown" => 0xA5_2A2A,
+        "pink" => 0xFF_C0CB,
+        "cyan" | "aqua" => 0x00_FFFF,
+        "magenta" | "fuchsia" => 0xFF_00FF,
+        "olive" => 0x80_8000,
+        "navy" => 0x00_0080,
+        "teal" => 0x00_8080,
+        "silver" => 0xC0_C0C0,
+        "maroon" => 0x80_0000,
+        "gray" | "grey" => 0x80_8080,
+        "lightgray" | "lightgrey" => 0xD3_D3D3,
+        "darkgray" | "darkgrey" => 0xA9_A9A9,
+        "lightblue" => 0xAD_D8E6,
+        "darkblue" => 0x00_008B,
+        "lightgreen" => 0x90_EE90,
+        "darkgreen" => 0x00_6400,
+        "lightyellow" => 0xFF_FFE0,
+        "lightcyan" => 0xE0_FFFF,
+        "lightpink" => 0xFF_B6C1,
+        "lightsalmon" => 0xFF_A07A,
+        "lightsteelblue" => 0xB0_C4DE,
+        "lightseagreen" => 0x20_B2AA,
+        "lightcoral" => 0xF0_8080,
+        "skyblue" => 0x87_CEEB,
+        "steelblue" => 0x46_82B4,
+        "royalblue" => 0x41_69E1,
+        "dodgerblue" => 0x1E_90FF,
+        "cornflowerblue" => 0x64_95ED,
+        "palegreen" => 0x98_FB98,
+        "paleturquoise" => 0xAF_EEEE,
+        "powderblue" => 0xB0_E0E6,
+        "gold" => 0xFF_D700,
+        "goldenrod" => 0xDA_A520,
+        "coral" => 0xFF_7F50,
+        "salmon" => 0xFA_8072,
+        "tomato" => 0xFF_6347,
+        "khaki" => 0xF0_E68C,
+        "wheat" => 0xF5_DEB3,
+        "beige" => 0xF5_F5DC,
+        "ivory" => 0xFF_FFF0,
+        "lavender" => 0xE6_E6FA,
+        "plum" => 0xDD_A0DD,
+        "orchid" => 0xDA_70D6,
+        "thistle" => 0xD8_BFD8,
+        "turquoise" => 0x40_E0D0,
+        "tan" => 0xD2_B48C,
+        "crimson" => 0xDC_143C,
+        "firebrick" => 0xB2_2222,
+        "darkred" => 0x8B_0000,
+        "darkorange" => 0xFF_8C00,
+        "darkkhaki" => 0xBD_B76B,
+        "darkseagreen" => 0x8F_BC8F,
+        "midnightblue" => 0x19_1970,
+        "slategray" | "slategrey" => 0x70_8090,
+        "seagreen" => 0x2E_8B57,
+        "forestgreen" => 0x22_8B22,
+        "yellowgreen" => 0x9A_CD32,
+        "chartreuse" => 0x7F_FF00,
+        "springgreen" => 0x00_FF7F,
+        "azure" => 0xF0_FFFF,
+        "aliceblue" => 0xF0_F8FF,
+        "ghostwhite" => 0xF8_F8FF,
+        "snow" => 0xFF_FAFA,
+        "linen" => 0xFA_F0E6,
+        "bisque" => 0xFF_E4C4,
+        "moccasin" => 0xFF_E4B5,
+        "peachpuff" => 0xFF_DAB9,
+        "mistyrose" => 0xFF_E4E1,
+        "honeydew" => 0xF0_FFF0,
+        "mintcream" => 0xF5_FFFA,
+        "oldlace" => 0xFD_F5E6,
+        _ => return None,
+    };
+    Some(Rgba::hex(rgb))
 }
 
 /// Ordered map used by parsers that need insertion-ordered unique keys.

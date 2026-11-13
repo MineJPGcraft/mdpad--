@@ -24,7 +24,9 @@ use std::collections::BTreeSet;
 use crate::diagram::model::{
     Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Graph, GroupKind, LineStyle, Node,
     NodeShape, NodeStyle, NotePosition, ParticipantKind, Pie, SeqStep, Sequence, Slice,
+    parse_color,
 };
+use crate::gfx::Rgba;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -453,6 +455,130 @@ fn looks_like_edge(s: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Style properties (`classDef`, `style`, `linkStyle`)
+// ---------------------------------------------------------------------------
+
+/// `fill:#f9f,stroke:#333,stroke-width:2px,color:#fff` as an incremental patch.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StyleProps {
+    fill: Option<Rgba>,
+    stroke: Option<Rgba>,
+    text: Option<Rgba>,
+    width: Option<f32>,
+    dashed: Option<bool>,
+}
+
+impl StyleProps {
+    fn parse(body: &str) -> Self {
+        let mut p = Self::default();
+        for part in split_top_level(body, ',') {
+            let Some((key, value)) = part.split_once(':') else {
+                continue;
+            };
+            let key = key.trim().to_ascii_lowercase();
+            let value = value.trim();
+            match key.as_str() {
+                "fill" | "background" | "background-color" | "bgcolor" => {
+                    p.fill = parse_color(value)
+                }
+                "stroke" | "border-color" | "bordercolor" => p.stroke = parse_color(value),
+                "color" | "text-color" | "font-color" => p.text = parse_color(value),
+                "stroke-width" | "line-width" | "border-width" => p.width = parse_px(value),
+                "stroke-dasharray" => {
+                    p.dashed = Some(!(value.is_empty() || value == "0" || value == "none"));
+                }
+                // Everything else (`font-weight`, `rx`, `ry`, `opacity`) has no
+                // counterpart in the flat IR and is deliberately ignored.
+                _ => {}
+            }
+        }
+        p
+    }
+
+    /// Later declarations win, field by field.
+    fn merge(&mut self, other: &Self) {
+        if other.fill.is_some() {
+            self.fill = other.fill;
+        }
+        if other.stroke.is_some() {
+            self.stroke = other.stroke;
+        }
+        if other.text.is_some() {
+            self.text = other.text;
+        }
+        if other.width.is_some() {
+            self.width = other.width;
+        }
+        if other.dashed.is_some() {
+            self.dashed = other.dashed;
+        }
+    }
+
+    fn apply_node(&self, node: &mut Node) {
+        if self.fill.is_some() {
+            node.fill = self.fill;
+        }
+        if self.stroke.is_some() {
+            node.stroke = self.stroke;
+        }
+        if self.text.is_some() {
+            node.text_color = self.text;
+        }
+        if self.width.is_some() {
+            node.stroke_width = self.width;
+        }
+    }
+
+    fn apply_cluster(&self, cluster: &mut Cluster) {
+        if self.fill.is_some() {
+            cluster.fill = self.fill;
+        }
+        if self.stroke.is_some() {
+            cluster.stroke = self.stroke;
+        }
+        if self.text.is_some() {
+            cluster.text_color = self.text;
+        }
+    }
+
+    fn apply_edge(&self, edge: &mut Edge) {
+        if self.fill.is_some() {
+            edge.color = self.fill;
+        }
+        if self.stroke.is_some() {
+            edge.color = self.stroke;
+        }
+        if self.text.is_some() {
+            // A coloured edge label is painted with the label pill's own colour
+            // in this renderer, so the text colour rides along with the stroke.
+            edge.color = edge.color.or(self.text);
+        }
+        if self.width.is_some() {
+            edge.width = self.width;
+        }
+        if self.dashed == Some(true) {
+            edge.line = LineStyle::Dashed;
+        }
+    }
+}
+
+/// `2px`, `1.5` and `3` all mean points in this renderer.
+fn parse_px(raw: &str) -> Option<f32> {
+    let t = raw.trim().trim_end_matches("px").trim();
+    t.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// One deferred styling statement, applied after the body is parsed.
+enum StyleDirective {
+    /// `class A,B name` and `A:::name`: node ids plus the class names to use.
+    Classes(Vec<String>, Vec<String>),
+    /// `style target fill:...`, where `target` may be a node *or* a subgraph id.
+    Inline(String, StyleProps),
+    /// `linkStyle 0,2 ...`; `None` means the `default` form.
+    Links(Option<Vec<usize>>, StyleProps),
+}
+
+// ---------------------------------------------------------------------------
 // Flowchart
 // ---------------------------------------------------------------------------
 
@@ -462,6 +588,8 @@ struct PendingNode {
     shape: Option<NodeShape>,
     label: Option<String>,
     warn: Option<String>,
+    /// `A:::className` class suffixes.
+    classes: Vec<String>,
 }
 
 /// A parsed link token together with how many characters it spans.
@@ -479,6 +607,10 @@ struct FlowParser {
     /// Indices of currently open subgraphs, innermost last.
     stack: Vec<usize>,
     auto: usize,
+    /// `classDef name prop:value,...` definitions, in source order.
+    class_defs: Vec<(String, StyleProps)>,
+    /// Styling statements deferred until the body (and its nodes) exists.
+    directives: Vec<StyleDirective>,
 }
 
 /// Build a flowchart-style graph. `kind` is `None` for the unrecognised-header
@@ -499,10 +631,13 @@ fn flowchart_graph(
         notes: Notes::default(),
         stack: Vec::new(),
         auto: 0,
+        class_defs: Vec::new(),
+        directives: Vec::new(),
     };
     for line in lines {
         parser.stmt(line);
     }
+    parser.apply_directives();
     let warnings = parser.notes.into_vec();
     parser.graph.warnings = warnings;
     parser.graph
@@ -533,13 +668,178 @@ impl FlowParser {
                 }
                 return;
             }
-            "classdef" | "class" | "style" | "linkstyle" | "click" => {
-                self.notes.warn(format!("ignored directive: {word}"));
+            "classdef" => {
+                self.class_def(after_first_word(t));
+                return;
+            }
+            "class" => {
+                self.class_assign(after_first_word(t));
+                return;
+            }
+            "style" => {
+                self.style_stmt(after_first_word(t));
+                return;
+            }
+            "linkstyle" => {
+                self.link_style(after_first_word(t));
+                return;
+            }
+            "click" | "acctitle" | "accdescr" | "acc_title" | "acc_descr" => {
+                // Accessibility text and click handlers have no visual effect in
+                // this renderer; nothing to warn about.
                 return;
             }
             _ => {}
         }
         self.edge_stmt(t);
+    }
+
+    // -- styling directives -------------------------------------------------
+
+    /// `classDef important fill:#f9f,stroke:#333,stroke-width:4px`
+    fn class_def(&mut self, rest: &str) {
+        let (names, props) = split_word(rest);
+        if names.is_empty() {
+            self.notes.warn("classDef 缺少类名".to_owned());
+            return;
+        }
+        let props = StyleProps::parse(props);
+        for name in names.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            // A later definition of the same class replaces the earlier one.
+            match self.class_defs.iter_mut().find(|(n, _)| n == name) {
+                Some(slot) => slot.1 = props.clone(),
+                None => self.class_defs.push((name.to_owned(), props.clone())),
+            }
+        }
+    }
+
+    /// `class A,B important` — attach one or more classes to existing nodes.
+    fn class_assign(&mut self, rest: &str) {
+        let rest = rest.trim();
+        let Some((ids, names)) = rest.rsplit_once(char::is_whitespace) else {
+            self.notes.warn(format!("class 语句缺少类名: {rest}"));
+            return;
+        };
+        let ids: Vec<String> = ids
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let names: Vec<String> = names
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.is_empty() || names.is_empty() {
+            self.notes.warn(format!("class 语句不完整: {rest}"));
+            return;
+        }
+        self.directives.push(StyleDirective::Classes(ids, names));
+    }
+
+    /// `style A fill:#f9f,stroke:#333` (`A` may also be a subgraph id).
+    fn style_stmt(&mut self, rest: &str) {
+        let (target, props) = split_word(rest);
+        let target = strip_quotes(target);
+        if target.is_empty() {
+            self.notes.warn("style 缺少目标".to_owned());
+            return;
+        }
+        self.directives
+            .push(StyleDirective::Inline(target, StyleProps::parse(props)));
+    }
+
+    /// `linkStyle 0,1 stroke:#f00` or `linkStyle default stroke:#f00`.
+    fn link_style(&mut self, rest: &str) {
+        let (head, props) = split_word(rest);
+        let props = StyleProps::parse(props);
+        let indices = if head.eq_ignore_ascii_case("default") {
+            None
+        } else {
+            let list: Vec<usize> = head
+                .split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .collect();
+            if list.is_empty() {
+                self.notes.warn(format!("linkStyle 缺少连线下标: {head}"));
+                return;
+            }
+            Some(list)
+        };
+        self.directives.push(StyleDirective::Links(indices, props));
+    }
+
+    /// Apply every deferred styling statement now that the nodes exist.
+    fn apply_directives(&mut self) {
+        let directives = std::mem::take(&mut self.directives);
+        for directive in directives {
+            match directive {
+                StyleDirective::Classes(ids, names) => {
+                    let mut props = StyleProps::default();
+                    let mut known = false;
+                    for name in &names {
+                        match self.class_defs.iter().find(|(n, _)| n == name) {
+                            Some((_, p)) => {
+                                props.merge(p);
+                                known = true;
+                            }
+                            None => self.notes.warn(format!("未定义的 classDef: {name}")),
+                        }
+                    }
+                    if !known {
+                        continue;
+                    }
+                    for id in ids {
+                        match self.graph.index_of(&id) {
+                            Some(idx) => props.apply_node(&mut self.graph.nodes[idx]),
+                            None => self.notes.warn(format!("class 目标不存在: {id}")),
+                        }
+                    }
+                }
+                StyleDirective::Inline(target, props) => {
+                    if let Some(idx) = self.graph.index_of(&target) {
+                        props.apply_node(&mut self.graph.nodes[idx]);
+                    } else if let Some(ci) =
+                        self.graph.clusters.iter().position(|c| c.id == target)
+                    {
+                        props.apply_cluster(&mut self.graph.clusters[ci]);
+                    } else {
+                        self.notes.warn(format!("style 目标不存在: {target}"));
+                    }
+                }
+                StyleDirective::Links(indices, props) => match indices {
+                    None => {
+                        for edge in &mut self.graph.edges {
+                            props.apply_edge(edge);
+                        }
+                    }
+                    Some(list) => {
+                        for i in list {
+                            match self.graph.edges.get_mut(i) {
+                                Some(edge) => props.apply_edge(edge),
+                                None => self
+                                    .notes
+                                    .warn(format!("linkStyle 下标越界: {i}")),
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        // `classDef default` styles everything that no class claimed.
+        if let Some((_, props)) = self.class_defs.iter().find(|(n, _)| n == "default") {
+            let props = props.clone();
+            for node in &mut self.graph.nodes {
+                if node.fill.is_none() && node.stroke.is_none() && node.text_color.is_none() {
+                    props.apply_node(node);
+                }
+            }
+        }
     }
 
     fn push_subgraph(&mut self, spec: &str) {
@@ -554,6 +854,7 @@ impl FlowParser {
             label,
             members: Vec::new(),
             parent,
+                ..Default::default()
         });
         self.stack.push(idx);
     }
@@ -644,6 +945,12 @@ impl FlowParser {
         if let Some(w) = &p.warn {
             self.notes.warn(w.clone());
         }
+        if !p.classes.is_empty() {
+            self.directives.push(StyleDirective::Classes(
+                vec![p.id.clone()],
+                p.classes.clone(),
+            ));
+        }
         let idx = match self.graph.index_of(&p.id) {
             Some(i) => i,
             None => {
@@ -721,6 +1028,7 @@ fn parse_node(cur: &mut Cur) -> Option<PendingNode> {
         shape: None,
         label: None,
         warn: None,
+        classes: Vec::new(),
     };
 
     if cur.starts_with("@{") {
@@ -750,11 +1058,15 @@ fn parse_node(cur: &mut Cur) -> Option<PendingNode> {
         pending.label = Some(clean_label(&inner));
     }
 
-    // `:::class` suffixes are parsed and discarded.
+    // `:::class` attaches a `classDef` style to this node.
     while cur.starts_with(":::") || cur.starts_with("::") {
         let skip = if cur.starts_with(":::") { 3 } else { 2 };
         cur.advance(skip);
-        let _ = read_id(cur);
+        let name = read_id(cur);
+        let name = name.trim().to_owned();
+        if !name.is_empty() {
+            pending.classes.push(name);
+        }
     }
     Some(pending)
 }
@@ -1980,6 +2292,7 @@ fn push_cluster(graph: &mut Graph, stack: &mut Vec<usize>, id: &str, label: &str
         label: label.to_owned(),
         members: Vec::new(),
         parent,
+            ..Default::default()
     });
     stack.push(idx);
 }
@@ -2002,7 +2315,6 @@ mod tests {
             other => panic!("expected a graph, got {other:?}"),
         }
     }
-
     fn sequence(src: &str) -> Sequence {
         match parse(src) {
             Diagram::Sequence(s) => s,
@@ -2382,5 +2694,75 @@ mod tests {
             let _ = diagram.title();
             let _ = diagram.kind();
         }
+    }
+    // -- styling directives -------------------------------------------------
+
+    #[test]
+    fn classdef_class_style_and_linkstyle_paint_the_graph() {
+        let g = graph(
+            "flowchart TD\n\
+             \x20 A[开始]:::hot --> B[中间]\n\
+             \x20 B --> C[结束]\n\
+             \x20 classDef hot fill:#f9f,stroke:#333,stroke-width:3px,color:#fff\n\
+             \x20 class B hot\n\
+             \x20 style C fill:#0f0\n\
+             \x20 linkStyle 0 stroke:#f00,stroke-width:2px",
+        );
+        let a = g.node("A").expect("A");
+        assert_eq!(a.fill, parse_color("#f9f"));
+        assert_eq!(a.stroke, parse_color("#333"));
+        assert_eq!(a.text_color, parse_color("#fff"));
+        assert_eq!(a.stroke_width, Some(3.0));
+
+        let b = g.node("B").expect("B");
+        assert_eq!(b.fill, parse_color("#f9f"), "class B hot 应生效");
+
+        let c = g.node("C").expect("C");
+        assert_eq!(c.fill, parse_color("#0f0"), "style 应覆盖表主题");
+
+        assert_eq!(g.edges[0].color, parse_color("#f00"));
+        assert_eq!(g.edges[0].width, Some(2.0));
+        assert!(g.edges[1].color.is_none(), "未指定的连线保持主题色");
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    }
+
+    #[test]
+    fn linkstyle_default_paints_every_edge() {
+        let g = graph("flowchart LR\n a --> b\n b --> c\n linkStyle default stroke:#123456");
+        assert!(g.edges.iter().all(|e| e.color == parse_color("#123456")));
+    }
+
+    #[test]
+    fn classdef_default_fills_unstyled_nodes() {
+        let g = graph("flowchart TD\n a --> b\n classDef default fill:#abc");
+        assert!(g.nodes.iter().all(|n| n.fill == parse_color("#abc")));
+    }
+
+    #[test]
+    fn subgraph_style_colours_the_cluster() {
+        let g = graph(
+            "flowchart TD\n\
+             \x20 subgraph S1[组一]\n\
+             \x20 a --> b\n\
+             \x20 end\n\
+             \x20 style S1 fill:#ff0,stroke:#333",
+        );
+        let cluster = g.clusters.first().expect("cluster");
+        assert_eq!(cluster.fill, parse_color("#ff0"));
+        assert_eq!(cluster.stroke, parse_color("#333"));
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    }
+
+    #[test]
+    fn unknown_style_target_warns_instead_of_failing() {
+        let g = graph("flowchart TD\n a --> b\n style ghost fill:#f00\n class a nope");
+        assert!(g.warnings.iter().any(|w| w.contains("ghost")));
+        assert!(g.warnings.iter().any(|w| w.contains("nope")));
+    }
+
+    #[test]
+    fn stroke_dasharray_makes_the_edge_dashed() {
+        let g = graph("flowchart LR\n a --> b\n linkStyle 0 stroke-dasharray: 5 5");
+        assert_eq!(g.edges[0].line, LineStyle::Dashed);
     }
 }

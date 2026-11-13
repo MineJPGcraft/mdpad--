@@ -20,9 +20,11 @@
 //! ```
 
 use crate::diagram::model::{
-    Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Graph, GroupKind, LineStyle, NodeShape,
-    NodeStyle, NotePosition, ParticipantKind, SeqStep, Sequence,
+    Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Graph, GroupKind, LineStyle, Node,
+    NodeShape, NodeStyle, NotePosition, ParticipantKind, SeqStep, Sequence,
+    parse_color,
 };
+use crate::gfx::Rgba;
 
 /// Parse PlantUML source into the renderer-agnostic IR. Never panics.
 ///
@@ -31,9 +33,10 @@ use crate::diagram::model::{
 /// partially-typed diagram is still useful to look at.
 pub fn parse(src: &str) -> Diagram {
     let mut lines = collect_lines(src);
-    let pre = extract_preamble(&mut lines);
+    let mut pre = extract_preamble(&mut lines);
+    pre.skin.resolve();
 
-    match detect_type(&lines) {
+    let mut diagram = match detect_type(&lines) {
         Some(DiagramKind::Sequence) => Diagram::Sequence(parse_sequence(&lines, &pre)),
         Some(DiagramKind::Class) => Diagram::Graph(parse_class(&lines, &pre)),
         Some(DiagramKind::State) => Diagram::Graph(parse_state(&lines, &pre)),
@@ -41,7 +44,13 @@ pub fn parse(src: &str) -> Diagram {
         Some(DiagramKind::Flowchart) => Diagram::Graph(parse_flow(&lines, &pre)),
         // `Pie` never comes out of detection; keep the match total anyway.
         Some(DiagramKind::Pie) | None => Diagram::Graph(parse_fallback(&lines, &pre)),
+    };
+    match &mut diagram {
+        Diagram::Graph(g) => apply_skin(g, &pre.skin),
+        Diagram::Sequence(s) => apply_skin_sequence(s, &pre.skin),
+        Diagram::Pie(_) => {}
     }
+    diagram
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +137,110 @@ fn collect_lines(src: &str) -> Vec<Line> {
 struct Preamble {
     title: Option<String>,
     direction: Direction,
+    skin: Skin,
+}
+
+/// Colours resolved from `skinparam` statements.
+///
+/// PlantUML's skin vocabulary is enormous and mostly about spacing and stroke
+/// details this renderer does not model, so only the colour families are kept:
+/// element background / border / font, package (cluster) background / border and
+/// arrow colour. Statements are collected raw and resolved in one pass at the
+/// end, which makes the result independent of where they appear.
+#[derive(Default)]
+struct Skin {
+    fill: Option<Rgba>,
+    stroke: Option<Rgba>,
+    text: Option<Rgba>,
+    cluster_fill: Option<Rgba>,
+    cluster_stroke: Option<Rgba>,
+    edge: Option<Rgba>,
+    raw: Vec<(String, String)>,
+}
+
+impl Skin {
+    fn add(&mut self, key: &str, value: &str) {
+        let key = key.trim().to_ascii_lowercase().replace([' ', '-', '_'], "");
+        let value = value.trim().to_owned();
+        if key.is_empty() || value.is_empty() {
+            return;
+        }
+        self.raw.push((key, value));
+    }
+
+    fn resolve(&mut self) {
+        for (key, value) in std::mem::take(&mut self.raw) {
+            let Some(color) = parse_color(&value) else {
+                continue;
+            };
+            let cluster = key.contains("package")
+                || key.contains("cluster")
+                || key.contains("group")
+                || key.contains("folder");
+            if key.ends_with("backgroundcolor") {
+                if cluster {
+                    self.cluster_fill = Some(color);
+                } else {
+                    self.fill = Some(color);
+                }
+            } else if key.ends_with("bordercolor") || key.ends_with("linecolor") {
+                if cluster {
+                    self.cluster_stroke = Some(color);
+                } else {
+                    self.stroke = Some(color);
+                }
+            } else if key.ends_with("arrowcolor") || key.ends_with("arrowfontcolor") {
+                self.edge = Some(color);
+            } else if key.ends_with("fontcolor") || key.ends_with("textcolor") {
+                self.text = Some(color);
+            }
+        }
+    }
+
+    /// Explicit per-element colours always win over the skin.
+    fn paint_node(&self, node: &mut Node) {
+        if node.fill.is_none() {
+            node.fill = self.fill;
+        }
+        if node.stroke.is_none() {
+            node.stroke = self.stroke;
+        }
+        if node.text_color.is_none() {
+            node.text_color = self.text;
+        }
+    }
+}
+
+/// Apply resolved skin colours to a graph without overwriting element colours.
+fn apply_skin(graph: &mut Graph, skin: &Skin) {
+    for node in &mut graph.nodes {
+        skin.paint_node(node);
+    }
+    for cluster in &mut graph.clusters {
+        if cluster.fill.is_none() {
+            cluster.fill = skin.cluster_fill;
+        }
+        if cluster.stroke.is_none() {
+            cluster.stroke = skin.cluster_stroke;
+        }
+    }
+    for edge in &mut graph.edges {
+        if edge.color.is_none() {
+            edge.color = skin.edge;
+        }
+    }
+}
+
+/// Apply resolved skin colours to a sequence diagram.
+fn apply_skin_sequence(seq: &mut Sequence, skin: &Skin) {
+    for p in &mut seq.participants {
+        if p.fill.is_none() {
+            p.fill = skin.fill;
+        }
+        if p.stroke.is_none() {
+            p.stroke = skin.stroke;
+        }
+    }
 }
 
 /// Remove optional `@startuml` / `@enduml` delimiters, styling directives and
@@ -144,10 +257,21 @@ fn extract_preamble(lines: &mut Vec<Line>) -> Preamble {
 
     let mut out = Vec::with_capacity(lines.len());
     let mut in_legend = false;
+    // `skinparam class { BackgroundColor #red }` block form.
+    let mut skin_block: Option<String> = None;
 
     for line in lines.drain(..) {
         let t = line.text.trim();
 
+        if let Some(prefix) = skin_block.clone() {
+            if t == "}" {
+                skin_block = None;
+                continue;
+            }
+            let (key, value) = split_first_word(t);
+            pre.skin.add(&format!("{prefix}{key}"), value);
+            continue;
+        }
         if in_legend {
             if t.starts_with("endlegend") || t == "end legend" {
                 in_legend = false;
@@ -155,6 +279,16 @@ fn extract_preamble(lines: &mut Vec<Line>) -> Preamble {
             continue;
         }
         if t.starts_with("@startuml") || t.starts_with("@enduml") {
+            continue;
+        }
+        if let Some(rest) = after_keyword(t, "skinparam") {
+            let rest = rest.trim();
+            if let Some(prefix) = rest.strip_suffix('{') {
+                skin_block = Some(prefix.trim().to_ascii_lowercase());
+            } else {
+                let (key, value) = split_first_word(rest);
+                pre.skin.add(key, value);
+            }
             continue;
         }
         if t == "left to right direction" {
@@ -1181,6 +1315,7 @@ fn handle_class_line(
             label,
             members: Vec::new(),
             parent: cur,
+                ..Default::default()
         });
         let body_follows = !matches!(after, Some(a) if a.contains('}'));
         if body_follows {
@@ -1389,6 +1524,7 @@ fn handle_state_line(
                 label,
                 members: Vec::new(),
                 parent: cur,
+                    ..Default::default()
             });
             if !after.trim().contains('}') {
                 ctx.stack.push(cidx);
@@ -1528,6 +1664,7 @@ fn handle_flow_line(
             label,
             members: Vec::new(),
             parent: cur,
+                ..Default::default()
         });
         if !matches!(after, Some(a) if a.contains('}')) {
             stack.push(idx);
@@ -1759,6 +1896,7 @@ fn parse_fallback(lines: &[Line], pre: &Preamble) -> Graph {
 #[cfg(test)]
 mod tests {
     use super::parse;
+    use crate::diagram::model::parse_color;
     use crate::diagram::model::{
         Arrow, Diagram, DiagramKind, Direction, Graph, GroupKind, LineStyle, NodeShape, NodeStyle,
         ParticipantKind, SeqStep, Sequence,
@@ -2346,4 +2484,79 @@ class A
             _ => unreachable!(),
         }
     }
+    // -- skinparam ----------------------------------------------------------
+
+    #[test]
+    fn skinparam_colours_reach_the_ir() {
+        let d = parse(
+            "@startuml\n\
+             skinparam classBackgroundColor #ffcc00\n\
+             skinparam classBorderColor #333333\n\
+             class A\n\
+             class B\n\
+             @enduml",
+        );
+        let g = as_graph(&d);
+        assert_eq!(g.nodes.len(), 2);
+        for n in &g.nodes {
+            assert_eq!(n.fill, parse_color("#ffcc00"), "{}", n.id);
+            assert_eq!(n.stroke, parse_color("#333333"), "{}", n.id);
+        }
+    }
+
+    #[test]
+    fn skinparam_block_form_is_understood() {
+        let d = parse(
+            "@startuml\n\
+             skinparam class {\n\
+             \x20 BackgroundColor lightblue\n\
+             \x20 BorderColor black\n\
+             }\n\
+             class A\n\
+             @enduml",
+        );
+        let g = as_graph(&d);
+        assert_eq!(g.nodes[0].fill, parse_color("lightblue"));
+        assert_eq!(g.nodes[0].stroke, parse_color("black"));
+    }
+
+    #[test]
+    fn skinparam_paints_sequence_participants() {
+        let d = parse(
+            "@startuml\n\
+             skinparam participantBackgroundColor #ffddaa\n\
+             A -> B : hi\n\
+             @enduml",
+        );
+        let s = as_seq(&d);
+        assert_eq!(s.participants.len(), 2);
+        assert!(s.participants.iter().all(|p| p.fill == parse_color("#ffddaa")));
+    }
+
+    #[test]
+    fn skinparam_paints_packages_and_arrows() {
+        let d = parse(
+            "@startuml\n\
+             skinparam packageBackgroundColor #eef\n\
+             skinparam arrowColor #0a0\n\
+             package P {\n\
+             class A\n\
+             }\n\
+             A --> B\n\
+             @enduml",
+        );
+        let g = as_graph(&d);
+        assert_eq!(g.clusters.len(), 1);
+        assert_eq!(g.clusters[0].fill, parse_color("#eef"));
+        assert!(g.edges.iter().all(|e| e.color == parse_color("#0a0")));
+    }
+
+    #[test]
+    fn unknown_skinparam_values_are_ignored() {
+        let d = parse("@startuml\nskinparam classBackgroundColor notacolour\nclass A\n@enduml");
+        let g = as_graph(&d);
+        assert!(g.nodes[0].fill.is_none());
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    }
 }
+
