@@ -26,8 +26,9 @@ use std::f32::consts::PI;
 
 use super::{draw, DiagramTheme};
 use crate::diagram::model::{
-    series_color, Arrow, Diagram, Direction, Edge, Graph, GroupKind, LineStyle, Node, NodeShape,
-    NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
+    series_color, Arrow, Diagram, Direction, Edge, Gantt, Graph, GroupKind, LineStyle, Node,
+    NodeShape, NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
+    Task, days_from_civil, format_day,
 };
 use crate::gfx::{Anchor, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -85,6 +86,7 @@ pub fn layout(
         Diagram::Graph(g) => layout_graph(g, diagram, &ctx),
         Diagram::Sequence(s) => layout_sequence(s, diagram, &ctx),
         Diagram::Pie(p) => layout_pie(p, diagram, &ctx),
+        Diagram::Gantt(g) => layout_gantt(g, diagram, &ctx),
     }
 }
 
@@ -1311,6 +1313,207 @@ fn self_loop(node: Rect, e: &Edge, ctx: &Ctx) -> Vec<Prim> {
         out.extend(label_pill(label, center, ctx));
     }
     out
+}
+
+
+// ===========================================================================
+// Gantt charts
+// ===========================================================================
+
+/// Day steps the axis is allowed to use, coarsest first, so the tick count stays
+/// readable instead of turning into a grey smear.
+const GANTT_STEPS: [f32; 10] = [1.0, 2.0, 7.0, 14.0, 30.0, 60.0, 91.0, 182.0, 365.0, 730.0];
+
+/// A single bar's colours, derived from the theme plus the task's own tags.
+fn gantt_bar_colors(task: &Task, ctx: &Ctx) -> (Rgba, Rgba) {
+    let accent = ctx.theme.accent;
+    if task.crit {
+        return (Rgba::hex(0xE5_5757).lerp(accent, 0.15), Rgba::hex(0xB0_2A2A));
+    }
+    if task.milestone {
+        return (accent, accent.fade(0.7));
+    }
+    let fill = if task.done {
+        accent.lerp(ctx.theme.node_fill, 0.55)
+    } else if task.active {
+        accent
+    } else {
+        accent.lerp(ctx.theme.node_fill, 0.25)
+    };
+    (fill, accent.fade(0.85))
+}
+
+/// `gantt` — task rows over a shared time axis.
+fn layout_gantt(gantt: &Gantt, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    if gantt.tasks.is_empty() {
+        push_warning(&mut warnings, "gantt 没有任务".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let label_font = ctx.body();
+    let small = ctx.small();
+    let section_font = ctx.small_bold();
+    let row_gap = 8.0;
+    let row_h = ctx.lh(label_font) + row_gap;
+    let bar_h = (row_h * 0.6).max(9.0);
+
+    // Left column: task names, right-aligned so bars start at a shared edge.
+    let label_w = gantt
+        .tasks
+        .iter()
+        .map(|t| ctx.w(&t.name, label_font))
+        .fold(0.0f32, f32::max)
+        .max(0.0)
+        .min(ctx.base * 22.0);
+    let left_w = label_w + 14.0;
+
+    // Time axis spans every task; pad by half a day so bars do not touch the edge.
+    let (t0, t1) = gantt.span();
+    let span = (t1 - t0).max(1.0);
+    let chart_w = (ctx.base * 26.0).clamp(220.0, 760.0);
+
+    let step = GANTT_STEPS
+        .iter()
+        .copied()
+        .find(|s| span / s <= 8.0)
+        .unwrap_or(730.0);
+    let axis_h = ctx.lh(small) + 6.0;
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let total_w = left_w + chart_w;
+    let mut y = 0.0f32;
+
+    // Title, centred over the whole chart.
+    if let Some(title) = gantt.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        prims.push(Prim::anchored_text(
+            [total_w * 0.5, y],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::CenterTop,
+        ));
+        y += lh + 10.0;
+    }
+
+    let axis_top = y;
+    let rows_top = axis_top + axis_h + 2.0;
+    let x_of = |day: f32| left_w + ((day - t0) / span).clamp(0.0, 1.0) * chart_w;
+
+    // Axis rule + ticks. Ticks land on whole steps counted from day 0, so a
+    // weekly chart shows weeks rather than an arbitrary offset.
+    prims.push(Prim::line(
+        [left_w, axis_top + axis_h - 1.0],
+        [total_w, axis_top + axis_h - 1.0],
+        draw::stroke(1.0, ctx.theme.node_stroke.fade(0.5)),
+    ));
+    let mut tick = (t0 / step).floor() * step;
+    let mut guard = 0;
+    while tick <= t1 + step * 0.5 && guard < 64 {
+        guard += 1;
+        if tick >= t0 - step * 0.05 {
+            let x = x_of(tick);
+            prims.push(Prim::line(
+                [x, axis_top + axis_h - 5.0],
+                [x, axis_top + axis_h - 1.0],
+                draw::stroke(1.0, ctx.theme.node_stroke.fade(0.5)),
+            ));
+            let label = match gantt.origin {
+                Some((oy, om, od)) => {
+                    let origin_days = days_from_civil(oy, om, od).unwrap_or(0);
+                    format_day(origin_days + tick.round() as i32, &gantt.axis_format)
+                }
+                None => format!("D{}", tick.round() as i32),
+            };
+            prims.push(Prim::anchored_text(
+                [x, axis_top + ctx.lh(small) * 0.5 + 1.0],
+                label,
+                small,
+                ctx.theme.node_text.fade(0.75),
+                Anchor::Center,
+            ));
+        }
+        tick += step;
+    }
+
+    // Rows: sections get their own header line, tasks get a bar.
+    let mut row_y = rows_top;
+    let mut last_section = usize::MAX;
+    let mut body_bottom = row_y;
+    for task in &gantt.tasks {
+        if task.section != last_section {
+            last_section = task.section;
+            let name = gantt
+                .sections
+                .get(task.section)
+                .cloned()
+                .unwrap_or_default();
+            if !name.is_empty() {
+                prims.push(Prim::anchored_text(
+                    [left_w, row_y + ctx.lh(section_font) * 0.5],
+                    name,
+                    section_font,
+                    ctx.theme.cluster_text,
+                    Anchor::RightCenter,
+                ));
+                row_y += ctx.lh(section_font) + 6.0;
+            }
+        }
+
+        let baseline = row_y + ctx.lh(label_font) * 0.5;
+        prims.push(Prim::anchored_text(
+            [left_w - 8.0, baseline],
+            task.name.clone(),
+            label_font,
+            ctx.theme.node_text,
+            Anchor::RightCenter,
+        ));
+
+        let (fill, stroke_color) = gantt_bar_colors(task, ctx);
+        let x0 = x_of(task.start);
+        let x1 = x_of(task.end());
+        let cy = row_y + row_h * 0.5;
+        if task.milestone || task.duration <= 0.0 {
+            // A milestone is a diamond centred on its day.
+            let r = bar_h * 0.5;
+            prims.push(Prim::path(
+                vec![[x0, cy - r], [x0 + r, cy], [x0, cy + r], [x0 - r, cy]],
+                true,
+                Some(fill),
+                Some(draw::stroke(1.0, stroke_color)),
+            ));
+        } else {
+            let bar = Rect::from_min_size(
+                [x0, cy - bar_h * 0.5],
+                [(x1 - x0).max(2.0), bar_h],
+            );
+            prims.push(Prim::filled_rect(bar, 4.0, fill));
+            prims.push(Prim::stroked_rect(
+                bar,
+                4.0,
+                draw::stroke(1.0, stroke_color),
+            ));
+        }
+        row_y += row_h;
+        body_bottom = row_y;
+    }
+
+    // A hairline under the last row closes the grid.
+    prims.push(Prim::line(
+        [0.0, body_bottom],
+        [total_w, body_bottom],
+        draw::stroke(1.0, ctx.theme.node_stroke.fade(0.35)),
+    ));
+    prims.push(Prim::line(
+        [left_w - 4.0, axis_top + axis_h],
+        [left_w - 4.0, body_bottom],
+        draw::stroke(1.0, ctx.theme.node_stroke.fade(0.35)),
+    ));
+
+    finish(prims, ctx, None, warnings, summary)
 }
 
 // ===========================================================================
@@ -2589,5 +2792,118 @@ mod tests {
             assert_clean(&r);
             assert!(r.size[0] <= 200_000.0 && r.size[1] <= 200_000.0, "case {i} exploded");
         }
+    }
+    // -- gantt --------------------------------------------------------------
+
+    #[test]
+    fn gantt_lays_out_bars_and_an_axis() {
+        let gantt = Gantt {
+            title: Some("项目计划".to_owned()),
+            sections: vec!["设计".to_owned(), "开发".to_owned()],
+            axis_format: "%m-%d".to_owned(),
+            origin: Some((2024, 1, 1)),
+            tasks: vec![
+                Task {
+                    name: "需求".to_owned(),
+                    start: 0.0,
+                    duration: 5.0,
+                    section: 0,
+                    milestone: false,
+                    done: true,
+                    active: false,
+                    crit: false,
+                },
+                Task {
+                    name: "设计".to_owned(),
+                    start: 5.0,
+                    duration: 4.0,
+                    section: 0,
+                    milestone: false,
+                    done: false,
+                    active: true,
+                    crit: false,
+                },
+                Task {
+                    name: "里程碑".to_owned(),
+                    start: 12.0,
+                    duration: 0.0,
+                    section: 1,
+                    milestone: true,
+                    done: false,
+                    active: false,
+                    crit: true,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let d = Diagram::Gantt(gantt);
+        let r = run(&d);
+        assert_clean(&r);
+        assert!(r.size[0] > 150.0 && r.size[1] > 60.0, "{:?}", r.size);
+        // Three rows, so at least three bars plus axis text.
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"需求"), "{texts:?}");
+        assert!(texts.contains(&"里程碑"), "{texts:?}");
+        assert!(texts.contains(&"项目计划"), "{texts:?}");
+        assert!(texts.iter().any(|t| *t == "01-01"), "缺少日期刻度: {texts:?}");
+        // A milestone is drawn as a closed diamond path.
+        assert!(r
+            .prims
+            .iter()
+            .any(|p| matches!(p, Prim::Path { closed: true, .. })));
+    }
+
+    #[test]
+    fn gantt_without_dates_labels_days() {
+        let gantt = Gantt {
+            title: None,
+            sections: vec![String::new()],
+            axis_format: String::new(),
+            origin: None,
+            tasks: vec![Task {
+                name: "T".to_owned(),
+                start: 0.0,
+                duration: 3.0,
+                section: 0,
+                milestone: false,
+                done: false,
+                active: false,
+                crit: false,
+            }],
+            warnings: Vec::new(),
+        };
+        let r = run(&Diagram::Gantt(gantt));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t.starts_with('D')), "{texts:?}");
+    }
+
+    #[test]
+    fn an_empty_gantt_shows_the_placeholder_card() {
+        let r = run(&Diagram::Gantt(Gantt::default()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
     }
 }

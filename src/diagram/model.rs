@@ -24,6 +24,7 @@ pub enum DiagramKind {
     Mindmap,
     Requirement,
     Kanban,
+    Gantt,
 }
 
 impl DiagramKind {
@@ -38,6 +39,7 @@ impl DiagramKind {
             Self::Mindmap => "mindmap",
             Self::Requirement => "requirement",
             Self::Kanban => "kanban",
+            Self::Gantt => "gantt",
         }
     }
 }
@@ -450,6 +452,143 @@ impl Pie {
 }
 
 // ---------------------------------------------------------------------------
+// Gantt charts
+// ---------------------------------------------------------------------------
+
+/// One bar of a `gantt` chart.
+#[derive(Clone, Debug)]
+pub struct Task {
+    pub name: String,
+    /// Start offset from the chart's day 0, in days.
+    pub start: f32,
+    /// Duration in days; `0.0` for a milestone.
+    pub duration: f32,
+    /// Index into [`Gantt::sections`].
+    pub section: usize,
+    pub milestone: bool,
+    pub done: bool,
+    pub active: bool,
+    pub crit: bool,
+}
+
+impl Task {
+    pub fn end(&self) -> f32 {
+        self.start + self.duration.max(0.0)
+    }
+}
+
+/// A parsed `gantt` block.
+#[derive(Clone, Debug, Default)]
+pub struct Gantt {
+    pub title: Option<String>,
+    pub sections: Vec<String>,
+    pub tasks: Vec<Task>,
+    /// `axisFormat` pattern; `%m-%d` when the source did not ask for one.
+    pub axis_format: String,
+    /// Calendar date the chart's day 0 falls on, when absolute dates were given.
+    pub origin: Option<(i32, u32, u32)>,
+    pub warnings: Vec<String>,
+}
+
+impl Gantt {
+    /// Day span covering every task, always at least one day wide.
+    pub fn span(&self) -> (f32, f32) {
+        let start = self
+            .tasks
+            .iter()
+            .map(|t| t.start)
+            .fold(f32::INFINITY, f32::min);
+        let end = self
+            .tasks
+            .iter()
+            .map(|t| t.end())
+            .fold(f32::NEG_INFINITY, f32::max);
+        if !start.is_finite() || !end.is_finite() || end <= start {
+            (0.0, 1.0)
+        } else {
+            (start, end)
+        }
+    }
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`). `None` for an impossible month or day.
+pub fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i32> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp as i32 + 2) / 5 + d as i32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// Inverse of [`days_from_civil`], as `(year, month, day)`.
+pub fn civil_from_days(days: i32) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+/// Format a day number the way `axisFormat` asks, defaulting to `mm-dd`.
+pub fn format_day(days: i32, pattern: &str) -> String {
+    let (y, m, d) = civil_from_days(days);
+    if pattern.trim().is_empty() {
+        return format!("{m:02}-{d:02}");
+    }
+    let mut out = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&y.to_string()),
+            Some('y') => out.push_str(&format!("{:02}", y % 100)),
+            Some('m') => out.push_str(&format!("{m:02}")),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('e') => out.push_str(&d.to_string()),
+            Some('b') | Some('B') => out.push_str(month_name(m)),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+fn month_name(m: u32) -> &'static str {
+    match m {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        _ => "Dec",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -458,6 +597,7 @@ pub enum Diagram {
     Graph(Graph),
     Sequence(Sequence),
     Pie(Pie),
+    Gantt(Gantt),
 }
 
 impl Diagram {
@@ -468,6 +608,7 @@ impl Diagram {
                 .unwrap_or(DiagramKind::Flowchart),
             Self::Sequence(_) => DiagramKind::Sequence,
             Self::Pie(_) => DiagramKind::Pie,
+            Self::Gantt(_) => DiagramKind::Gantt,
         }
     }
 
@@ -476,6 +617,7 @@ impl Diagram {
             Self::Graph(g) => g.title.as_deref(),
             Self::Sequence(s) => s.title.as_deref(),
             Self::Pie(p) => p.title.as_deref(),
+            Self::Gantt(g) => g.title.as_deref(),
         }
     }
 
@@ -485,6 +627,7 @@ impl Diagram {
             Self::Graph(g) => &g.warnings,
             Self::Sequence(s) => &s.warnings,
             Self::Pie(_) => &[],
+            Self::Gantt(g) => &g.warnings,
         }
     }
 
@@ -493,6 +636,7 @@ impl Diagram {
             Self::Graph(g) => g.nodes.is_empty(),
             Self::Sequence(s) => s.participants.is_empty() && s.steps.is_empty(),
             Self::Pie(p) => p.slices.is_empty(),
+            Self::Gantt(g) => g.tasks.is_empty(),
         }
     }
 
@@ -511,6 +655,11 @@ impl Diagram {
                 s.steps.len()
             ),
             Self::Pie(p) => format!("pie · {} 个扇区", p.slices.len()),
+            Self::Gantt(g) => format!(
+                "gantt · {} 个任务 · {} 个分组",
+                g.tasks.len(),
+                g.sections.len()
+            ),
         }
     }
 }

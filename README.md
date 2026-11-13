@@ -147,19 +147,29 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 
 - **flowchart / graph** — TD/TB/BT/LR/RL 六种方向；13 种节点形状
   （矩形、圆角、体育场、圆、双圆、六边形、平行四边形、圆柱、不对称形…）；
-  实线/虚线/粗线箭头，`--x` `--o` `<-->` 等箭头；带标签的边；
-  链式边 `A --> B --> C`；`&` 扇出扇入（自动取笛卡尔积）；`subgraph`
-  嵌套；v11 的 `@{ shape: rect, label: "x" }` 语法。
-- **sequenceDiagram** — `actor` / `participant` 别名、全部箭头类型、
-  激活/失活（`+`/`-` 后缀与独立语句）、四种 `Note` 位置写法、
-  `loop`/`alt`/`else`/`opt`/`par`/`break` 分块、`==` 分节线、`...` 延时、
-  `autonumber`。
+  实线/虚线/粗线箭头，`--x` `--o` `<-->` 等箭头；带标签的边；`~~~` 隐形连线
+  （参与分层但不绘制）；链式边 `A --> B --> C`；`&` 扇出扇入（自动取笛卡尔积）；
+  `subgraph` 嵌套；v11 的 `@{ shape: rect, label: "x" }` 语法；
+  `classDef` / `class` / `A:::cls` / `style` / `linkStyle` 真生效。
+- **sequenceDiagram** — `actor` / `participant` / `database` / `queue` 等
+  全部参与者类型、全部箭头类型、激活/失活（`+`/`-` 后缀与独立语句）、
+  `create` / `destroy`、四种 `Note` 位置写法、
+  `loop`/`alt`/`else`/`opt`/`par`/`and`/`critical`/`option`/`break`/`rect` 分块、
+  `==` 分节线、`...` 延时、`autonumber` 与 `autonumber off`。
 - **pie** — 标签可加引号可裸写，`showData` 控制数值显示。
 - **classDiagram** — 类体按「字段 / 方法」自动分格，`<<interface>>`
   `<<abstract>>` 标记，全套继承与依赖关系箭头，命名空间。
 - **stateDiagram** — `[*]` 起始/终止圆点（同一文件出现两次会自动区分
   起点与终点）、`state "描述" as X`、复合状态。
 - **erDiagram** — 实体属性格、基数关系。
+- **mindmap** — 按缩进建树，`((圆))` `(圆角)` `[矩形]` `{{六边形}}` `)云形(`
+  与 `id((标签))` 写法，左→右排布。
+- **requirementDiagram** — `requirement` / `element` 块变分类框（字段自动分格），
+  `A - satisfies -> B` 与 `B <- derives - A` 两种关系方向。
+- **kanban** — 列变分组、卡片变节点，左→右排布。
+- **gantt** — `section` 分组、`日期` 或 `after <id>` 起算、`30d`/`2w`/`3h`
+  时长、`done` / `active` / `crit` / `milestone` 标记、`axisFormat` 刻度格式、
+  `dateFormat` / `excludes` / `todayMarker` / `tickInterval` 等日历指令安全忽略。
 
 ### PlantUML
 

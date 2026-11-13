@@ -22,9 +22,9 @@
 use std::collections::BTreeSet;
 
 use crate::diagram::model::{
-    Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Graph, GroupKind, LineStyle, Node,
-    NodeShape, NodeStyle, NotePosition, ParticipantKind, Pie, SeqStep, Sequence, Slice,
-    parse_color,
+    Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Gantt, Graph, GroupKind, LineStyle,
+    Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Pie, SeqStep, Sequence, Slice, Task,
+    civil_from_days, days_from_civil, parse_color,
 };
 use crate::gfx::Rgba;
 
@@ -66,6 +66,7 @@ pub fn parse(src: &str) -> Diagram {
         Header::Mindmap => Diagram::Graph(mindmap_parse(src, title)),
         Header::Requirement => Diagram::Graph(requirement_parse(&lines[1..], title)),
         Header::Kanban => Diagram::Graph(kanban_parse(src, title)),
+        Header::Gantt => Diagram::Gantt(gantt_parse(&lines[1..], title)),
         Header::Unknown(name) => {
             let mut graph = if looks_like_edge(first) {
                 flowchart_graph(&lines, Direction::TopDown, None, title)
@@ -413,6 +414,7 @@ enum Header {
     Mindmap,
     Requirement,
     Kanban,
+    Gantt,
     Unknown(String),
 }
 
@@ -441,6 +443,7 @@ fn detect_header(first: &str) -> Header {
         "mindmap" => Header::Mindmap,
         "requirementdiagram" => Header::Requirement,
         "kanban" => Header::Kanban,
+        "gantt" => Header::Gantt,
         _ => Header::Unknown(word.to_owned()),
     }
 }
@@ -2678,6 +2681,250 @@ fn kanban_parse(src: &str, title: Option<String>) -> Graph {
     graph
 }
 
+// ---------------------------------------------------------------------------
+// gantt
+// ---------------------------------------------------------------------------
+
+/// `30d`, `2w`, `3h`, `15m` — days, weeks, hours and minutes.
+fn parse_gantt_duration(text: &str) -> Option<f32> {
+    let t = text.trim();
+    let (num, unit) = t.split_at(
+        t.char_indices()
+            .find(|(_, c)| !c.is_ascii_digit() && *c != '.')
+            .map(|(i, _)| i)
+            .unwrap_or(t.len()),
+    );
+    if num.is_empty() {
+        return None;
+    }
+    let value: f32 = num.parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    let days = match unit.trim().to_ascii_lowercase().as_str() {
+        "d" => value,
+        "w" => value * 7.0,
+        "h" => value / 24.0,
+        "m" | "min" => value / 1440.0,
+        "y" => value * 365.0,
+        _ => return None,
+    };
+    Some(days.max(0.0))
+}
+
+/// `2014-01-15` → days since the epoch.
+fn parse_gantt_date(text: &str) -> Option<i32> {
+    let t = text.trim();
+    let mut parts = t.split('-');
+    let y: i32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    days_from_civil(y, m, d)
+}
+
+/// One task line split into its name and meta list.
+struct GanttLine {
+    name: String,
+    id: Option<String>,
+    /// `after X` reference or an absolute day number.
+    start: Option<GanttStart>,
+    /// `None` when the line did not name a duration.
+    duration: Option<f32>,
+    milestone: bool,
+    done: bool,
+    active: bool,
+    crit: bool,
+}
+
+#[derive(Clone)]
+enum GanttStart {
+    After(String),
+    Day(i32),
+}
+
+/// `gantt` — sections of tasks with start dates or `after` chains.
+fn gantt_parse(lines: &[String], title: Option<String>) -> Gantt {
+    let mut gantt = Gantt {
+        title,
+        axis_format: "%m-%d".to_owned(),
+        ..Gantt::default()
+    };
+
+    let raw = |line: &str| -> Option<GanttLine> {
+        let t = line.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let lower = first_word(t).to_ascii_lowercase();
+        // Directives that shape a real Gantt chart's calendar but have no effect
+        // on this renderer's fixed grid.
+        if matches!(
+            lower.as_str(),
+            "dateformat"
+                | "excludes"
+                | "todaymarker"
+                | "tickinterval"
+                | "weekday"
+                | "weekend"
+                | "inclusiveenddates"
+                | "topaxis"
+                | "displaymode"
+                | "compress"
+                | "title"
+        ) {
+            return None;
+        }
+
+        let (name, meta) = match t.split_once(':') {
+            Some((name, meta)) => (name.trim().to_owned(), Some(meta.trim())),
+            None => (t.to_owned(), None),
+        };
+        let mut line = GanttLine {
+            name,
+            id: None,
+            start: None,
+            duration: None,
+            milestone: false,
+            done: false,
+            active: false,
+            crit: false,
+        };
+        let Some(meta) = meta else {
+            return Some(line);
+        };
+        for part in meta.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(days) = parse_gantt_duration(part) {
+                line.duration = Some(days);
+                continue;
+            }
+            if let Some(rest) = part.strip_prefix("after ") {
+                line.start = Some(GanttStart::After(rest.trim().to_owned()));
+                continue;
+            }
+            if let Some(day) = parse_gantt_date(part) {
+                line.start = Some(GanttStart::Day(day));
+                continue;
+            }
+            match part.to_ascii_lowercase().as_str() {
+                "done" => line.done = true,
+                "active" => line.active = true,
+                "crit" => line.crit = true,
+                "milestone" => line.milestone = true,
+                _ => {
+                    if line.id.is_none() {
+                        line.id = Some(part.to_owned());
+                    }
+                }
+            }
+        }
+        Some(line)
+    };
+
+    // Pass 1: collect the tasks, keeping absolute days as absolute.
+    struct Placed {
+        line: GanttLine,
+        section: usize,
+        start_day: f32,
+        end_day: f32,
+    }
+    let mut placed: Vec<Placed> = Vec::new();
+    let mut by_id: Vec<(String, f32)> = Vec::new(); // id -> end day
+    let mut section = usize::MAX;
+    let mut cursor: f32 = 0.0;
+
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = first_word(t).to_ascii_lowercase();
+        if lower == "section" {
+            gantt.sections.push(after_first_word(t).trim().to_owned());
+            section = gantt.sections.len() - 1;
+            continue;
+        }
+        if lower == "axisformat" {
+            let fmt = after_first_word(t).trim();
+            if !fmt.is_empty() {
+                gantt.axis_format = fmt.to_owned();
+            }
+            continue;
+        }
+        let Some(parsed) = raw(t) else {
+            continue;
+        };
+        // A chart with no `section` statement still needs one bucket.
+        let section = if section == usize::MAX {
+            if gantt.sections.is_empty() {
+                gantt.sections.push(String::new());
+            }
+            section = 0;
+            0
+        } else {
+            section
+        };
+
+        let start = match &parsed.start {
+            Some(GanttStart::Day(day)) => *day as f32,
+            Some(GanttStart::After(id)) => by_id
+                .iter()
+                .find(|(name, _)| name == id)
+                .map(|(_, end)| *end)
+                .unwrap_or(cursor),
+            None => cursor,
+        };
+        let duration = parsed.duration.unwrap_or(if parsed.milestone { 0.0 } else { 1.0 });
+        let end = start + duration;
+        cursor = end;
+        if let Some(id) = &parsed.id {
+            by_id.push((id.clone(), end));
+        }
+        placed.push(Placed {
+            line: parsed,
+            section,
+            start_day: start,
+            end_day: end,
+        });
+    }
+
+    // Pass 2: shift everything so day 0 is the earliest task, and remember the
+    // calendar date that corresponds to (only when absolute dates were used).
+    let Some(min_start) = placed
+        .iter()
+        .map(|p| p.start_day)
+        .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a: f32| a.min(v))))
+    else {
+        gantt.warnings.push("gantt 没有任务".to_owned());
+        return gantt;
+    };
+    let used_dates = placed
+        .iter()
+        .any(|p| matches!(p.line.start, Some(GanttStart::Day(_))));
+    if used_dates {
+        gantt.origin = Some(civil_from_days(min_start.round() as i32));
+    }
+    for p in placed {
+        gantt.tasks.push(Task {
+            name: p.line.name,
+            start: p.start_day - min_start,
+            duration: (p.end_day - p.start_day).max(0.0),
+            section: p.section,
+            milestone: p.line.milestone,
+            done: p.line.done,
+            active: p.line.active,
+            crit: p.line.crit,
+        });
+    }
+    gantt
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3299,5 +3546,83 @@ mod tests {
         assert_eq!(g.clusters[1].members.len(), 1);
         assert_eq!(g.nodes.len(), 3);
         assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    }
+    // -- gantt --------------------------------------------------------------
+
+    #[test]
+    fn gantt_parses_sections_dates_and_after_chains() {
+        let d = parse(
+            "gantt\n\
+             \x20 dateFormat YYYY-MM-DD\n\
+             \x20 axisFormat %m-%d\n\
+             \x20 section 设计\n\
+             \x20 需求分析 :done, a1, 2024-01-01, 5d\n\
+             \x20 方案设计 :a2, after a1, 3d\n\
+             \x20 section 开发\n\
+             \x20 编码 :active, b1, after a2, 10d\n\
+             \x20 里程碑 :milestone, m1, 2024-01-30, 0d",
+        );
+        let Diagram::Gantt(g) = d else {
+            panic!("expected a gantt chart")
+        };
+        assert_eq!(g.sections, vec!["设计", "开发"]);
+        assert_eq!(g.tasks.len(), 4);
+        assert_eq!(g.axis_format, "%m-%d");
+        assert_eq!(g.origin, Some((2024, 1, 1)));
+
+        assert_eq!(g.tasks[0].start, 0.0);
+        assert_eq!(g.tasks[0].duration, 5.0);
+        assert!(g.tasks[0].done);
+        assert_eq!(g.tasks[0].section, 0);
+
+        assert_eq!(g.tasks[1].start, 5.0, "after a1");
+        assert_eq!(g.tasks[2].start, 8.0, "after a2");
+        assert_eq!(g.tasks[2].section, 1);
+        assert!(g.tasks[2].active);
+
+        assert!(g.tasks[3].milestone);
+        assert_eq!(g.tasks[3].start, 29.0, "2024-01-30 距 01-01 是 29 天");
+        assert_eq!(g.tasks[3].duration, 0.0);
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    }
+
+    #[test]
+    fn gantt_without_dates_uses_relative_days() {
+        let d = parse("gantt\n section A\n Task one :t1, 3d\n Task two :t2, 2d");
+        let Diagram::Gantt(g) = d else {
+            panic!("expected a gantt chart")
+        };
+        assert_eq!(g.origin, None);
+        assert_eq!(g.tasks[0].start, 0.0);
+        assert_eq!(g.tasks[1].start, 3.0);
+        assert_eq!(g.tasks[1].duration, 2.0);
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    }
+
+    #[test]
+    fn gantt_tolerates_unsupported_directives() {
+        let d = parse(
+            "gantt\n\
+             \x20 excludes weekends\n\
+             \x20 todayMarker off\n\
+             \x20 tickInterval 1week\n\
+             \x20 section S\n\
+             \x20 t :t1, 2d",
+        );
+        let Diagram::Gantt(g) = d else {
+            panic!("expected a gantt chart")
+        };
+        assert_eq!(g.tasks.len(), 1);
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    }
+
+    #[test]
+    fn gantt_without_tasks_warns() {
+        let d = parse("gantt\n section 空");
+        let Diagram::Gantt(g) = d else {
+            panic!("expected a gantt chart")
+        };
+        assert!(g.tasks.is_empty());
+        assert!(g.warnings.iter().any(|w| w.contains("没有任务")));
     }
 }

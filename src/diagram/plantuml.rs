@@ -48,12 +48,13 @@ pub fn parse(src: &str) -> Diagram {
         | Some(DiagramKind::Mindmap)
         | Some(DiagramKind::Requirement)
         | Some(DiagramKind::Kanban)
+        | Some(DiagramKind::Gantt)
         | None => Diagram::Graph(parse_fallback(&lines, &pre)),
     };
     match &mut diagram {
         Diagram::Graph(g) => apply_skin(g, &pre.skin),
         Diagram::Sequence(s) => apply_skin_sequence(s, &pre.skin),
-        Diagram::Pie(_) => {}
+        Diagram::Pie(_) | Diagram::Gantt(_) => {}
     }
     diagram
 }
