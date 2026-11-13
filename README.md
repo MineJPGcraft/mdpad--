@@ -205,6 +205,55 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
   `partition "名称" { … }`；分支并排、循环与分区带底色框、分叉用双横杠。
 - **用例图 / 组件图**、**状态图**、**ER / IE**。
 
+### 图种覆盖矩阵
+
+两套前端一共识别 **26 种**可渲染图种，全部走同一套 IR + 布局层。下表是逐种盘点，
+「不画」一栏是明确不做的部分及原因——它们描述的东西这套渲染器没有对应模型，
+与其假装支持，不如给出告警。
+
+**Mermaid（18 种）**
+
+| 图种 | 状态 | 关键语法 |
+|---|---|---|
+| flowchart / graph | ✅ | 6 方向、13 形状、全部连线形式、`&` 扇出、subgraph 嵌套、`~~~` 隐形连线、classDef/style/linkStyle |
+| sequenceDiagram | ✅ | 7 种参与者、全部箭头、激活/失活、create/destroy、note 四写法、alt/opt/loop/par/and/critical/option/break/rect、autonumber |
+| classDiagram | ✅ | 成员分格、`<<interface>>`/`<<abstract>>`、继承/依赖/组合/聚合、命名空间 |
+| stateDiagram(-v2) | ✅ | `[*]` 起止、复合状态、描述、转换标签 |
+| erDiagram | ✅ | 实体属性格、基数关系、标签 |
+| pie | ✅ | showData、引号/裸写标签 |
+| mindmap | ✅ | 缩进树、6 种括号形状、`id((标签))` |
+| requirementDiagram | ✅ | requirement/element 分格框、双向关系 |
+| kanban | ✅ | 列→集群、卡片→节点 |
+| gantt | ✅ | section、日期/after 链、时长单位、done/active/crit/milestone、axisFormat |
+| timeline | ✅ | section 分带、一句多事件、轴上下交替卡片 |
+| journey | ✅ | 1–5 分刻度轴、参与者、section |
+| quadrantChart | ✅ | 轴标题、四象限名、`[x, y]` 数据点 |
+| xychart-beta | ✅ | 分类/数值轴、bar/line 多序列、刻度自动取整 |
+| packet-beta | ✅ | 位范围/相对宽度、32 位换行、8 位刻度 |
+| sankey-beta | ✅ | CSV 流量、带宽∝流量、分层 |
+| gitGraph | ✅ | commit/branch/checkout/merge/cherry-pick、泳道、图例 |
+| block-beta | ✅ | columns 网格、space 占位、格间箭头 |
+| radar-beta | ✅ | 多轴、多曲线叠加、max |
+| treemap-beta | ⬜ 待补 | 需要矩形分割算法（squarified treemap） |
+| architecture-beta / C4 / zenuml | ❌ 不画 | 部署拓扑/容器视图；没有对应的分层与图标模型 |
+
+**PlantUML（8 种 + 3 种复用）**
+
+| 图种 | 状态 | 关键语法 |
+|---|---|---|
+| sequence | ✅ | 7 种参与者、全部箭头、note、alt/else/loop/par/break/critical/group/rect、autonumber、`==` 分节 |
+| class | ✅ | 字段/方法分格、interface/abstract/enum、全套关系与多重性、package 嵌套 |
+| usecase / component | ✅ | 用例与组件形状、`-->` 关系 |
+| state | ✅ | `[*]`、复合状态、转换标签 |
+| ER / IE | ✅ | 实体属性、基数关系 |
+| activity（beta 语法） | ✅ | start/stop、:动作;、if/elseif/else、while、repeat、fork、partition |
+| wbs | ✅ | `*` 层数树 |
+| mindmap | ✅ | `*` 层数树、left/right side |
+| gantt | ✅ | lasts/starts at/ends/`--` 分节（与 Mermaid gantt 共用布局） |
+| deployment | ◐ 部分 | 由 component/package 语法覆盖，缺少 `node {}` 分组的专用外观 |
+| archimate / salt / ditaa / timing / json / yaml | ❌ 不画 | 企业架构建模、UI 线框、ASCII 图、时序波形；模型差异过大 |
+
+
 ### 提醒框：四种语法
 
 同一套模型，**双向**支持四种主流写法，可解析也可序列化：
