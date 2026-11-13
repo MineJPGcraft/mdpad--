@@ -127,6 +127,8 @@ pub enum NodeShape {
     Classifier,
     /// Sticky note (`note "..." as N1`, PlantUML notes).
     Note,
+    /// Short thick bar: a `<<fork>>` / `<<join>>` pseudo-state.
+    Bar,
 }
 
 /// Semantic classification of a graph node, used for styling.

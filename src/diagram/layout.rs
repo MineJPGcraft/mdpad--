@@ -773,6 +773,10 @@ fn node_size(node: &Node, ctx: &Ctx) -> [f32; 2] {
     if node.style == NodeStyle::Terminal {
         return [14.0, 14.0];
     }
+    if node.shape == NodeShape::Bar {
+        // Fork/join bars are wide and thin, and carry no label.
+        return [44.0, 7.0];
+    }
     if node.shape == NodeShape::Classifier {
         return classifier_size(node, ctx);
     }
@@ -937,6 +941,14 @@ fn shape_prims(shape: NodeShape, rect: Rect, fill: Option<Rgba>, stroke: Option<
         // rectangle below is only the fallback if one ever reaches here.
         NodeShape::Classifier => {
             out.extend(draw::round_rect(rect, 4.0, fill, stroke));
+        }
+        // A fork/join bar is a filled rule with square ends.
+        NodeShape::Bar => {
+            out.push(Prim::filled_rect(
+                rect,
+                1.5,
+                stroke.map(|s| s.color).or(fill).unwrap_or(Rgba::BLACK),
+            ));
         }
     }
     out

@@ -2124,7 +2124,27 @@ fn state_decl(graph: &mut Graph, stack: &mut Vec<usize>, rest: &str) {
     if cur.peek() == Some('{') {
         push_cluster(graph, stack, &id, &id);
     } else {
-        ensure_node(graph, &id, NodeShape::Round, NodeStyle::Default, stack);
+        // `state X <<fork>>` / `<<join>>` / `<<choice>>` are pseudo-states.
+        let lower = rest.to_ascii_lowercase();
+        let shape = if lower.contains("<<fork>>") || lower.contains("<<join>>") {
+            NodeShape::Bar
+        } else if lower.contains("<<choice>>") {
+            NodeShape::Diamond
+        } else {
+            NodeShape::Round
+        };
+        ensure_node(graph, &id, shape, NodeStyle::Default, stack);
+        // The node may already exist (a transition can reach it first), so the
+        // shape has to be forced rather than only applied on creation.
+        if let Some(idx) = graph.index_of(&id)
+            && let Some(node) = graph.nodes.get_mut(idx)
+        {
+            node.shape = shape;
+            if shape == NodeShape::Bar {
+                // The bar carries no text; the id would only clutter it.
+                node.label.clear();
+            }
+        }
     }
 }
 
@@ -5164,5 +5184,40 @@ mod tests {
             panic!("expected a treemap")
         };
         assert!(t.warnings.iter().any(|w| w.contains("没有区块")));
+    }    // -- state pseudo-states / ER keys -------------------------------------
+
+    #[test]
+    fn state_pseudo_states_become_bars_and_diamonds() {
+        let g = graph(
+            "stateDiagram-v2\n\
+             \x20 [*] --> fork1\n\
+             \x20 state fork1 <<fork>>\n\
+             \x20 fork1 --> work\n\
+             \x20 state pick <<choice>>\n\
+             \x20 work --> pick",
+        );
+        let fork = g.node("fork1").expect("fork1");
+        assert_eq!(fork.shape, NodeShape::Bar, "fork 应画成粗横杠");
+        assert!(fork.label.is_empty(), "粗横杠不带文字");
+        let choice = g.node("pick").expect("pick");
+        assert_eq!(choice.shape, NodeShape::Diamond, "choice 应画成菱形");
+        assert_eq!(g.edges.len(), 3);
+    }
+
+    #[test]
+    fn er_attributes_keep_their_key_markers() {
+        let g = graph(
+            "erDiagram\n\
+             \x20 CUSTOMER {\n\
+             \x20   string id PK\n\
+             \x20   string name\n\
+             \x20   string owner FK\n\
+             \x20 }",
+        );
+        let entity = g.node("CUSTOMER").expect("CUSTOMER");
+        let lines: Vec<String> = entity.compartments.iter().flatten().cloned().collect();
+        let joined = lines.join(" | ");
+        assert!(joined.contains("PK"), "主键标记应保留: {joined}");
+        assert!(joined.contains("FK"), "外键标记应保留: {joined}");
     }
 }
