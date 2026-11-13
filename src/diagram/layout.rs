@@ -4456,7 +4456,7 @@ mod tests {
             }
         }
 
-        let cases: [(&str, &str); 12] = [
+        let cases: [(&str, &str); 14] = [
             (
                 "gantt",
                 "gantt\n section Design\n 需求分析 :done, a1, 2024-01-01, 5d\n 方案设计 :a2, after a1, 3d\n section Build\n 编码 :active, b1, after a2, 10d\n 里程碑 :milestone, m1, 2024-01-30, 0d",
@@ -4474,7 +4474,15 @@ mod tests {
                 "kanban\n  todo[待办]\n    t1[写解析器]\n    t2[补测试]\n  doing[进行中]\n    d1[修布局]",
             ),
             (
-                "activity",
+                "puml_wbs",
+                "@startwbs\n* 商业计划\n** 市场\n*** 线上活动\n*** 线下活动\n** 研发\n*** 模型\n@endwbs",
+            ),
+            (
+                "puml_gantt",
+                "@startgantt\nProject starts 2024-01-01\n[设计] lasts 5 days\n[开发] lasts 10 days\n[开发] starts at [设计]'s end\n[测试] lasts 4 days\n[测试] starts 1 day after [开发]'s end\n@endgantt",
+            ),
+            (
+            "activity",
                 "@startuml\nstart\n:准备;\nif (有权限?) then (是)\n :执行;\nelse (否)\n :拒绝;\nendif\nwhile (还有任务?) is (是)\n :处理一个;\nendwhile\nfork\n :甲;\nfork again\n :乙;\nend fork\npartition \"阶段二\" {\n :收尾;\n}\nstop\n@enduml",
             ),
             (
@@ -4509,7 +4517,7 @@ mod tests {
 
         let mut out: Vec<String> = Vec::new();
         for (name, src) in cases {
-            let d = if src.starts_with("@startuml") {
+            let d = if src.starts_with("@start") {
                 crate::diagram::plantuml::parse(src)
             } else {
                 crate::diagram::mermaid::parse(src)

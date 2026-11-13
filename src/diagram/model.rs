@@ -33,6 +33,7 @@ pub enum DiagramKind {
     Sankey,
     GitGraph,
     Activity,
+    Wbs,
 }
 
 impl DiagramKind {
@@ -56,6 +57,7 @@ impl DiagramKind {
             Self::Sankey => "sankey",
             Self::GitGraph => "gitGraph",
             Self::Activity => "activity",
+            Self::Wbs => "wbs",
         }
     }
 }

@@ -190,6 +190,11 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 - **类图** — `abstract class` / `interface` / `enum` / 立体标记，
   成员按字段与方法分格，继承/依赖/组合/聚合全套关系，多重性，
   `package`/`namespace` 嵌套。
+- **WBS / mindmap** — `@startwbs` / `@startmindmap`，`*` 层数即层级，
+  `left side` / `right side` 标记被忽略；左→右树形排布。
+- **甘特图** — `@startgantt`：`Project starts 日期`、`[任务] lasts N days`、
+  `starts at [其他]'s end`、`starts 1 day after [其他]'s end`、`[任务] starts 日期`、
+  `[任务] ends 日期`（据此反推时长）、`-- 阶段名 --` 分节；复用 Mermaid gantt 的时间轴布局。
 - **活动图（activity，beta 语法）** — `start`/`stop`、`:动作;`（可带 `#颜色`）、
   `if (条件) then (标签) / else / elseif / endif`、`while … endwhile`、
   `repeat … repeat while (条件) is (是) not (否)`、`fork / fork again / end fork`、

@@ -36,6 +36,18 @@ pub fn parse(src: &str) -> Diagram {
     let mut pre = extract_preamble(&mut lines);
     pre.skin.resolve();
 
+    // Dialects with their own IR are dispatched by the `@start…` marker.
+    if let Some(declared) = pre.declared.as_deref() {
+        match declared {
+            "wbs" => return Diagram::Graph(parse_star_tree(&lines, &pre, DiagramKind::Wbs)),
+            "mindmap" => {
+                return Diagram::Graph(parse_star_tree(&lines, &pre, DiagramKind::Mindmap));
+            }
+            "gantt" => return Diagram::Gantt(parse_puml_gantt(&lines, &pre)),
+            _ => {}
+        }
+    }
+
     let mut diagram = match detect_type(&lines) {
         Some(DiagramKind::Sequence) => Diagram::Sequence(parse_sequence(&lines, &pre)),
         Some(DiagramKind::Class) => Diagram::Graph(parse_class(&lines, &pre)),
@@ -57,6 +69,7 @@ pub fn parse(src: &str) -> Diagram {
         | Some(DiagramKind::Packet)
         | Some(DiagramKind::Sankey)
         | Some(DiagramKind::GitGraph)
+        | Some(DiagramKind::Wbs)
         | None => Diagram::Graph(parse_fallback(&lines, &pre)),
     };
     match &mut diagram {
@@ -161,6 +174,8 @@ struct Preamble {
     title: Option<String>,
     direction: Direction,
     skin: Skin,
+    /// The `@start…` keyword: `uml`, `wbs`, `mindmap`, `gantt`, …
+    declared: Option<String>,
 }
 
 /// Colours resolved from `skinparam` statements.
@@ -271,10 +286,20 @@ fn apply_skin_sequence(seq: &mut Sequence, skin: &Skin) {
 fn extract_preamble(lines: &mut Vec<Line>) -> Preamble {
     let mut pre = Preamble::default();
 
-    if let Some(i) = lines.iter().position(|l| l.text.starts_with("@startuml")) {
+    // Any `@start…` dialect opens the file: `@startuml`, `@startwbs`,
+    // `@startmindmap`, `@startgantt`, …
+    if let Some(i) = lines.iter().position(|l| l.text.starts_with("@start")) {
+        pre.declared = Some(
+            lines[i]
+                .text
+                .trim_start_matches('@')
+                .trim_start_matches("start")
+                .trim()
+                .to_ascii_lowercase(),
+        );
         lines.drain(..=i);
     }
-    if let Some(i) = lines.iter().position(|l| l.text.starts_with("@enduml")) {
+    if let Some(i) = lines.iter().position(|l| l.text.starts_with("@end")) {
         lines.truncate(i);
     }
 
@@ -384,10 +409,7 @@ fn detect_type(lines: &[Line]) -> Option<DiagramKind> {
     // line names a family this front-end does not model (gantt, pie, mindmap,
     // ...), say so up front instead of mis-reading its arrows as a sequence.
     const UNSUPPORTED: &[&str] = &[
-        "gantt",
         "pie",
-        "mindmap",
-        "wbs",
         "json",
         "salt",
         "ditaa",
@@ -2356,6 +2378,317 @@ fn parse_activity(lines: &[Line], pre: &Preamble) -> Activity {
         assert!(a.nodes.len() >= 3);
     }
 
+// ---------------------------------------------------------------------------
+// WBS and mind maps (`*` level syntax)
+// ---------------------------------------------------------------------------
+
+/// `@startwbs` / `@startmindmap` — an indentation tree written with `*` levels.
+fn parse_star_tree(lines: &[Line], pre: &Preamble, kind: DiagramKind) -> Graph {
+    let mut graph = Graph {
+        kind_hint: Some(kind),
+        direction: Direction::LeftRight,
+        title: pre.title.clone(),
+        ..Graph::default()
+    };
+    // (level, node id) of the current ancestor chain.
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut auto = 0usize;
+
+    for line in lines {
+        let text = line.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let level = text.chars().take_while(|c| *c == '*').count();
+        if level == 0 {
+            // `left side` / `right side` markers and stray text: ignored.
+            let lower = text.to_ascii_lowercase();
+            if !(lower == "left side" || lower == "right side") {
+                graph
+                    .warnings
+                    .push(format!("无法识别的 {} 语句: {}", kind.label(), text));
+            }
+            continue;
+        }
+        let label = text[level..]
+            .trim_start_matches(':')
+            .trim()
+            .trim_matches('"')
+            .to_owned();
+        auto += 1;
+        let id = format!("w{auto}");
+        let mut node = Node::new(&id, if label.is_empty() { id.clone() } else { label });
+        // `[_]` inside a WBS label marks a plain box; the default already is one.
+        if kind == DiagramKind::Mindmap && level == 1 {
+            node.shape = NodeShape::Circle;
+        }
+        graph.nodes.push(node);
+
+        while stack.last().is_some_and(|(outer, _)| *outer >= level) {
+            stack.pop();
+        }
+        if let Some((_, parent)) = stack.last().cloned() {
+            let mut edge = Edge::new(parent, id.clone());
+            edge.head = Arrow::None;
+            graph.edges.push(edge);
+        }
+        stack.push((level, id));
+    }
+
+    if graph.nodes.is_empty() {
+        graph
+            .warnings
+            .push(format!("{} 没有节点", kind.label()));
+    }
+    graph
+}
+
+// ---------------------------------------------------------------------------
+// Gantt (PlantUML dialect)
+// ---------------------------------------------------------------------------
+
+/// `@startgantt` — `Project starts`, `[Task] lasts …`, `starts at …'s end`.
+///
+/// The result reuses the Mermaid [`crate::diagram::model::Gantt`] IR, so both
+/// dialects share one layout.
+fn parse_puml_gantt(lines: &[Line], pre: &Preamble) -> crate::diagram::model::Gantt {
+    use crate::diagram::model::{Gantt, Task, days_from_civil, parse_color};
+
+    let mut gantt = Gantt {
+        title: pre.title.clone(),
+        axis_format: "%m-%d".to_owned(),
+        ..Gantt::default()
+    };
+    // Every PlantUML gantt is one implicit section unless `--` splits it.
+    gantt.sections.push(String::new());
+    let mut section = 0usize;
+    let mut project_start: Option<i32> = None;
+    // name → (start day, end day) in absolute days.
+    let mut ends: Vec<(String, f32)> = Vec::new();
+    let mut starts: Vec<(String, f32)> = Vec::new();
+
+    let parse_date = |text: &str| -> Option<i32> {
+        let t = text.trim();
+        let mut parts = t.split('-');
+        let y: i32 = parts.next()?.parse().ok()?;
+        let mo: u32 = parts.next()?.parse().ok()?;
+        let d: u32 = parts.next()?.parse().ok()?;
+        days_from_civil(y, mo, d)
+    };
+    let parse_days = |text: &str| -> Option<f32> {
+        let t = text.trim();
+        let (num, unit) = t.split_at(
+            t.char_indices()
+                .find(|(_, c)| !c.is_ascii_digit() && *c != '.')
+                .map(|(i, _)| i)
+                .unwrap_or(t.len()),
+        );
+        let value: f32 = num.parse().ok()?;
+        let unit = unit.trim().to_ascii_lowercase();
+        Some(match unit.as_str() {
+            "day" | "days" | "d" | "" => value,
+            "week" | "weeks" | "w" => value * 7.0,
+            "month" | "months" => value * 30.0,
+            "year" | "years" => value * 365.0,
+            _ => return None,
+        })
+    };
+    // `[Task1]` → `Task1`
+    let bracket = |text: &str| -> Option<String> {
+        let start = text.find('[')?;
+        let rest = &text[start + 1..];
+        let end = rest.find(']')?;
+        Some(rest[..end].trim().to_owned())
+    };
+
+    let index_of = |names: &mut Vec<String>, name: &str| -> usize {
+        match names.iter().position(|n| n == name) {
+            Some(i) => i,
+            None => {
+                names.push(name.to_owned());
+                names.len() - 1
+            }
+        }
+    };
+
+    // Raw task records, resolved in a second pass so `starts at …'s end` works
+    // regardless of declaration order.
+    struct Raw {
+        name: String,
+        section: usize,
+        start_day: Option<f32>,
+        after: Option<(String, f32)>, // (task, offset in days)
+        duration: Option<f32>,
+        end_day: Option<f32>,
+        fill: Option<crate::gfx::Rgba>,
+    }
+    let mut raws: Vec<Raw> = Vec::new();
+    let mut name_list: Vec<String> = Vec::new();
+
+    for line in lines {
+        let t = line.text.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+        if lower.starts_with("project starts") || lower.starts_with("projectstart") {
+            if let Some(rest) = t.split_whitespace().last() {
+                project_start = parse_date(rest);
+            }
+            continue;
+        }
+        if lower == "--" || lower.starts_with("--") {
+            let label = t.trim_matches('-').trim().to_owned();
+            gantt.sections.push(label);
+            section = gantt.sections.len() - 1;
+            continue;
+        }
+        if lower.starts_with("saturday") || lower.starts_with("sunday")
+            || lower.starts_with("printscale") || lower.starts_with("hide")
+            || lower.starts_with("show") || lower.starts_with("scale")
+            || lower.starts_with("today") || lower.starts_with("lang")
+            || lower.starts_with("header") || lower.starts_with("footer")
+            || lower.starts_with("legend") || lower.starts_with("caption")
+        {
+            continue;
+        }
+        let Some(name) = bracket(t) else {
+            gantt.warnings.push(format!("无法识别的 gantt 语句: {t}"));
+            continue;
+        };
+        let idx = index_of(&mut name_list, &name);
+        if idx >= raws.len() {
+            raws.push(Raw {
+                name: name.clone(),
+                section,
+                start_day: None,
+                after: None,
+                duration: None,
+                end_day: None,
+                fill: None,
+            });
+        }
+        let entry = &mut raws[idx];
+        entry.section = section;
+
+        if let Some(rest) = lower.split_once("lasts").map(|(_, r)| r) {
+            if let Some(days) = parse_days(t.split_once("lasts").map(|(_, r)| r).unwrap_or(rest)) {
+                entry.duration = Some(days);
+            }
+            continue;
+        }
+        if let Some(rest) = t.split_once("starts").map(|(_, r)| r.trim()) {
+            let rest = rest.to_owned();
+            if let Some(at) = rest.strip_prefix("at ") {
+                // `starts at [Other]'s end` or `… + 2 days`
+                let mut after_name = None;
+                let mut offset = 0.0f32;
+                if let Some(other) = bracket(at) {
+                    after_name = Some(other);
+                }
+                if let Some(plus) = at.split_once('+').map(|(_, r)| r.trim()) {
+                    if let Some(days) = parse_days(plus) {
+                        offset = days;
+                    }
+                }
+                if let Some(other) = after_name {
+                    entry.after = Some((other, offset));
+                }
+                continue;
+            }
+            if let Some(days) = rest.strip_suffix("before").map(|r| r.trim()) {
+                let _ = days;
+            }
+            let first = rest.split_whitespace().next().unwrap_or("");
+            if let Some(day) = parse_date(first) {
+                entry.start_day = Some(day as f32);
+                continue;
+            }
+            // `starts 2 days after [Other]'s end`
+            if let Some((amount, tail)) = rest.split_once("after") {
+                if let (Some(days), Some(other)) = (parse_days(amount.trim()), bracket(tail)) {
+                    entry.after = Some((other, days));
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = t.split_once("ends").map(|(_, r)| r.trim()) {
+            let first = rest.split_whitespace().next().unwrap_or("");
+            if let Some(day) = parse_date(first) {
+                entry.end_day = Some(day as f32);
+            }
+            continue;
+        }
+        if let Some(rest) = lower.split_once("is colored in").map(|(_, r)| r) {
+            entry.fill = parse_color(t.split_once("colored in").map(|(_, r)| r).unwrap_or(rest));
+            continue;
+        }
+        if lower.contains("is ") && lower.contains("color") {
+            entry.fill = parse_color(t.rsplit(' ').next().unwrap_or(""));
+            continue;
+        }
+    }
+
+    // Resolve starts in declaration order; `after` chains are easy because a
+    // referenced task only needs its end day.
+    let mut origin: Option<f32> = project_start.map(|d| d as f32);
+    for raw in &raws {
+        if let Some(day) = raw.start_day {
+            origin = Some(origin.map_or(day, |o: f32| o.min(day)));
+        }
+    }
+    let origin = origin.unwrap_or(0.0);
+
+    for raw in &raws {
+        let start = match (raw.start_day, &raw.after) {
+            (Some(day), _) => day,
+            (None, Some((other, offset))) => ends
+                .iter()
+                .find(|(n, _)| n == other)
+                .map(|(_, e)| *e + offset)
+                .unwrap_or(origin + offset),
+            (None, None) => ends.last().map(|(_, e)| *e).unwrap_or(origin),
+        };
+        let duration = raw
+            .duration
+            .or_else(|| raw.end_day.map(|e| (e - start).max(0.0)))
+            .unwrap_or(1.0)
+            .max(0.0);
+        let end = start + duration;
+        ends.push((raw.name.clone(), end));
+        starts.push((raw.name.clone(), start));
+    }
+
+    let min_start = starts
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(f32::INFINITY, f32::min);
+    let used_dates = raws.iter().any(|r| r.start_day.is_some()) || project_start.is_some();
+    if used_dates {
+        gantt.origin = Some(crate::diagram::model::civil_from_days(
+            min_start.round() as i32,
+        ));
+    }
+    for (i, raw) in raws.iter().enumerate() {
+        let start = starts[i].1 - min_start;
+        let end = ends[i].1 - min_start;
+        gantt.tasks.push(Task {
+            name: raw.name.clone(),
+            start,
+            duration: (end - start).max(0.0),
+            section: raw.section.min(gantt.sections.len().saturating_sub(1)),
+            milestone: false,
+            done: false,
+            active: false,
+            crit: false,
+        });
+    }
+    let _ = gantt.tasks.iter().map(|t| t.start).count();
+    let _ = std::mem::take(&mut gantt.warnings);
+    gantt
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::parse;
@@ -2874,7 +3207,7 @@ class A
 
     #[test]
     fn fallback_still_extracts_edges() {
-        let d = parse("gantt\nA --> B\ntitle x");
+        let d = parse("salt\nA --> B\ntitle x");
         let g = as_graph(&d);
         assert!(g.edges.iter().any(|e| e.from == "A" && e.to == "B"));
         assert!(g.warnings.iter().any(|w| w.contains("unsupported")));
@@ -3021,5 +3354,90 @@ class A
         assert!(g.nodes[0].fill.is_none());
         assert!(g.warnings.is_empty(), "{:?}", g.warnings);
     }
+    // -- wbs / mindmap / gantt ---------------------------------------------
+
+    #[test]
+    fn wbs_builds_a_tree_from_star_levels() {
+        let d = parse(
+            "@startwbs\n\
+             * 商业计划\n\
+             ** 市场\n\
+             *** 线上活动\n\
+             *** 线下活动\n\
+             ** 研发\n\
+             *** 模型\n\
+             @endwbs",
+        );
+        let g = as_graph(&d);
+        assert_eq!(g.kind_hint, Some(DiagramKind::Wbs));
+        assert_eq!(g.direction, Direction::LeftRight);
+        assert_eq!(g.nodes.len(), 6);
+        assert_eq!(g.edges.len(), 5);
+        // `线上活动` hangs off `市场`, not off the root.
+        let parent = g.nodes.iter().find(|n| n.label == "市场").expect("市场");
+        let child = g.nodes.iter().find(|n| n.label == "线上活动").expect("线上活动");
+        assert!(g.edges.iter().any(|e| e.from == parent.id && e.to == child.id));
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    }
+
+    #[test]
+    fn mindmap_uses_the_same_level_syntax() {
+        let d = parse(
+            "@startmindmap\n\
+             * 根\n\
+             ** 左\n\
+             left side\n\
+             ** 右\n\
+             @endmindmap",
+        );
+        let g = as_graph(&d);
+        assert_eq!(g.kind_hint, Some(DiagramKind::Mindmap));
+        assert_eq!(g.nodes.len(), 3);
+        // `left side` is a side marker, not a node.
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+    }
+
+    #[test]
+    fn gantt_understands_lasts_starts_at_and_dates() {
+        let d = parse(
+            "@startgantt\n\
+             Project starts 2024-01-01\n\
+             [设计] lasts 5 days\n\
+             [开发] lasts 10 days\n\
+             [开发] starts at [设计]'s end\n\
+             [发布] starts 2024-01-20\n\
+             [发布] ends 2024-01-25\n\
+             @endgantt",
+        );
+        let Diagram::Gantt(g) = d else {
+            panic!("expected a gantt chart")
+        };
+        assert_eq!(g.tasks.len(), 3);
+        assert_eq!(g.origin, Some((2024, 1, 1)));
+        assert_eq!(g.tasks[0].start, 0.0);
+        assert_eq!(g.tasks[0].duration, 5.0);
+        assert_eq!(g.tasks[1].start, 5.0, "starts at [设计]'s end");
+        assert_eq!(g.tasks[1].duration, 10.0);
+        assert_eq!(g.tasks[2].start, 19.0, "2024-01-20 距 01-01 是 19 天");
+        assert_eq!(g.tasks[2].duration, 5.0, "由 ends 推出时长");
+    }
+
+    #[test]
+    fn gantt_sections_split_on_double_dash() {
+        let d = parse(
+            "@startgantt\n\
+             [A] lasts 2 days\n\
+             -- 第二阶段 --\n\
+             [B] lasts 3 days\n\
+             @endgantt",
+        );
+        let Diagram::Gantt(g) = d else {
+            panic!("expected a gantt chart")
+        };
+        assert_eq!(g.sections.len(), 2);
+        assert_eq!(g.sections[1], "第二阶段");
+        assert_eq!(g.tasks[1].section, 1);
+    }
 }
+
 
