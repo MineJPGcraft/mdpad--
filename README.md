@@ -103,27 +103,39 @@ AST。渲染层是一个实时视图——它解析源码、决定每段怎么�
 ### LaTeX
 
 Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
-（`src/tex/`，约 3400 行）。基线驱动的布局盒模型，全部字形宽度通过字体
+（`src/tex/`，约 4900 行）。基线驱动的布局盒模型，全部字形宽度通过字体
 度量接口取得，没有硬编码。
 
 支持：
 
 | 类别 | 内容 |
 |---|---|
-| 希腊字母 | `\alpha` … `\omega`，含 `\varepsilon` `\vartheta` `\varphi` `\varpi` 等异体 |
-| 关系符 | `\leq \geq \neq \equiv \approx \cong \propto \preceq \in \notin \vdash \models \implies \iff` … |
-| 运算符 | `\pm \times \div \cdot \oplus \otimes \otimes \circ \bullet` 及各类大算符 |
-| 上下标 | `^` `_` 任意次序与嵌套；`\displaystyle` 下大算符取上下限，支持 `\limits` / `\nolimits` 覆盖 |
-| 分式 | `\frac` `\dfrac` `\tfrac`，分子分母上下居中于横线 |
+| 希腊字母 | `\alpha` … `\omega`，含 `\varepsilon` `\vartheta` `\varphi` `\varpi` `\digamma` 等异体 |
+| 关系符 | `\leq \geq \neq \equiv \approx \cong \propto \preceq \in \notin \vdash \models \lesssim \coloneqq \therefore \implies \iff` … |
+| 运算符 | `\pm \times \div \cdot \oplus \otimes \ominus \uplus \sqcup \setminus \circ \bullet` 及各类大算符 |
+| 上下标 | `^` `_` 任意次序与嵌套；`\displaystyle` 下大算符取上下限，支持 `\limits` / `\nolimits` 覆盖；**积分默认上下限在右侧**（TeX 的 `\nolimits` 惯例） |
+| 堆叠 | `\overset` `\underset` `\stackrel`（按关系符排间距）、`\substack`（多行上下限）、`\overbrace` / `\underbrace`（花括号 + 标注） |
+| 分式 | `\frac` `\dfrac` `\tfrac`，分子分母上下居中于横线；`\binom` |
 | 根式 | `\sqrt{x}` `\sqrt[n]{x}`，根号随内容伸缩 |
 | 定界符 | `\left…\right` 覆盖 `()[]{}||\langle\rangle` 上下限号族；另有 `\big` 系列 |
-| 环境 | `matrix pmatrix bmatrix vmatrix Bmatrix cases aligned align gathered array`，支持 `&` 与 `\\`、array 列格式与竖线 |
-| 样式 | `\text \mathrm \mathbf \mathit \mathsf \mathtt \mathbb \mathcal \mathscr \mathfrak \operatorname` |
-| 重音 | `\hat \bar \overline \tilde \dot \ddot \vec \check \breve \acute \grave` |
-| 间距 | `\, \; \: \! \quad \qquad \thinspace \ `，按 TeX 规则区分关系符（0.2778em）与二元运算符（0.2222em） |
+| 环境 | `matrix pmatrix bmatrix vmatrix Bmatrix cases aligned align gathered array`，另含 `split` `alignedat` `gather*` `multline` `eqnarray` `dcases` 等同构别名；支持 `&` 与 `\\`、`\\[6pt]` 行距 |
+| array 列格式 | `lcr`、竖线 `|`、`p{2cm}` / `m{}` / `b{}` 最小列宽、`@{}` 抑制列间距、`*{3}{c}` 重复；行级 `\hline` / `\cline` |
+| 样式 | `\text \textbf \textit \textrm \textsf \texttt \mathrm \mathbf \boldsymbol \mathit \mathsf \mathtt \mathbb \mathcal \mathscr \mathfrak \operatorname \operatorname*` |
+| 颜色 | `\color{red}` 作用到组结束，`\textcolor{#c0392b}{…}`；支持常用色名与 `#rgb` / `#rrggbb` |
+| 重音 | `\hat \widehat \bar \overline \tilde \widetilde \dot \ddot \vec \check \breve \acute \grave \mathring \underline`，**全部按几何绘制**，不依赖字体里组合符号的墨迹位置 |
+| 取反与框 | `\not`（叠加小斜线）、`\boxed` / `\fbox` |
+| 间距 | `\, \; \: \! \quad \qquad \enspace \enskip \negthinspace \negmedspace \negthickspace \medspace \thickspace \mkern{n mu} \mskip \hspace{1em} \hspace*{1em}`，按 TeX 规则区分关系符（0.2778em）与二元运算符（0.2222em） |
+| 幻影与类别 | `\phantom \hphantom \vphantom`；`\mathord \mathop \mathbin \mathrel \mathopen \mathclose \mathpunct \mathinner` 强制原子类别 |
 
 字体直接取自系统：`Cambria Math`（`cambria.ttc` 的第 1 个字面）作为数学字体，
 微软雅黑兜底中文，`\mathbb` 走 Unicode 双线体字形（`\mathbb{R}` → `ℝ`）。
+
+两个容易出错的地方也一并按 TeX 的行为做了：
+
+- **二元运算符的类别判定是双向的。** `(-x)` 里的 `-` 不是二元运算符，`a+` 结尾时
+  也不是，所以整行先定类别、再排版，只看前一个原子会排错一侧的间距。
+- **矩阵类环境居中于数学轴**，不是挂在基线上。此前首行的 ascent 被算了两遍，整块
+  会偏低；现在按 TeX 的做法把块的中点对齐到数学轴（0.25em）上。
 
 未识别的命令按源码原样渲染并降低不透明度，同时记入警告列表——不崩溃，
 也不悄悄吞掉。
@@ -288,9 +300,12 @@ src/
 
 诚实说明当前没有覆盖的部分：
 
-- **LaTeX** 是常用子集，不是 TeX 的完整实现。`array` 的列格式支持有限；
-  `\frac` 不支持行内自动缩放；连字符、字体微调（`\!` 之外的负间距）
-  等 TeX 细节未做。`\mathbb` 对 Unicode 无对应字形的字母会退化为下划线。
+- **LaTeX** 是常用子集，不是 TeX 的完整实现。没有 `\middle`、`\cancel`、
+  `\xrightarrow`、`\genfrac`、编号与交叉引用（`\tag` / `\label` 静默忽略）；
+  `array` 的 `>{}` / `<{}` 列修饰只解析不生效；`p{2cm}` 这类绝对长度按
+  1em = 10pt 的参考字号换算。`\frac` 不做行内自动缩放（行内分母取 0.72 倍字号），
+  连字符与断行等 TeX 细节未做。`\mathbb` 对 Unicode 无对应字形的字母会退化为下划线。
+  上下标不会自动拉开避让（同一位置上的 `x_i^2` 叠得很紧）。
 - **Mermaid / PlantUML** 覆盖了常用语法，但主题（`classDef`、皮肤参数）
   只解析不生效，绘制采用编辑器统一配色。时序图 activation 条按语句
   配对，遇到不配对的 `deactivate` 会安全忽略而非报错。

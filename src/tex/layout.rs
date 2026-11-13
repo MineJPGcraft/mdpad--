@@ -12,8 +12,8 @@
 //! against the live egui font atlas and against [`ApproxMeasure`] in tests.
 
 use super::parse::{
-    AccentKind, ArraySpec, Class, ColAlign, Delim, EnvKind, FracStyle, LimitMode, Node, OpKind,
-    SizeStyle, SymStyle, TextStyle,
+    AccentKind, ArraySpec, Class, ColAlign, DEFAULT_COL_GAP, Delim, EnvKind, FracStyle, LimitMode,
+    Node, OpKind, PhantomKind, SizeStyle, SymStyle, TextStyle,
 };
 use crate::gfx::{Anchor, Family, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -270,20 +270,12 @@ fn class_of(node: &Node) -> Class {
         Node::BigDelim { class, .. } => *class,
         Node::Scripts { base, .. } => class_of(base),
         Node::Style { body, .. } => class_of(body),
+        Node::Color { body, .. } => class_of(body),
+        Node::Classed { class, .. } => *class,
+        Node::Stack { class, .. } => *class,
+        Node::Negate { base } => class_of(base),
         Node::Delimited { .. } | Node::Environ { .. } | Node::Row(_) => Class::Inner,
         _ => Class::Ord,
-    }
-}
-
-/// Convert a binary operator into an ordinary atom when it is really unary:
-/// nothing, an operator, a relation or an opening delimiter precedes it.
-fn effective_class(prev: Option<Class>, class: Class) -> Class {
-    if class == Class::Bin
-        && !matches!(prev, Some(Class::Ord) | Some(Class::Inner) | Some(Class::Close))
-    {
-        Class::Ord
-    } else {
-        class
     }
 }
 
@@ -394,16 +386,64 @@ fn layout(node: &Node, size: f32, level: u32, ctx: &mut Ctx) -> Sb {
             limits,
         } => layout_scripts(base, sup, sub, *limits, size, level, ctx),
         Node::Op { text, kind, .. } => {
-            let op_size = if *kind == OpKind::Large && ctx.display {
+            let large = matches!(kind, OpKind::Large | OpKind::Integral);
+            let op_size = if large && ctx.display {
                 size * 1.4
             } else {
                 size
             };
             text_box(text, upright_math(op_size), ctx.color, ctx.m)
         }
-        Node::Environ { kind, rows, spec } => {
-            layout_environment(*kind, rows, spec.as_ref(), size, level, ctx)
+        Node::Negate { base } => {
+            let b = layout(base, size, level, ctx);
+            layout_negate(b, size, ctx)
         }
+        Node::Stack {
+            base,
+            top,
+            bottom,
+            ..
+        } => layout_stack(base, top.as_deref(), bottom.as_deref(), size, level, ctx),
+        Node::Brace { over, body } => {
+            let b = layout(body, size, level, ctx);
+            layout_brace(*over, b, size, ctx)
+        }
+        Node::Boxed { body } => {
+            let b = layout(body, size, level, ctx);
+            layout_boxed(b, size, ctx)
+        }
+        Node::Phantom { body, kind } => {
+            let b = layout(body, size, level, ctx);
+            match kind {
+                PhantomKind::Full => Sb {
+                    prims: Vec::new(),
+                    ..b
+                },
+                PhantomKind::Horizontal => Sb::pure(b.w),
+                PhantomKind::Vertical => Sb {
+                    w: 0.0,
+                    ascent: b.ascent,
+                    descent: b.descent,
+                    prims: Vec::new(),
+                },
+            }
+        }
+        Node::Classed { body, .. } => layout(body, size, level, ctx),
+        Node::Color { color, body } => {
+            let saved = ctx.color;
+            ctx.color = *color;
+            let out = layout(body, size, level, ctx);
+            ctx.color = saved;
+            out
+        }
+        Node::ColorSwitch(_) => Sb::empty(),
+        Node::Rule => Sb::empty(),
+        Node::Environ {
+            kind,
+            rows,
+            spec,
+            gaps,
+        } => layout_environment(*kind, rows, spec.as_ref(), gaps, size, level, ctx),
         Node::Raw(text) => {
             let faded = ctx.color.fade(0.75);
             text_box(text, upright_math(size), faded, ctx.m)
@@ -412,14 +452,60 @@ fn layout(node: &Node, size: f32, level: u32, ctx: &mut Ctx) -> Sb {
     }
 }
 
+/// Resolve the atom class of every item of a row before anything is placed.
+///
+/// TeX reclassifies a binary operator as ordinary when it is not really binary:
+/// `(-x)` and `a+` must not get binary spacing. Both sides matter, so the whole
+/// row is classified first and laid out second. Explicit spacing commands and
+/// line breaks break the chain, matching TeX's "glue resets the context";
+/// style and colour switches are transparent, so they never count as atoms.
+fn resolve_classes(items: &[Node]) -> Vec<Class> {
+    let mut out = vec![Class::Ord; items.len()];
+    let mut segment: Vec<(usize, Class)> = Vec::new();
+
+    let flush = |segment: &mut Vec<(usize, Class)>, out: &mut Vec<Class>| {
+        for (k, (index, cls)) in segment.iter().enumerate() {
+            let mut c = *cls;
+            if c == Class::Bin {
+                let prev = if k == 0 { None } else { Some(segment[k - 1].1) };
+                let next = segment.get(k + 1).map(|(_, c)| *c);
+                let prev_bin = matches!(prev, Some(Class::Ord | Class::Inner | Class::Close));
+                let next_bin = matches!(
+                    next,
+                    Some(Class::Ord | Class::Op | Class::Open | Class::Inner)
+                );
+                if !prev_bin || !next_bin {
+                    c = Class::Ord;
+                }
+            }
+            out[*index] = c;
+        }
+        segment.clear();
+    };
+
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            Node::Space(_) | Node::LineBreak => {
+                flush(&mut segment, &mut out);
+            }
+            Node::StyleSwitch(_) | Node::ColorSwitch(_) => {}
+            _ => segment.push((index, class_of(item))),
+        }
+    }
+    flush(&mut segment, &mut out);
+    out
+}
+
 fn layout_row(items: &[Node], size: f32, level: u32, ctx: &mut Ctx) -> Sb {
     let saved_display = ctx.display;
+    let saved_color = ctx.color;
     let mut out = Sb::empty();
     let mut cursor = 0.0f32;
     let mut prev: Option<Class> = None;
     let mut pending = 0.0f32;
+    let classes = resolve_classes(items);
 
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
         match item {
             Node::Space(em) => {
                 pending += em * size;
@@ -428,6 +514,10 @@ fn layout_row(items: &[Node], size: f32, level: u32, ctx: &mut Ctx) -> Sb {
             }
             Node::StyleSwitch(style) => {
                 ctx.display = matches!(style, SizeStyle::Display);
+                continue;
+            }
+            Node::ColorSwitch(color) => {
+                ctx.color = *color;
                 continue;
             }
             Node::LineBreak => {
@@ -439,7 +529,7 @@ fn layout_row(items: &[Node], size: f32, level: u32, ctx: &mut Ctx) -> Sb {
             _ => {}
         }
 
-        let class = effective_class(prev, class_of(item));
+        let class = classes[index];
         let gap = pending + space_between(prev, class) * size;
         pending = 0.0;
 
@@ -454,6 +544,7 @@ fn layout_row(items: &[Node], size: f32, level: u32, ctx: &mut Ctx) -> Sb {
 
     out.w = cursor.max(0.0);
     ctx.display = saved_display;
+    ctx.color = saved_color;
     out
 }
 
@@ -604,98 +695,287 @@ fn layout_sqrt(
 // Accents
 // ---------------------------------------------------------------------------
 
-fn mark_glyph(kind: AccentKind) -> &'static str {
-    match kind {
-        AccentKind::Hat => "\u{02C6}",
-        AccentKind::Tilde => "\u{02DC}",
-        AccentKind::Dot => "\u{02D9}",
-        AccentKind::Ddot => "\u{00A8}",
-        AccentKind::Vec => "\u{2192}",
-        AccentKind::Check => "\u{02C7}",
-        AccentKind::Breve => "\u{02D8}",
-        AccentKind::Acute => "\u{00B4}",
-        AccentKind::Grave => "\u{0060}",
-        AccentKind::Ring => "\u{02DA}",
-        _ => "\u{02C6}",
-    }
-}
-
+/// Accents, drawn from geometry rather than from a mark glyph.
+///
+/// A combining mark glyph (`U+02C6` and friends) puts its ink wherever the font
+/// likes inside its own line box, so anchoring it by metrics leaves an
+/// unpredictable gap above the base. Building the mark from strokes instead
+/// keeps it a fixed distance from the base's top at every size and every font.
 fn layout_accent(kind: AccentKind, base: Sb, size: f32, ctx: &mut Ctx) -> Sb {
     let stroke_w = (0.055 * size).max(0.6);
-    let gap = 0.08 * size;
     let stroke = Stroke::new(stroke_w, ctx.color);
+    let gap = 0.05 * size;
 
-    match kind {
-        AccentKind::Overline | AccentKind::Bar => {
-            let w = base.w.max(0.3 * size);
-            let y = -(base.ascent + gap);
-            let mut out = Sb::empty();
-            place(&mut out, &base, (w - base.w) * 0.5, 0.0);
-            out.prims
-                .push(Prim::filled_rect(Rect::from_xywh(0.0, y, w, stroke_w), 0.0, ctx.color));
-            out.w = w;
-            out.ascent = base.ascent + gap + stroke_w;
-            out.descent = base.descent;
-            out
-        }
-        AccentKind::Underline => {
-            let w = base.w.max(0.3 * size);
-            let y = base.descent + gap;
-            let mut out = Sb::empty();
-            place(&mut out, &base, (w - base.w) * 0.5, 0.0);
-            out.prims
-                .push(Prim::filled_rect(Rect::from_xywh(0.0, y, w, stroke_w), 0.0, ctx.color));
-            out.w = w;
-            out.ascent = base.ascent;
-            out.descent = y + stroke_w;
-            out
-        }
-        AccentKind::WideHat | AccentKind::WideTilde => {
-            let w = base.w.max(0.5 * size);
-            let y = -(base.ascent + gap);
-            let hh = 0.18 * size;
-            let points = if kind == AccentKind::WideHat {
-                vec![[0.0, y + hh], [w * 0.5, y], [w, y + hh]]
-            } else {
-                vec![
-                    [0.0, y + hh],
-                    [w * 0.25, y],
-                    [w * 0.5, y + hh],
-                    [w * 0.75, y],
-                    [w, y + hh],
-                ]
-            };
-            let mut out = Sb::empty();
-            place(&mut out, &base, (w - base.w) * 0.5, 0.0);
-            out.prims.push(Prim::path(points, false, None, Some(stroke)));
-            out.w = w;
-            out.ascent = base.ascent + gap + hh + stroke_w * 0.5;
-            out.descent = base.descent;
-            out
-        }
-        _ => {
-            // Marks are glyphs like U+02C6 whose ink sits in the upper part of
-            // their own line box, so the mark is anchored by its baseline just
-            // above the base instead of by its box bottom. That keeps the accent
-            // close to the base while never letting the boxes collide.
-            let font = Font {
-                size: size * 0.85,
-                family: Family::Math,
-                weight: Weight::Regular,
-                slant: Slant::Upright,
-            };
-            let mark = text_box(mark_glyph(kind), font, ctx.color, ctx.m);
-            let w = base.w.max(mark.w);
-            let mark_baseline = -(base.ascent + gap);
-            let mut out = Sb::empty();
-            place(&mut out, &base, (w - base.w) * 0.5, 0.0);
-            place(&mut out, &mark, (w - mark.w) * 0.5, mark_baseline);
-            out.w = w;
-            out.ascent = base.ascent + gap + mark.ascent;
-            out.descent = base.descent;
-            out
-        }
+    // Rules first: they are the only accents that are a filled rectangle.
+    if matches!(kind, AccentKind::Bar | AccentKind::Overline) {
+        let w = base.w.max(0.3 * size);
+        let y = -(base.ascent + gap);
+        let mut out = Sb::empty();
+        place(&mut out, &base, (w - base.w) * 0.5, 0.0);
+        out.prims
+            .push(Prim::filled_rect(Rect::from_xywh(0.0, y, w, stroke_w), 0.0, ctx.color));
+        out.w = w;
+        out.ascent = base.ascent + gap + stroke_w;
+        out.descent = base.descent;
+        return out;
     }
+    if matches!(kind, AccentKind::Underline) {
+        let w = base.w.max(0.3 * size);
+        let y = base.descent + gap;
+        let mut out = Sb::empty();
+        place(&mut out, &base, (w - base.w) * 0.5, 0.0);
+        out.prims
+            .push(Prim::filled_rect(Rect::from_xywh(0.0, y, w, stroke_w), 0.0, ctx.color));
+        out.w = w;
+        out.ascent = base.ascent;
+        out.descent = y + stroke_w;
+        return out;
+    }
+
+    let wide = matches!(kind, AccentKind::WideHat | AccentKind::WideTilde);
+    let w = if wide {
+        base.w.max(0.5 * size)
+    } else {
+        base.w.max(0.32 * size)
+    };
+    let cx = w * 0.5;
+    let y = -(base.ascent + gap); // bottom edge of the mark's ink
+    let mut out = Sb::empty();
+    place(&mut out, &base, (w - base.w) * 0.5, 0.0);
+    out.w = w;
+    out.descent = base.descent;
+
+    // Height of the mark above `y`, used to grow the box.
+    let mut ink = 0.0f32;
+    match kind {
+        AccentKind::Hat | AccentKind::WideHat => {
+            let hh = if wide { 0.22 * size } else { 0.16 * size };
+            out.prims.push(Prim::path(
+                vec![[0.0, y + hh], [cx, y], [w, y + hh]],
+                false,
+                None,
+                Some(stroke),
+            ));
+            ink = hh + stroke_w * 0.5;
+        }
+        AccentKind::Tilde | AccentKind::WideTilde => {
+            let hh = 0.11 * size;
+            out.prims.push(Prim::path(
+                vec![
+                    [0.0, y + hh * 0.5],
+                    [w * 0.25, y],
+                    [w * 0.5, y + hh * 0.5],
+                    [w * 0.75, y + hh],
+                    [w, y + hh * 0.5],
+                ],
+                false,
+                None,
+                Some(stroke),
+            ));
+            ink = hh + stroke_w * 0.5;
+        }
+        AccentKind::Check => {
+            let hh = 0.15 * size;
+            out.prims.push(Prim::path(
+                vec![[0.0, y], [cx, y + hh], [w, y]],
+                false,
+                None,
+                Some(stroke),
+            ));
+            ink = hh + stroke_w * 0.5;
+        }
+        AccentKind::Breve => {
+            let hh = 0.14 * size;
+            out.prims.push(Prim::path(
+                vec![
+                    [0.0, y],
+                    [w * 0.25, y + hh * 0.7],
+                    [cx, y + hh],
+                    [w * 0.75, y + hh * 0.7],
+                    [w, y],
+                ],
+                false,
+                None,
+                Some(stroke),
+            ));
+            ink = hh + stroke_w * 0.5;
+        }
+        AccentKind::Vec => {
+            let hh = 0.12 * size;
+            let ty = y + hh * 0.5;
+            let barb = 0.11 * size;
+            out.prims.push(Prim::line([0.0, ty], [w, ty], stroke));
+            out.prims
+                .push(Prim::line([w, ty], [w - barb, ty - barb * 0.55], stroke));
+            out.prims
+                .push(Prim::line([w, ty], [w - barb, ty + barb * 0.55], stroke));
+            ink = hh * 0.5 + barb * 0.55 + stroke_w * 0.5;
+        }
+        AccentKind::Acute | AccentKind::Grave => {
+            let mw = 0.22 * size;
+            let hh = 0.16 * size;
+            let rising = kind == AccentKind::Acute;
+            let (y0, y1) = if rising { (y + hh, y) } else { (y, y + hh) };
+            out.prims.push(Prim::line(
+                [cx - mw * 0.5, y0],
+                [cx + mw * 0.5, y1],
+                stroke,
+            ));
+            ink = hh + stroke_w * 0.5;
+        }
+        AccentKind::Dot => {
+            let r = (0.05 * size).max(0.8);
+            out.prims
+                .push(Prim::circle([cx, y + r], r, Some(ctx.color), None));
+            ink = r * 2.0;
+        }
+        AccentKind::Ddot => {
+            let r = (0.045 * size).max(0.7);
+            let dx = 0.09 * size;
+            out.prims
+                .push(Prim::circle([cx - dx, y + r], r, Some(ctx.color), None));
+            out.prims
+                .push(Prim::circle([cx + dx, y + r], r, Some(ctx.color), None));
+            ink = r * 2.0;
+        }
+        AccentKind::Ring => {
+            let r = (0.075 * size).max(0.9);
+            out.prims
+                .push(Prim::circle([cx, y + r], r, None, Some(stroke)));
+            ink = r * 2.0;
+        }
+        _ => {}
+    }
+
+    out.ascent = base.ascent + gap + ink;
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Negation, stacks, braces, boxes
+// ---------------------------------------------------------------------------
+
+/// `\not`: a slash laid over the base atom. TeX overlays the slash without
+/// changing the advance width, so the atom keeps its own metrics and only the
+/// ink extends slightly past the box.
+fn layout_negate(base: Sb, size: f32, ctx: &mut Ctx) -> Sb {
+    let stroke = Stroke::new((0.055 * size).max(0.7), ctx.color);
+    // A fixed-size slash centred on the math axis, as TeX overlays it: sizing it
+    // from the base's line box would turn `\not=` into a full-height bar.
+    let half = 0.34 * size;
+    let axis = -AXIS * size;
+    let overhang = 0.02 * size;
+    let w = base.w.max(0.25 * size);
+    let mut out = Sb::empty();
+    place(&mut out, &base, 0.0, 0.0);
+    out.prims.push(Prim::line(
+        [-overhang, axis + half],
+        [w + overhang, axis - half],
+        stroke,
+    ));
+    out.w = w;
+    out.ascent = base.ascent.max(-(axis - half));
+    out.descent = base.descent.max(axis + half);
+    out
+}
+
+/// `\overset` / `\underset` / `\stackrel`: small items centred over or under a
+/// full-size base, always stacked (never beside), as in amsmath.
+fn layout_stack(
+    base: &Node,
+    top: Option<&Node>,
+    bottom: Option<&Node>,
+    size: f32,
+    level: u32,
+    ctx: &mut Ctx,
+) -> Sb {
+    let b = layout(base, size, level, ctx);
+    let script = size * SCRIPT_L1;
+    let t = top.map(|n| layout(n, script, level + 1, ctx));
+    let d = bottom.map(|n| layout(n, script, level + 1, ctx));
+
+    let w = b
+        .w
+        .max(t.as_ref().map_or(0.0, |s| s.w))
+        .max(d.as_ref().map_or(0.0, |s| s.w));
+    let gap = 0.12 * size;
+
+    let mut out = Sb::empty();
+    place(&mut out, &b, (w - b.w) * 0.5, 0.0);
+    out.w = w;
+    out.ascent = b.ascent;
+    out.descent = b.descent;
+
+    if let Some(s) = t {
+        let dy = -(b.ascent + gap) - s.descent;
+        place(&mut out, &s, (w - s.w) * 0.5, dy);
+        out.ascent = out.ascent.max(-(dy - s.ascent));
+    }
+    if let Some(s) = d {
+        let dy = b.descent + gap + s.ascent;
+        place(&mut out, &s, (w - s.w) * 0.5, dy);
+        out.descent = out.descent.max(dy + s.descent);
+    }
+    out
+}
+
+/// `\overbrace` / `\underbrace`: a horizontal brace drawn from a polyline, with
+/// its nub at the centre for the script to sit on.
+fn layout_brace(over: bool, base: Sb, size: f32, ctx: &mut Ctx) -> Sb {
+    let gap = 0.10 * size;
+    let height = 0.42 * size;
+    let w = base.w.max(0.6 * size);
+    let stroke = Stroke::new((0.05 * size).max(0.6), ctx.color);
+    let outer = if over {
+        -(base.ascent + gap)
+    } else {
+        base.descent + gap
+    };
+    let inner = if over { outer - height } else { outer + height };
+    let mid = (outer + inner) * 0.5;
+    let q = (w * 0.06).min(0.2 * size);
+
+    let points = vec![
+        [0.0, outer],
+        [q, mid],
+        [w * 0.25, mid],
+        [w * 0.5, inner],
+        [w * 0.75, mid],
+        [w - q, mid],
+        [w, outer],
+    ];
+
+    let mut out = Sb::empty();
+    place(&mut out, &base, (w - base.w) * 0.5, 0.0);
+    out.prims.push(Prim::path(points, false, None, Some(stroke)));
+    out.w = w;
+    out.ascent = base.ascent;
+    out.descent = base.descent;
+    if over {
+        out.ascent = base.ascent + gap + height + stroke.width * 0.5;
+    } else {
+        out.descent = base.descent + gap + height + stroke.width * 0.5;
+    }
+    out
+}
+
+/// `\boxed`: a frame with padding around its content.
+fn layout_boxed(base: Sb, size: f32, ctx: &mut Ctx) -> Sb {
+    let pad = 0.22 * size;
+    let stroke = Stroke::new((0.05 * size).max(0.6), ctx.color);
+    let mut out = Sb::empty();
+    place(&mut out, &base, pad, 0.0);
+    let rect = Rect::from_xywh(
+        0.0,
+        -(base.ascent + pad),
+        base.w + 2.0 * pad,
+        base.ascent + base.descent + 2.0 * pad,
+    );
+    out.prims.push(Prim::stroked_rect(rect, 0.0, stroke));
+    out.w = base.w + 2.0 * pad;
+    out.ascent = base.ascent + pad;
+    out.descent = base.descent + pad;
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -899,7 +1179,9 @@ fn limits_allowed(base: &Node) -> bool {
             LimitMode::Limits => true,
             LimitMode::Auto => matches!(kind, OpKind::Large | OpKind::Limit),
         },
-        Node::Style { body, .. } => limits_allowed(body),
+        Node::Style { body, .. } | Node::Color { body, .. } => limits_allowed(body),
+        // A brace always carries its label above/below, in either style.
+        Node::Brace { .. } => true,
         _ => false,
     }
 }
@@ -929,7 +1211,11 @@ fn layout_scripts(
     let use_limits = match limits {
         LimitMode::Limits => true,
         LimitMode::NoLimits => false,
-        LimitMode::Auto => ctx.display && limits_allowed(base),
+        // A brace label always goes above/below the brace, whatever the style.
+        LimitMode::Auto => match base {
+            Node::Brace { .. } => true,
+            _ => ctx.display && limits_allowed(base),
+        },
     };
 
     if use_limits {
@@ -991,10 +1277,17 @@ fn layout_environment(
     kind: EnvKind,
     rows: &[Vec<Node>],
     spec: Option<&ArraySpec>,
+    gaps: &[f32],
     size: f32,
     level: u32,
     ctx: &mut Ctx,
 ) -> Sb {
+    // `\hline` occupies a row of its own and never shares one with cells.
+    let is_rule: Vec<bool> = rows
+        .iter()
+        .map(|r| r.len() == 1 && matches!(r[0], Node::Rule))
+        .collect();
+
     let mut cells: Vec<Vec<Sb>> = Vec::with_capacity(rows.len());
     for row in rows {
         let mut laid = Vec::with_capacity(row.len());
@@ -1004,16 +1297,36 @@ fn layout_environment(
         cells.push(laid);
     }
 
-    let ncols = cells.iter().map(|r| r.len()).max().unwrap_or(0);
+    let spec_aligns = if kind == EnvKind::Array { spec } else { None };
+
+    let ncols = cells
+        .iter()
+        .zip(is_rule.iter())
+        .filter(|(_, rule)| !**rule)
+        .map(|(row, _)| row.len())
+        .max()
+        .unwrap_or(0);
     if ncols == 0 {
         return Sb::empty();
     }
 
     let mut widths = vec![0.0f32; ncols];
-    for row in &cells {
+    for (ri, row) in cells.iter().enumerate() {
+        if is_rule.get(ri).copied().unwrap_or(false) {
+            continue;
+        }
         for (c, cell) in row.iter().enumerate() {
             if c < ncols && cell.w > widths[c] {
                 widths[c] = cell.w;
+            }
+        }
+    }
+    // `p{..}` / `m{..}` / `b{..}` set a minimum column width, in points.
+    if let Some(s) = spec_aligns {
+        for (c, w) in widths.iter_mut().enumerate() {
+            let min = s.min_widths.get(c).copied().unwrap_or(0.0);
+            if min > *w {
+                *w = min;
             }
         }
     }
@@ -1041,44 +1354,79 @@ fn layout_environment(
         vec![ColAlign::Center; ncols]
     };
 
-    let vlines: Vec<bool> = match spec {
-        Some(s) if kind == EnvKind::Array => (0..=ncols)
+    let vlines: Vec<bool> = match spec_aligns {
+        Some(s) => (0..=ncols)
             .map(|i| s.vlines.get(i).copied().unwrap_or(false))
             .collect(),
         _ => vec![false; ncols + 1],
     };
     let has_rules = vlines.iter().any(|b| *b);
 
-    let col_gap = 0.6 * size;
-    let pad = if has_rules { 0.3 * size } else { 0.0 };
+    // `@{}` overrides the space at a column boundary; everything else gets the
+    // standard inter-column gap. A vertical rule needs a little padding so it
+    // does not touch the glyphs, which is also what `@{}` usually trims.
+    let explicit_gap = |i: usize| -> Option<f32> {
+        spec_aligns
+            .and_then(|s| s.gaps.get(i).copied().flatten())
+            .map(|em| em * size)
+    };
+    let rule_pad = if has_rules { 0.3 * size } else { 0.0 };
+    let lead = explicit_gap(0).unwrap_or(rule_pad);
+    let trail = explicit_gap(ncols).unwrap_or(rule_pad);
+    let inner_gap = |i: usize| explicit_gap(i).unwrap_or(DEFAULT_COL_GAP * size);
+
     let mut col_x = vec![0.0f32; ncols];
-    let mut x = pad;
-    for (slot, w) in col_x.iter_mut().zip(widths.iter()) {
+    let mut x = lead;
+    for (c, slot) in col_x.iter_mut().enumerate() {
         *slot = x;
-        x += w + col_gap;
+        x += widths[c];
+        if c + 1 < ncols {
+            x += inner_gap(c + 1);
+        }
     }
-    let content_right = (x - col_gap).max(0.0);
-    let total_w = content_right + pad;
+    let total_w = x + trail;
 
     let row_gap = 0.35 * size;
+    let rule_clear = 0.18 * size;
     let mut baselines = vec![0.0f32; cells.len()];
-    let mut y = 0.0f32;
-    let mut ascent = 0.0f32;
-    let mut descent = 0.0f32;
+    let mut rule_y: Vec<f32> = Vec::new();
+    let mut cursor = 0.0f32; // top edge of the row being placed
+    let mut bottom = 0.0f32;
     for (ri, row) in cells.iter().enumerate() {
+        if is_rule.get(ri).copied().unwrap_or(false) {
+            rule_y.push(cursor);
+            cursor += rule_clear;
+            bottom = cursor;
+            continue;
+        }
         let a = row.iter().map(|c| c.ascent).fold(0.0f32, f32::max);
         let d = row.iter().map(|c| c.descent).fold(0.0f32, f32::max);
-        let baseline = y + a;
+        let baseline = cursor + a;
         baselines[ri] = baseline;
-        if ri == 0 {
-            ascent = a;
-        }
-        descent = baseline + d;
-        y = baseline + d + row_gap;
+        bottom = baseline + d;
+        let extra = gaps.get(ri).copied().unwrap_or(0.0);
+        cursor = bottom + row_gap + extra;
     }
+
+    // TeX centres a matrix (and `cases`, `aligned`, ...) on the math axis
+    // instead of hanging it from the baseline, so the whole block is shifted
+    // until its middle sits on the axis. Without this the first row's own
+    // ascent would be counted twice and the block would sit too low.
+    let dy = -AXIS * size - bottom * 0.5;
+    for value in &mut baselines {
+        *value += dy;
+    }
+    for value in &mut rule_y {
+        *value += dy;
+    }
+    let ascent = -dy;
+    let descent = bottom + dy;
 
     let mut out = Sb::empty();
     for (ri, row) in cells.iter().enumerate() {
+        if is_rule.get(ri).copied().unwrap_or(false) {
+            continue;
+        }
         for (c, cell) in row.iter().enumerate() {
             if c >= ncols {
                 continue;
@@ -1092,13 +1440,20 @@ fn layout_environment(
         }
     }
 
+    // `\hline` rules span the whole table, including the padding columns.
+    let hstroke = Stroke::new((0.045 * size).max(0.6), ctx.color);
+    for ry in &rule_y {
+        out.prims
+            .push(Prim::line([0.0, *ry], [total_w, *ry], hstroke));
+    }
+
     if has_rules {
         let stroke = Stroke::new((0.04 * size).max(0.5), ctx.color);
-        // Boundaries: 0, one between each pair of columns, then the right edge.
+        // Boundaries: left edge, one between each pair of columns, right edge.
         let mut rule_x: Vec<f32> = Vec::with_capacity(ncols + 2);
         rule_x.push(0.0);
-        for cx in &col_x {
-            rule_x.push(cx - col_gap * 0.5);
+        for (c, cx) in col_x.iter().enumerate() {
+            rule_x.push(cx - inner_gap(c + 1) * 0.5);
         }
         rule_x.push(total_w);
         for (c, rx) in rule_x.iter().enumerate() {
@@ -1155,7 +1510,7 @@ fn strip_delims(src: &str) -> (&str, bool) {
 fn is_blank(node: &Node) -> bool {
     match node {
         Node::Row(items) => items.iter().all(is_blank),
-        Node::Space(_) | Node::StyleSwitch(_) => true,
+        Node::Space(_) | Node::StyleSwitch(_) | Node::ColorSwitch(_) | Node::Rule => true,
         Node::Scripts {
             base, sup, sub, ..
         } => {
@@ -1163,7 +1518,18 @@ fn is_blank(node: &Node) -> bool {
                 && sup.as_deref().is_none_or(is_blank)
                 && sub.as_deref().is_none_or(is_blank)
         }
-        Node::Style { body, .. } => is_blank(body),
+        Node::Style { body, .. }
+        | Node::Color { body, .. }
+        | Node::Classed { body, .. }
+        | Node::Boxed { body }
+        | Node::Phantom { body, .. } => is_blank(body),
+        Node::Stack { base, top, bottom, .. } => {
+            is_blank(base)
+                && top.as_deref().is_none_or(is_blank)
+                && bottom.as_deref().is_none_or(is_blank)
+        }
+        Node::Negate { base } => is_blank(base),
+        Node::Brace { body, .. } => is_blank(body),
         _ => false,
     }
 }
@@ -1458,5 +1824,381 @@ mod tests {
             .prims
             .iter()
             .any(|p| matches!(p, Prim::Line { .. })));
+    }
+
+    // -- constructs added by the LaTeX completeness pass ---------------------
+
+    fn lines(m: &MathRender) -> Vec<([f32; 2], [f32; 2])> {
+        m.prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Line { from, to, .. } => Some((*from, *to)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn text_colors(m: &MathRender) -> Vec<(String, Rgba)> {
+        m.prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, color, .. } => Some((text.clone(), *color)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn not_draws_a_slash_across_the_base() {
+        let m = r("\\not\\in");
+        let lines = lines(&m);
+        assert_eq!(lines.len(), 1, "\\not 应画一条斜线，实际 {:?}", lines);
+        let (from, to) = lines[0];
+        assert!((from[1] - to[1]).abs() > 0.5, "斜线应跨越符号高度");
+        assert!(all_finite(&m));
+        // The slash must not swallow the symbol itself.
+        assert!(texts(&m).iter().any(|t| t == "\u{2209}" || t == "\u{2208}"));
+    }
+
+    #[test]
+    fn overset_and_underset_stack_their_arguments() {
+        let plain = r("=");
+        let over = r("\\overset{!}{=}");
+        let under = r("\\underset{n}{=}");
+        assert!(over.size[1] > plain.size[1]);
+        assert!(under.size[1] > plain.size[1]);
+        assert!(texts(&over).iter().any(|t| t == "!"));
+        assert!(texts(&under).iter().any(|t| t == "n"));
+        assert!(all_finite(&over) && all_finite(&under));
+    }
+
+    #[test]
+    fn stackrel_is_a_relation_and_still_stacks() {
+        let m = r("a \\stackrel{\\text{def}}{=} b");
+        assert!(m.size[1] > 0.0);
+        assert!(all_finite(&m));
+        // A relation gets thick spaces on both sides, a binary operator only medium.
+        let rel = r("a\\stackrel{}{=}b");
+        let bin = r("a+b");
+        assert!(rel.size[0] > bin.size[0], "{} <= {}", rel.size[0], bin.size[0]);
+    }
+
+    #[test]
+    fn overbrace_draws_a_brace_and_takes_a_label() {
+        let plain = r("a+b");
+        let braced = r("\\overbrace{a+b}^{n}");
+        assert!(braced.size[1] > plain.size[1]);
+        assert!(texts(&braced).iter().any(|t| t == "n"));
+        assert!(
+            braced.prims.iter().any(|p| matches!(p, Prim::Path { .. })),
+            "花括号应是一条折线"
+        );
+        let under = r("\\underbrace{a+b}_{m}");
+        assert!(under.size[1] > plain.size[1]);
+        assert!(all_finite(&under));
+    }
+
+    #[test]
+    fn boxed_draws_a_frame_around_its_content() {
+        let plain = r("x");
+        let boxed = r("\\boxed{x}");
+        assert!(boxed.size[0] > plain.size[0]);
+        assert!(boxed.size[1] > plain.size[1]);
+        let framed = boxed.prims.iter().any(|p| {
+            matches!(
+                p,
+                Prim::Rect {
+                    stroke: Some(_),
+                    ..
+                }
+            )
+        });
+        assert!(framed, "缺少边框");
+    }
+
+    #[test]
+    fn phantom_occupies_space_without_drawing() {
+        let m = r("a\\phantom{xyz}b");
+        assert_eq!(texts(&m), vec!["a".to_owned(), "b".to_owned()]);
+        let solid = r("axyzb");
+        assert!(
+            (m.size[0] - solid.size[0]).abs() < 0.01,
+            "\\phantom 的宽度应等于其内容的宽度：{} vs {}",
+            m.size[0],
+            solid.size[0]
+        );
+        // Height and depth are kept where the *parent* can see them: inside a
+        // radical the reserved height shows up as a taller sign.
+        let v = r("\\sqrt{\\vphantom{\\frac{1}{2}}x}");
+        assert!(
+            v.size[1] > r("\\sqrt{x}").size[1],
+            "\\vphantom 应保留高度：{} <= {}",
+            v.size[1],
+            r("\\sqrt{x}").size[1]
+        );
+        assert_eq!(texts(&v), vec!["x".to_owned()]);
+    }
+
+    #[test]
+    fn textcolor_paints_only_its_argument() {
+        let red = Rgba::hex(0xFF_0000);
+        let m = r("\\textcolor{red}{x}+y");
+        let painted = text_colors(&m);
+        let x = painted.iter().find(|(t, _)| t == "x").expect("x 缺失");
+        assert_eq!(x.1, red, "x 应为红色");
+        let y = painted.iter().find(|(t, _)| t == "y").expect("y 缺失");
+        assert_eq!(y.1, Rgba::BLACK, "作用域外的 y 不该染色");
+    }
+
+    #[test]
+    fn color_switch_stops_at_the_end_of_its_group() {
+        let blue = Rgba::hex(0x00_00FF);
+        let m = r("{\\color{blue}x}y");
+        let painted = text_colors(&m);
+        let x = painted.iter().find(|(t, _)| t == "x").expect("x 缺失");
+        assert_eq!(x.1, blue);
+        let y = painted.iter().find(|(t, _)| t == "y").expect("y 缺失");
+        assert_eq!(y.1, Rgba::BLACK, "组结束后颜色应复位");
+    }
+
+    #[test]
+    fn textcolor_accepts_hex_literals() {
+        let m = r("\\textcolor{#0f0}{x}");
+        let painted = text_colors(&m);
+        assert_eq!(painted[0].1, Rgba::hex(0x00_FF00));
+    }
+
+    #[test]
+    fn unknown_color_warns_instead_of_failing() {
+        let m = r("\\textcolor{chartreuse}{x}");
+        assert!(m.warnings.iter().any(|w| w.contains("chartreuse")));
+        assert!(all_finite(&m));
+    }
+
+    #[test]
+    fn operatorname_star_stacks_its_limits() {
+        let side = r("$$\\operatorname{argmax}_{x}$$");
+        let stacked = r("$$\\operatorname*{argmax}_{x}$$");
+        assert!(texts(&side).iter().any(|t| t == "argmax"));
+        assert!(texts(&stacked).iter().any(|t| t == "argmax"));
+        assert!(
+            stacked.size[1] > side.size[1],
+            "\\operatorname* 应把下标叠在下方：{} <= {}",
+            stacked.size[1],
+            side.size[1]
+        );
+    }
+
+    #[test]
+    fn integral_limits_sit_beside_the_sign_by_default() {
+        let int = r("$$\\int_0^1$$");
+        let sum = r("$$\\sum_0^1$$");
+        assert!(
+            int.size[1] < sum.size[1],
+            "积分的上下限应在右侧：{} >= {}",
+            int.size[1],
+            sum.size[1]
+        );
+        // `\limits` still forces them to stack.
+        let forced = r("$$\\int\\limits_0^1$$");
+        assert!(forced.size[1] > int.size[1]);
+    }
+
+    #[test]
+    fn substack_builds_multi_row_limits() {
+        let one = r("$$\\sum_{i=1}^{n}$$");
+        let many = r("$$\\sum_{\\substack{i=1\\\\j=2}}^{n}$$");
+        assert!(
+            many.size[1] > one.size[1],
+            "\\substack 应让下标变成多行：{} <= {}",
+            many.size[1],
+            one.size[1]
+        );
+        assert!(all_finite(&many));
+    }
+
+    #[test]
+    fn spacing_commands_follow_the_em_unit() {
+        let quad = r("a\\quad b");
+        let mkern = r("a\\mkern{18mu}b");
+        assert!(
+            (quad.size[0] - mkern.size[0]).abs() < 0.01,
+            "18mu 应等于一个 quad：{} vs {}",
+            mkern.size[0],
+            quad.size[0]
+        );
+        let neg = r("a\\negthinspace b");
+        assert!(neg.size[0] < r("a b").size[0]);
+    }
+
+    #[test]
+    fn a_malformed_mkern_does_not_swallow_the_next_symbol() {
+        let m = r("\\mkern2x");
+        assert!(
+            texts(&m).iter().any(|t| t == "x"),
+            "x 被当作单位吃掉了：{:?}",
+            texts(&m)
+        );
+        assert!(!m.warnings.is_empty());
+    }
+
+    #[test]
+    fn the_sample_documents_formulas_render_without_warnings() {
+        // Pinned so the built-in sample can never start warning in the status bar.
+        for src in [
+            "\\int_{0}^{\\infty} \\frac{x^{3}}{e^{x} - 1}\\, dx = \\frac{\\pi^{4}}{15}",
+            "\\boxed{\\sum_{k=1}^{n} k = \\frac{n(n+1)}{2}} \\qquad \\overbrace{a + b + \\cdots + z}^{26}",
+            "\\operatorname*{argmin}_{\\theta}\\; \\mathcal{L}(\\theta) = \\sum_{i=1}^{n} \\left( y_i - h_\\theta(x_i) \\right)^2",
+            "f(x) = \\begin{cases} x^2 & x \\ge 0 \\\\ -x & x < 0 \\end{cases}",
+            "\\begin{array}{c|c}\\hline \\text{符号} & \\text{含义} \\\\ \\hline \\forall & \\text{任意} \\\\ \\hline\\end{array}",
+            "\\textcolor{#c0392b}{x} \\not\\in \\varnothing",
+            "E = mc^2",
+        ] {
+            let m = r(src);
+            assert!(m.warnings.is_empty(), "{src:?} 产生警告 {:?}", m.warnings);
+            assert!(all_finite(&m), "{src:?} -> {:?}", m.size);
+        }
+    }
+
+    #[test]
+    fn math_class_commands_override_the_atom_class() {
+        let rel = r("a\\mathrel{+}b");
+        let bin = r("a+b");
+        assert!(
+            rel.size[0] > bin.size[0],
+            "关系符两侧的间距应大于二元运算符：{} <= {}",
+            rel.size[0],
+            bin.size[0]
+        );
+    }
+
+    #[test]
+    fn array_hline_draws_horizontal_rules() {
+        let plain = r("\\begin{array}{c|c}a&b\\\\c&d\\end{array}");
+        let ruled = r("\\begin{array}{c|c}\\hline a&b\\\\\\hline c&d\\\\\\hline\\end{array}");
+        let horizontal = ruled
+            .prims
+            .iter()
+            .filter(|p| match p {
+                Prim::Line { from, to, .. } => (from[1] - to[1]).abs() < 0.01,
+                _ => false,
+            })
+            .count();
+        assert_eq!(horizontal, 3, "三条 \\hline 各应画一条横线");
+        assert!(ruled.size[1] > plain.size[1]);
+        // The same rules also work inside `cases`.
+        let cases = r("\\begin{cases}\\hline a&b\\\\\\hline c&d\\end{cases}");
+        assert!(all_finite(&cases));
+    }
+
+    #[test]
+    fn array_at_suppresses_the_boundary_space() {
+        let default = r("\\begin{array}{cc}a&b\\end{array}");
+        let tight = r("\\begin{array}{c@{}c}a&b\\end{array}");
+        assert!(
+            tight.size[0] < default.size[0],
+            "@{{}} 应去掉列间间距：{} >= {}",
+            tight.size[0],
+            default.size[0]
+        );
+        // A padding-only column boundary shows up as a gap between the cells.
+        let padded = r("\\begin{array}{c@{1em}c}a&b\\end{array}");
+        assert!(padded.size[0] > default.size[0], "@{{1em}} 应加宽列间间距");
+    }
+
+    #[test]
+    fn array_star_repeats_a_column_spec() {
+        let explicit = r("\\begin{array}{cc}a&b\\end{array}");
+        let starred = r("\\begin{array}{*{2}{c}}a&b\\end{array}");
+        assert!(
+            (explicit.size[0] - starred.size[0]).abs() < 0.01,
+            "*{{2}}{{c}} 应等价于 cc：{} vs {}",
+            starred.size[0],
+            explicit.size[0]
+        );
+    }
+
+    #[test]
+    fn array_p_width_sets_a_minimum_column_width() {
+        let narrow = r("\\begin{array}{cc}a&b\\end{array}");
+        let wide = r("\\begin{array}{p{3cm}c}a&b\\end{array}");
+        assert!(
+            wide.size[0] > narrow.size[0],
+            "p{{3cm}} 应把列撑宽：{} <= {}",
+            wide.size[0],
+            narrow.size[0]
+        );
+    }
+
+    #[test]
+    fn bracket_row_gap_adds_vertical_space() {
+        let plain = r("\\begin{matrix}a\\\\b\\end{matrix}");
+        let spaced = r("\\begin{matrix}a\\\\[12pt]b\\end{matrix}");
+        assert!(
+            spaced.size[1] > plain.size[1] + 6.0,
+            "\\\\[12pt] 应加高一行：{} vs {}",
+            spaced.size[1],
+            plain.size[1]
+        );
+        assert!(all_finite(&spaced));
+    }
+
+    #[test]
+    fn extra_environment_aliases_parse() {
+        for src in [
+            "\\begin{split}a&=b\\end{split}",
+            "\\begin{alignedat}{2}a&=b\\end{alignedat}",
+            "\\begin{gather*}a\\\\b\\end{gather*}",
+            "\\begin{multline}a\\\\b\\end{multline}",
+            "\\begin{dcases}a&b\\end{dcases}",
+            "\\begin{eqnarray}a&=&b\\end{eqnarray}",
+        ] {
+            let m = r(src);
+            assert!(
+                m.warnings.iter().all(|w| !w.contains("未知环境")),
+                "{src:?} 被当成未知环境：{:?}",
+                m.warnings
+            );
+            assert!(all_finite(&m), "{src:?} -> {:?}", m.size);
+        }
+    }
+
+    #[test]
+    fn new_symbols_resolve_to_glyphs() {
+        let m = r("\\therefore\\because\\lesssim\\coloneqq\\sqcup\\setminus\\checkmark");
+        assert!(m.warnings.is_empty(), "意外的警告：{:?}", m.warnings);
+        assert_eq!(texts(&m).len(), 7);
+    }
+
+    #[test]
+    fn more_malformed_inputs_stay_finite() {
+        let samples = [
+            "\\not",
+            "\\overset",
+            "\\overset{a}",
+            "\\substack",
+            "\\substack{",
+            "\\substack{a\\\\",
+            "\\boxed",
+            "\\overbrace",
+            "\\begin{array}{@{}p}",
+            "\\begin{array}{*{2}}a\\end{array}",
+            "\\begin{array}{p{}}a\\end{array}",
+            "\\begin{array}{c}\\hline",
+            "\\color",
+            "\\color{}x",
+            "\\textcolor{red}",
+            "\\mkern",
+            "\\mkern2",
+            "\\mathbin",
+            "\\phantom",
+            "\\\\[x]",
+            "\\begin{matrix}a\\\\[6pt]b\\end{matrix}",
+            "\\begin{array}{c}\\cline{1-2}a\\end{array}",
+        ];
+        for s in samples {
+            let m = r(s);
+            assert!(all_finite(&m), "{s:?} 产生了非法尺寸 {:?}", m.size);
+        }
     }
 }

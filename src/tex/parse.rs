@@ -11,7 +11,7 @@
 //! a glyph, a font face and a spacing class; sizes and positions belong to
 //! [`super::layout`].
 
-use crate::gfx::{Family, Slant, Weight};
+use crate::gfx::{Family, Rgba, Slant, Weight};
 
 /// Maximum nesting depth for braces, groups and environments.
 ///
@@ -50,14 +50,24 @@ pub enum Token {
 ///
 /// Those groups are captured verbatim by the lexer so that `\text{if }` keeps
 /// its spaces (which math mode would otherwise discard).
-const RAW_GROUP_COMMANDS: [&str; 9] = [
+const RAW_GROUP_COMMANDS: [&str; 19] = [
     "text",
     "textrm",
     "textsf",
     "texttt",
+    "textnormal",
+    "textup",
+    "textmd",
+    "textbf",
+    "textit",
+    "textsl",
     "mbox",
     "operatorname",
     "hspace",
+    "mkern",
+    "mskip",
+    "color",
+    "textcolor",
     "begin",
     "end",
 ];
@@ -93,8 +103,15 @@ pub fn tokenize(src: &str) -> Vec<Token> {
                     while i < chars.len() && chars[i].is_alphabetic() {
                         i += 1;
                     }
-                    let name: String = chars[start..i].iter().collect();
-                    if RAW_GROUP_COMMANDS.contains(&name.as_str()) {
+                    let mut name: String = chars[start..i].iter().collect();
+                    // `\operatorname*{...}` asks for limit placement. The star
+                    // is folded into the command name so the parser sees one
+                    // token, and the text argument is still captured verbatim.
+                    if name == "operatorname" && i < chars.len() && chars[i] == '*' {
+                        i += 1;
+                        name.push('*');
+                    }
+                    if name == "operatorname*" || RAW_GROUP_COMMANDS.contains(&name.as_str()) {
                         let mut j = i;
                         while j < chars.len() && chars[j].is_whitespace() {
                             j += 1;
@@ -295,8 +312,12 @@ pub enum LimitMode {
 /// Operator flavour, deciding both glyph size and limit eligibility.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OpKind {
-    /// `\sum \int \bigcup ...`: drawn large in display style, limits allowed.
+    /// `\sum \bigcup ...`: drawn large in display style, limits allowed.
     Large,
+    /// `\int \oint ...`: drawn large in display style, but limits sit beside
+    /// the symbol unless `\limits` asks otherwise (TeX's `\nolimits` default
+    /// for integrals).
+    Integral,
     /// `\lim \sup \max`: an upright name that takes limits in display style.
     Limit,
     /// `\sin \log \det`: upright name, scripts always to the side.
@@ -377,13 +398,43 @@ pub enum ColAlign {
     Right,
 }
 
+/// Default space between two columns of an `array`, in em.
+pub const DEFAULT_COL_GAP: f32 = 0.6;
+
 /// `array` column specification, e.g. `{c|lr}`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ArraySpec {
     pub aligns: Vec<ColAlign>,
     /// `vlines[i]` is `true` when a vertical rule sits before column `i`;
     /// index `aligns.len()` is the rule after the last column.
     pub vlines: Vec<bool>,
+    /// `gaps[i]` overrides [`DEFAULT_COL_GAP`] for the space before column `i`
+    /// (`@{}` sets it to zero). Index `aligns.len()` is the trailing space.
+    pub gaps: Vec<Option<f32>>,
+    /// Minimum column widths in points, from `p{..}` / `m{..}` / `b{..}`.
+    pub min_widths: Vec<f32>,
+}
+
+impl Default for ArraySpec {
+    fn default() -> Self {
+        Self {
+            aligns: Vec::new(),
+            vlines: vec![false],
+            gaps: Vec::new(),
+            min_widths: Vec::new(),
+        }
+    }
+}
+
+impl ArraySpec {
+    fn push_col(&mut self, align: ColAlign, min_width: f32) {
+        self.aligns.push(align);
+        self.vlines.push(false);
+        if self.gaps.len() < self.aligns.len() {
+            self.gaps.push(None);
+        }
+        self.min_widths.push(min_width);
+    }
 }
 
 /// Supported `\begin{...}` families.
@@ -405,15 +456,19 @@ impl EnvKind {
     /// Map an environment name to a kind. `None` means "unknown".
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
-            "matrix" | "smallmatrix" => Self::Matrix,
-            "pmatrix" => Self::ParenMatrix,
-            "bmatrix" => Self::BracketMatrix,
-            "vmatrix" => Self::BarMatrix,
-            "Bmatrix" => Self::BraceMatrix,
-            "cases" => Self::Cases,
-            "aligned" => Self::Aligned,
-            "align" | "align*" => Self::Align,
-            "gathered" | "gather" => Self::Gathered,
+            // `smallmatrix` is typographically smaller, but the row/column
+            // model is the same, so it shares the matrix path.
+            "matrix" | "smallmatrix" | "matrix*" => Self::Matrix,
+            "pmatrix" | "pmatrix*" => Self::ParenMatrix,
+            "bmatrix" | "bmatrix*" => Self::BracketMatrix,
+            "vmatrix" | "vmatrix*" => Self::BarMatrix,
+            "Bmatrix" | "Bmatrix*" => Self::BraceMatrix,
+            "cases" | "dcases" | "rcases" | "cases*" => Self::Cases,
+            // `split`, `alignedat` and friends all alternate columns around the
+            // alignment point, which is exactly the `aligned` model.
+            "aligned" | "split" | "alignedat" | "alignat" | "alignat*" => Self::Aligned,
+            "align" | "align*" | "eqnarray" | "eqnarray*" | "flalign" | "flalign*" => Self::Align,
+            "gathered" | "gather" | "gather*" | "multline" | "multline*" => Self::Gathered,
             "array" => Self::Array,
             _ => return None,
         })
@@ -445,6 +500,7 @@ pub enum Node {
     Text {
         body: String,
         style: TextStyle,
+        weight: Weight,
         class: Class,
     },
     /// A style scope. Purely structural at layout time: the fonts of the
@@ -497,11 +553,47 @@ pub enum Node {
         kind: EnvKind,
         rows: Vec<Vec<Node>>,
         spec: Option<ArraySpec>,
+        /// Extra vertical space (in points) after row `i`, from `\\[dim]`.
+        gaps: Vec<f32>,
     },
+    /// `\not`: a negation slash drawn across the base atom.
+    Negate { base: Box<Node> },
+    /// `\overset` / `\underset` / `\stackrel`.
+    Stack {
+        base: Box<Node>,
+        top: Option<Box<Node>>,
+        bottom: Option<Box<Node>>,
+        class: Class,
+    },
+    /// `\overbrace` / `\underbrace`; scripts attach to the brace.
+    Brace { over: bool, body: Box<Node> },
+    /// `\boxed` / `\fbox`.
+    Boxed { body: Box<Node> },
+    /// `\phantom` and friends: occupy space, draw nothing.
+    Phantom { body: Box<Node>, kind: PhantomKind },
+    /// `\mathbin{...}` and friends: force an atom class.
+    Classed { class: Class, body: Box<Node> },
+    /// `\textcolor{...}{...}`: colour scope that ends with the node.
+    Color { color: Rgba, body: Box<Node> },
+    /// `\color{...}`: colour switch for the rest of the enclosing group.
+    ColorSwitch(Rgba),
+    /// `\hline` inside an environment.
+    Rule,
     /// Text the parser could not interpret, kept verbatim as `\foo`.
     Raw(String),
     /// `\\` outside an environment; laid out as a space.
     LineBreak,
+}
+
+/// Which parts of a phantom to keep.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PhantomKind {
+    /// `\phantom`: both size and depth.
+    Full,
+    /// `\hphantom`: width only.
+    Horizontal,
+    /// `\vphantom`: height and depth only.
+    Vertical,
 }
 
 /// Result of [`parse`].
@@ -809,6 +901,7 @@ impl P {
             Token::Group(g) => Node::Text {
                 body: g,
                 style: TextStyle::Sans,
+                weight: Weight::Regular,
                 class: Class::Ord,
             },
             Token::Sup | Token::Sub => {
@@ -1007,20 +1100,108 @@ impl P {
                 self.warn("\\end 没有匹配的 \\begin");
                 Node::Raw("\\end".to_owned())
             }
-            "text" => self.text_node(TextStyle::Sans, Class::Ord),
-            "textrm" => self.text_node(TextStyle::Serif, Class::Ord),
-            "textsf" => self.text_node(TextStyle::Sans, Class::Ord),
-            "texttt" => self.text_node(TextStyle::Mono, Class::Ord),
-            "mbox" => self.text_node(TextStyle::Serif, Class::Ord),
-            "operatorname" => self.text_node(TextStyle::Serif, Class::Op),
+            "text" => self.text_node(TextStyle::Sans, Weight::Regular, Class::Ord),
+            "textrm" => self.text_node(TextStyle::Serif, Weight::Regular, Class::Ord),
+            "textsf" => self.text_node(TextStyle::Sans, Weight::Regular, Class::Ord),
+            "texttt" => self.text_node(TextStyle::Mono, Weight::Regular, Class::Ord),
+            "textnormal" | "textup" => self.text_node(TextStyle::Serif, Weight::Regular, Class::Ord),
+            "textmd" => self.text_node(TextStyle::Serif, Weight::Regular, Class::Ord),
+            "textbf" => self.text_node(TextStyle::Serif, Weight::Bold, Class::Ord),
+            "textit" | "textsl" => self.text_node(TextStyle::Serif, Weight::Regular, Class::Ord),
+            "mbox" => self.text_node(TextStyle::Serif, Weight::Regular, Class::Ord),
+            "operatorname" => self.text_node(TextStyle::Serif, Weight::Regular, Class::Op),
+            "operatorname*" => {
+                // Limit-taking operator name: laid out as an upright op so that
+                // scripts stack in display style, exactly like `\lim`.
+                if let Some(body) = self.take_group() {
+                    Node::Op {
+                        text: body,
+                        kind: OpKind::Limit,
+                        limits: LimitMode::Auto,
+                    }
+                } else {
+                    self.warn("\\operatorname* 缺少 {...} 参数");
+                    Node::Raw("\\operatorname*".to_owned())
+                }
+            }
             "mathrm" => self.style_wrap(MathStyle::Roman),
             "mathbf" => self.style_wrap(MathStyle::Bold),
+            "boldsymbol" | "bm" | "pmb" => self.style_wrap(MathStyle::Bold),
             "mathit" => self.style_wrap(MathStyle::Italic),
             "mathsf" => self.style_wrap(MathStyle::Sans),
             "mathtt" => self.style_wrap(MathStyle::Mono),
+            "not" => {
+                let base = self.parse_atom();
+                Node::Negate {
+                    base: Box::new(base),
+                }
+            }
+            "overset" => {
+                let top = self.parse_arg();
+                let base = self.parse_arg();
+                Node::Stack {
+                    base: Box::new(base),
+                    top: Some(Box::new(top)),
+                    bottom: None,
+                    class: Class::Ord,
+                }
+            }
+            "underset" => {
+                let bottom = self.parse_arg();
+                let base = self.parse_arg();
+                Node::Stack {
+                    base: Box::new(base),
+                    top: None,
+                    bottom: Some(Box::new(bottom)),
+                    class: Class::Ord,
+                }
+            }
+            "stackrel" => {
+                let top = self.parse_arg();
+                let base = self.parse_arg();
+                Node::Stack {
+                    base: Box::new(base),
+                    top: Some(Box::new(top)),
+                    bottom: None,
+                    class: Class::Rel,
+                }
+            }
+            "overbrace" => Node::Brace {
+                over: true,
+                body: Box::new(self.parse_arg()),
+            },
+            "underbrace" => Node::Brace {
+                over: false,
+                body: Box::new(self.parse_arg()),
+            },
+            "boxed" | "fbox" => Node::Boxed {
+                body: Box::new(self.parse_arg()),
+            },
+            "phantom" => Node::Phantom {
+                body: Box::new(self.parse_arg()),
+                kind: PhantomKind::Full,
+            },
+            "hphantom" => Node::Phantom {
+                body: Box::new(self.parse_arg()),
+                kind: PhantomKind::Horizontal,
+            },
+            "vphantom" => Node::Phantom {
+                body: Box::new(self.parse_arg()),
+                kind: PhantomKind::Vertical,
+            },
+            "substack" => self.substack(),
+            "mathord" => self.classed(Class::Ord),
+            "mathop" => self.classed(Class::Op),
+            "mathbin" => self.classed(Class::Bin),
+            "mathrel" => self.classed(Class::Rel),
+            "mathopen" => self.classed(Class::Open),
+            "mathclose" => self.classed(Class::Close),
+            "mathpunct" => self.classed(Class::Punct),
+            "mathinner" => self.classed(Class::Inner),
             "bmod" | "mod" => Node::Text {
                 body: "mod".to_owned(),
                 style: TextStyle::Serif,
+                weight: Weight::Regular,
                 class: Class::Bin,
             },
             "pmod" => {
@@ -1029,6 +1210,7 @@ impl P {
                     Node::Text {
                         body: "mod".to_owned(),
                         style: TextStyle::Serif,
+                        weight: Weight::Regular,
                         class: Class::Ord,
                     },
                     Node::Space(0.1667),
@@ -1040,13 +1222,37 @@ impl P {
                     body: Box::new(inner),
                 }
             }
+            "color" => {
+                let color = self.color_arg();
+                Node::ColorSwitch(color)
+            }
+            "textcolor" => {
+                let color = self.color_arg();
+                let body = self.parse_arg();
+                Node::Color {
+                    color,
+                    body: Box::new(body),
+                }
+            }
             "hspace" => self.hspace_node(),
+            "mkern" | "mskip" => Node::Space(self.dimension_arg().unwrap_or(0.0)),
             "displaystyle" => Node::StyleSwitch(SizeStyle::Display),
             "textstyle" => Node::StyleSwitch(SizeStyle::Text),
             "scriptstyle" => Node::StyleSwitch(SizeStyle::Script),
             "scriptscriptstyle" => Node::StyleSwitch(SizeStyle::ScriptScript),
             "limits" | "nolimits" => {
                 self.warn("\\limits/\\nolimits 之前没有运算符");
+                Node::Row(Vec::new())
+            }
+            "hline" => {
+                self.warn("\\hline 只能出现在环境里");
+                Node::Row(Vec::new())
+            }
+            "label" | "tag" | "nonumber" | "notag" | "displaybreak" => {
+                // Reconciliation-only markers: the editor renders neither
+                // equation numbers nor cross-references, so they are dropped
+                // instead of being echoed as unknown source.
+                let _ = self.take_group();
                 Node::Row(Vec::new())
             }
             other => {
@@ -1073,15 +1279,23 @@ impl P {
             "_" => self.math_sym("_", Class::Ord, false),
             "|" => self.math_sym("\u{2016}", Class::Ord, false),
             "backslash" => self.math_sym("\\", Class::Ord, false),
-            "," => Node::Space(0.1667),
-            ":" => Node::Space(0.2222),
-            ";" => Node::Space(0.2778),
-            " " => Node::Space(0.3333),
-            "!" => Node::Space(-0.1667),
+            "lbrace" => self.math_sym("{", Class::Ord, false),
+            "rbrace" => self.math_sym("}", Class::Ord, false),
+            "," | "thinspace" => Node::Space(0.1667),
+            ":" | "medspace" => Node::Space(0.2222),
+            ";" | "thickspace" => Node::Space(0.2778),
+            " " | "\u{a0}" => Node::Space(0.3333),
+            "!" | "negthinspace" => Node::Space(-0.1667),
+            "negmedspace" => Node::Space(-0.2222),
+            "negthickspace" => Node::Space(-0.2778),
             "quad" => Node::Space(1.0),
             "qquad" => Node::Space(2.0),
-            "enspace" => Node::Space(0.5),
-            "thinspace" => Node::Space(0.1667),
+            "enspace" | "enskip" => Node::Space(0.5),
+            // Nothing in this engine stretches, so `\hfill` and `\hfil` are
+            // emulated with one quad of fixed space.
+            "hfill" | "hfil" => Node::Space(1.0),
+            "nobreakspace" => Node::Space(0.3333),
+            "allowbreak" | "nobreak" | "relax" => Node::Space(0.0),
             _ => return None,
         };
         Some(node)
@@ -1124,12 +1338,216 @@ impl P {
         }
     }
 
-    fn text_node(&mut self, style: TextStyle, class: Class) -> Node {
+    fn text_node(&mut self, style: TextStyle, weight: Weight, class: Class) -> Node {
         if let Some(body) = self.take_group() {
-            return Node::Text { body, style, class };
+            return Node::Text {
+                body,
+                style,
+                weight,
+                class,
+            };
         }
         self.warn("文本命令缺少 {...} 参数");
         Node::Raw("\\text".to_owned())
+    }
+
+    /// `\mathop{...}` and friends: wrap a body with a forced atom class.
+    fn classed(&mut self, class: Class) -> Node {
+        Node::Classed {
+            class,
+            body: Box::new(self.parse_arg()),
+        }
+    }
+
+    /// `\substack{a \\ b}`: a `gathered` environment built from the token
+    /// stream, since its rows are math rather than verbatim text.
+    fn substack(&mut self) -> Node {
+        if !matches!(self.peek(), Some(Token::LBrace)) {
+            self.warn("\\substack 缺少 {...} 参数");
+            return Node::Row(Vec::new());
+        }
+        self.next();
+        self.depth += 1;
+        let mut rows: Vec<Vec<Node>> = Vec::new();
+        let mut gaps: Vec<f32> = Vec::new();
+        loop {
+            if self.peek().is_none() {
+                self.warn("\\substack 缺少 '}'");
+                break;
+            }
+            if matches!(self.peek(), Some(Token::RBrace)) {
+                self.next();
+                break;
+            }
+            rows.push(vec![self.parse_row()]);
+            match self.peek() {
+                Some(Token::Command(c)) if c.as_str() == "\\" => {
+                    self.next();
+                    gaps.push(self.read_row_gap());
+                }
+                Some(Token::Amp) => {
+                    // `&` inside a substack is meaningless; treat it as a break.
+                    self.next();
+                    gaps.push(0.0);
+                }
+                Some(Token::RBrace) => {
+                    self.next();
+                    gaps.push(0.0);
+                    break;
+                }
+                None => {
+                    self.warn("\\substack 缺少 '}'");
+                    gaps.push(0.0);
+                    break;
+                }
+                Some(_) => {
+                    // A stray `\end` or `\right` would otherwise spin forever.
+                    self.next();
+                    gaps.push(0.0);
+                }
+            }
+        }
+        self.depth -= 1;
+        Node::Environ {
+            kind: EnvKind::Gathered,
+            rows,
+            spec: None,
+            gaps,
+        }
+    }
+
+    /// Read the colour name/`#rrggbb` argument of `\color` / `\textcolor`.
+    fn color_arg(&mut self) -> Rgba {
+        match self.take_group() {
+            Some(name) => match named_color(&name) {
+                Some(c) => c,
+                None => {
+                    self.warn(&format!("未知颜色 '{name}'，已按当前文字颜色绘制"));
+                    Rgba::BLACK
+                }
+            },
+            None => {
+                self.warn("\\color 缺少颜色参数");
+                Rgba::BLACK
+            }
+        }
+    }
+
+    /// A braced or bare dimension, in em: `\mkern{2mu}`, `\mkern2mu`,
+    /// `\hspace{1em}`, `\hspace*{1em}`.
+    fn dimension_arg(&mut self) -> Option<f32> {
+        if let Some(text) = self.take_group() {
+            return Some(parse_dimension(&text));
+        }
+        // A group that the lexer did not capture verbatim (it only does that for
+        // a fixed list of commands, and `\hspace*` puts a star in between).
+        if matches!(self.peek(), Some(Token::LBrace)) {
+            return self.read_raw_arg().map(|text| parse_dimension(&text));
+        }
+        // Bare form: a number followed by a unit, as TeX allows after `\mkern`.
+        let mut number = String::new();
+        while let Some(Token::Char(c)) = self.peek() {
+            let c = *c;
+            if c.is_ascii_digit() || c == '.' || c == '-' || c == '+' {
+                number.push(c);
+                self.next();
+            } else {
+                break;
+            }
+        }
+        let mut unit = String::new();
+        while let Some(Token::Char(c)) = self.peek() {
+            if c.is_ascii_alphabetic() && unit.len() < 2 {
+                unit.push(*c);
+                self.next();
+            } else {
+                break;
+            }
+        }
+        if number.is_empty() {
+            self.warn("长度命令缺少数值");
+            return None;
+        }
+        if !matches!(
+            unit.as_str(),
+            "mu" | "em" | "ex" | "pt" | "cm" | "mm" | "in" | "pc" | "bp" | "sp" | "dd" | "cc"
+        ) {
+            // Put the letters back: `\mkern2x` is malformed, and eating the `x`
+            // would silently drop a symbol from the formula.
+            self.i -= unit.chars().count();
+            self.warn(&format!("长度缺少单位（读到 '{unit}'），已按 em 处理"));
+            return Some(parse_dimension(&number));
+        }
+        Some(parse_dimension(&format!("{number}{unit}")))
+    }
+
+    /// Collect raw characters up to the matching `}`, including the braces, in
+    /// the same shape [`Token::Group`] would have had.
+    fn read_raw_arg(&mut self) -> Option<String> {
+        while let Some(Token::Char(c)) = self.peek() {
+            if c.is_whitespace() {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        if !matches!(self.peek(), Some(Token::LBrace)) {
+            return None;
+        }
+        self.next();
+        let mut depth = 1i32;
+        let mut s = String::new();
+        while let Some(tok) = self.next() {
+            match tok {
+                Token::LBrace => {
+                    depth += 1;
+                    s.push('{');
+                }
+                Token::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(s);
+                    }
+                    s.push('}');
+                }
+                Token::Char(c) => s.push(c),
+                Token::Command(c) => {
+                    s.push('\\');
+                    s.push_str(&c);
+                }
+                Token::Group(g) => s.push_str(&g),
+                Token::Amp => s.push('&'),
+                Token::Sup => s.push('^'),
+                Token::Sub => s.push('_'),
+            }
+        }
+        self.warn("缺少匹配的 '}'");
+        Some(s)
+    }
+
+    /// Optional `[dim]` after `\\`, giving the row extra vertical space. The
+    /// value is in points so an absolute `\\[6pt]` means what it says.
+    fn read_row_gap(&mut self) -> f32 {
+        if !matches!(self.peek(), Some(Token::Char('['))) {
+            return 0.0;
+        }
+        self.next();
+        let mut dim = String::new();
+        while let Some(tok) = self.peek() {
+            match tok {
+                Token::Char(']') => {
+                    self.next();
+                    return parse_length_pt(&dim);
+                }
+                Token::Char(c) => {
+                    dim.push(*c);
+                    self.next();
+                }
+                _ => break,
+            }
+        }
+        self.warn("\\\\[dim] 缺少 ']'");
+        0.0
     }
 
     fn style_wrap(&mut self, kind: MathStyle) -> Node {
@@ -1199,11 +1617,17 @@ impl P {
     }
 
     fn hspace_node(&mut self) -> Node {
-        if let Some(dim) = self.take_group() {
-            return Node::Space(parse_dimension(&dim));
+        // `\hspace*{..}` behaves like `\hspace{..}` here: nothing is discarded.
+        if matches!(self.peek(), Some(Token::Char('*'))) {
+            self.next();
         }
-        self.warn("\\hspace 缺少长度参数");
-        Node::Space(0.0)
+        match self.dimension_arg() {
+            Some(em) => Node::Space(em),
+            None => {
+                self.warn("\\hspace 缺少长度参数");
+                Node::Space(0.0)
+            }
+        }
     }
 
     fn big_delim(&mut self, size: BigSize, class: Class) -> Node {
@@ -1273,13 +1697,23 @@ impl P {
                 EnvKind::Matrix
             }
         };
+        // `array` takes a column spec; `alignedat`/`alignat` take a column
+        // *count* in braces, which is consumed so it does not print as text.
         let spec = if kind == EnvKind::Array {
             self.parse_array_spec()
         } else {
+            if matches!(self.peek(), Some(Token::LBrace)) && name.contains("alignat") {
+                let _ = self.read_raw_arg();
+            }
             None
         };
-        let rows = self.parse_env_body();
-        Node::Environ { kind, rows, spec }
+        let (rows, gaps) = self.parse_env_body();
+        Node::Environ {
+            kind,
+            rows,
+            spec,
+            gaps,
+        }
     }
 
     fn parse_array_spec(&mut self) -> Option<ArraySpec> {
@@ -1288,67 +1722,130 @@ impl P {
             return None;
         }
         self.next();
+        let mut spec = ArraySpec::default();
+        if !self.spec_columns(&mut spec) {
+            self.warn("array 列格式说明缺少 '}'");
+        }
+        Some(spec)
+    }
 
-        let mut spec = ArraySpec {
-            aligns: Vec::new(),
-            vlines: vec![false],
-        };
+    /// Parse column letters up to the closing `}`. Returns `false` on EOF.
+    ///
+    /// Handles the LaTeX column syntax that shows up in practice: `l c r`,
+    /// vertical rules `|`, `p{2cm}` / `m{..}` / `b{..}` minimum widths,
+    /// `@{}` gap suppression, and `*{n}{...}` repetition.
+    fn spec_columns(&mut self, spec: &mut ArraySpec) -> bool {
         loop {
-            if self.peek().is_none() {
-                self.warn("array 列格式说明缺少 '}'");
-                break;
-            }
-            if matches!(self.peek(), Some(Token::RBrace)) {
-                self.next();
-                break;
-            }
             let tok = match self.next() {
                 Some(t) => t,
-                None => break,
+                None => return false,
             };
             match tok {
-                Token::Char('^') => {}
+                Token::RBrace => return true,
+                Token::Char('l') => spec.push_col(ColAlign::Left, 0.0),
+                Token::Char('c') => spec.push_col(ColAlign::Center, 0.0),
+                Token::Char('r') => spec.push_col(ColAlign::Right, 0.0),
+                // `C` / `L` / `R` are not standard; treat them as their
+                // lowercase counterparts rather than dropping the column.
+                Token::Char('L') => spec.push_col(ColAlign::Left, 0.0),
+                Token::Char('C') => spec.push_col(ColAlign::Center, 0.0),
+                Token::Char('R') => spec.push_col(ColAlign::Right, 0.0),
                 Token::Char('|') => {
                     if let Some(last) = spec.vlines.last_mut() {
                         *last = true;
                     }
                 }
-                Token::Char('l') => {
-                    spec.aligns.push(ColAlign::Left);
-                    spec.vlines.push(false);
-                }
-                Token::Char('c') => {
-                    spec.aligns.push(ColAlign::Center);
-                    spec.vlines.push(false);
-                }
-                Token::Char('r') => {
-                    spec.aligns.push(ColAlign::Right);
-                    spec.vlines.push(false);
-                }
-                Token::Command(c) if c == "vert" => {
+                Token::Command(ref c) if c == "vert" => {
                     if let Some(last) = spec.vlines.last_mut() {
                         *last = true;
                     }
                 }
+                Token::Char('p') | Token::Char('m') | Token::Char('b') => {
+                    let w = self
+                        .read_raw_arg()
+                        .map(|s| parse_length_pt(&s).max(0.0))
+                        .unwrap_or(0.0);
+                    spec.push_col(ColAlign::Left, w);
+                }
+                Token::Char('@') => {
+                    // `@{}` removes the space at this boundary; `@{...}` is
+                    // approximated by the length of its content when it names
+                    // a spacing command, and by zero otherwise.
+                    let body = self.read_raw_arg().unwrap_or_default();
+                    let gap = parse_spec_gap(&body);
+                    let idx = spec.aligns.len();
+                    while spec.gaps.len() <= idx {
+                        spec.gaps.push(None);
+                    }
+                    spec.gaps[idx] = Some(gap);
+                }
+                Token::Char('*') => {
+                    let count = self
+                        .read_raw_arg()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(0)
+                        .min(64);
+                    if !matches!(self.peek(), Some(Token::LBrace)) {
+                        self.warn("array 的 *{n} 缺少列格式");
+                        continue;
+                    }
+                    // The repeated part is a complete spec of its own, so it is
+                    // parsed into a scratch spec and merged — sharing this loop
+                    // would consume the enclosing `}` on its first iteration.
+                    self.next();
+                    let mut sub = ArraySpec::default();
+                    if !self.spec_columns(&mut sub) {
+                        self.warn("array 的 *{n}{...} 缺少 '}'");
+                    }
+                    for _ in 0..count {
+                        for (i, align) in sub.aligns.iter().enumerate() {
+                            let width = sub.min_widths.get(i).copied().unwrap_or(0.0);
+                            spec.push_col(*align, width);
+                            if let Some(rule) = sub.vlines.get(i).copied() {
+                                if let Some(last) = spec.vlines.last_mut() {
+                                    *last = rule;
+                                }
+                            }
+                        }
+                        if let Some(rule) = sub.vlines.get(sub.aligns.len()).copied() {
+                            if rule
+                                && let Some(last) = spec.vlines.last_mut()
+                            {
+                                *last = true;
+                            }
+                        }
+                    }
+                    if sub.aligns.is_empty() && count > 0 {
+                        self.warn("array 的 *{n}{...} 里没有列格式");
+                    }
+                }
+                Token::Char('>') | Token::Char('<') => {
+                    // `>{...}` / `<{...}` inject declarations; only their
+                    // presence is noted, the content is not applied.
+                    let _ = self.read_raw_arg();
+                    self.warn("array 列格式中的 >{...} / <{...} 已被忽略");
+                }
+                Token::Char('^') => {}
                 other => {
                     self.warn(&format!("array 列格式中的 {other:?} 已被忽略"));
                 }
             }
         }
-        Some(spec)
     }
 
-    fn parse_env_body(&mut self) -> Vec<Vec<Node>> {
+    fn parse_env_body(&mut self) -> (Vec<Vec<Node>>, Vec<f32>) {
         let mut rows: Vec<Vec<Node>> = Vec::new();
+        let mut gaps: Vec<f32> = Vec::new();
         let mut row: Vec<Node> = Vec::new();
 
         loop {
             if self.peek().is_none() {
                 if !row.is_empty() {
                     rows.push(row);
+                    gaps.push(0.0);
                 }
                 self.warn("环境缺少 \\end");
-                return rows;
+                return (rows, gaps);
             }
             if matches!(self.peek(), Some(Token::Command(c)) if c.as_str() == "end") {
                 self.next();
@@ -1357,8 +1854,30 @@ impl P {
                 }
                 if !row.is_empty() {
                     rows.push(row);
+                    gaps.push(0.0);
                 }
-                return rows;
+                return (rows, gaps);
+            }
+
+            // `\hline` / `\cline{..}` occupy a row of their own; a rule never
+            // shares a row with cells, which keeps the column maths simple.
+            let is_rule = matches!(
+                self.peek(),
+                Some(Token::Command(c)) if c.as_str() == "hline" || c.as_str() == "cline"
+            );
+            if is_rule {
+                let is_cline = matches!(self.peek(), Some(Token::Command(c)) if c.as_str() == "cline");
+                self.next();
+                if is_cline {
+                    let _ = self.read_raw_arg();
+                }
+                if !row.is_empty() {
+                    rows.push(std::mem::take(&mut row));
+                    gaps.push(0.0);
+                }
+                rows.push(vec![Node::Rule]);
+                gaps.push(0.0);
+                continue;
             }
 
             row.push(self.parse_row());
@@ -1369,10 +1888,13 @@ impl P {
             }
             if matches!(self.peek(), Some(Token::Command(c)) if c.as_str() == "\\") {
                 self.next();
+                let extra = self.read_row_gap();
                 rows.push(std::mem::take(&mut row));
+                gaps.push(extra);
                 continue;
             }
             rows.push(std::mem::take(&mut row));
+            gaps.push(0.0);
             // Only `\end` or EOF may follow a completed cell; anything else
             // (a stray `\right`, say) is skipped so the loop always advances.
             let done = self.peek().is_none()
@@ -1436,8 +1958,13 @@ fn delim_of(tok: &Token) -> Option<Delim> {
     })
 }
 
-/// Parse an `\hspace` dimension into em units.
-fn parse_dimension(s: &str) -> f32 {
+/// Parse a length into points.
+///
+/// Font-relative units (`em`, `ex`, `mu`) need the current em size, which the
+/// parser does not have; they are resolved against the 10 pt reference size the
+/// rest of this file uses, so `2em` is 20 pt here and gets scaled by the caller.
+/// Absolute units (`cm`, `mm`, `in`, `pt`, `bp`, `pc`) are exact.
+fn parse_length_pt(s: &str) -> f32 {
     let t = s.trim();
     let num: String = t
         .chars()
@@ -1445,21 +1972,112 @@ fn parse_dimension(s: &str) -> f32 {
         .collect();
     let value: f32 = num.parse().unwrap_or(0.0);
     let unit = &t[num.len().min(t.len())..];
-    if unit.starts_with("ex") {
-        value * 0.5
-    } else if unit.starts_with("mu") {
-        value / 18.0
-    } else if unit.starts_with("pt") {
-        value * 0.1
-    } else if unit.starts_with("cm") {
-        value * 2.845
+    if unit.starts_with("cm") {
+        value * 28.45
     } else if unit.starts_with("mm") {
-        value * 0.2845
+        value * 2.845
     } else if unit.starts_with("in") {
-        value * 7.227
-    } else {
+        value * 72.27
+    } else if unit.starts_with("bp") {
+        value * 1.003_75
+    } else if unit.starts_with("pt") {
         value
+    } else if unit.starts_with("pc") {
+        value * 12.0
+    } else if unit.starts_with("ex") {
+        value * 5.0
+    } else if unit.starts_with("mu") {
+        value * 10.0 / 18.0
+    } else {
+        // `em` and a missing unit both mean "em of the reference size".
+        value * 10.0
     }
+}
+
+/// Parse a length into em, against the same 10 pt reference.
+fn parse_dimension(s: &str) -> f32 {
+    parse_length_pt(s) * 0.1
+}
+
+/// Space inserted at an `@{...}` boundary, in em.
+///
+/// `@{}` (the common case) collapses the inter-column space entirely; a spacing
+/// command or a dimension inside the braces is honoured; anything else
+/// degenerates to zero rather than to a guess.
+fn parse_spec_gap(body: &str) -> f32 {
+    let t = body.trim();
+    if t.is_empty() {
+        return 0.0;
+    }
+    let name = t.strip_prefix('\\').unwrap_or(t);
+    match name {
+        "," | "thinspace" => 0.1667,
+        ":" | "medspace" => 0.2222,
+        ";" | "thickspace" => 0.2778,
+        "quad" | "hfill" => 1.0,
+        "qquad" => 2.0,
+        "enspace" | "enskip" => 0.5,
+        " " => 0.3333,
+        "!" | "negthinspace" => 0.0,
+        _ => {
+            if t.starts_with('\\') {
+                0.0
+            } else {
+                parse_dimension(t).max(0.0)
+            }
+        }
+    }
+}
+
+/// xcolor-ish colour names plus `#rgb` / `#rrggbb` literals.
+fn named_color(name: &str) -> Option<Rgba> {
+    let t = name.trim();
+    if let Some(hex) = t.strip_prefix('#') {
+        let digits: Vec<u8> = hex
+            .chars()
+            .filter_map(|c| c.to_digit(16).map(|d| d as u8))
+            .collect();
+        return match digits.len() {
+            3 => Some(Rgba::new(
+                digits[0] * 17,
+                digits[1] * 17,
+                digits[2] * 17,
+                255,
+            )),
+            6 => Some(Rgba::new(
+                digits[0] * 16 + digits[1],
+                digits[2] * 16 + digits[3],
+                digits[4] * 16 + digits[5],
+                255,
+            )),
+            _ => None,
+        };
+    }
+    let lower = t.to_ascii_lowercase();
+    let rgb = match lower.as_str() {
+        "black" => 0x000000,
+        "white" => 0xFF_FFFF,
+        "gray" | "grey" => 0x80_8080,
+        "darkgray" | "darkgrey" => 0xA9_A9A9,
+        "lightgray" | "lightgrey" => 0xD3_D3D3,
+        "red" => 0xFF_0000,
+        "orange" => 0xFF_A5_00,
+        "yellow" => 0xFF_FF00,
+        "lime" => 0x00_FF00,
+        "green" => 0x00_80_00,
+        "teal" => 0x00_80_80,
+        "cyan" | "aqua" => 0x00_FF_FF,
+        "blue" => 0x00_00FF,
+        "navy" => 0x00_00_80,
+        "violet" | "purple" => 0x80_00_80,
+        "magenta" | "fuchsia" | "pink" => 0xFF_00FF,
+        "brown" => 0xA5_2A_2A,
+        "olive" => 0x80_80_00,
+        "maroon" => 0x80_0000,
+        "silver" => 0xC0_C0C0,
+        _ => return None,
+    };
+    Some(Rgba::hex(rgb))
 }
 
 /// `\big`, `\Bigl`, ... prefixes: fixed delimiter heights plus an atom class.
@@ -1513,12 +2131,19 @@ fn op_symbol(name: &str) -> Option<(&'static str, OpKind)> {
         "sum" => ("\u{2211}", OpKind::Large),
         "prod" => ("\u{220F}", OpKind::Large),
         "coprod" => ("\u{2210}", OpKind::Large),
-        "int" => ("\u{222B}", OpKind::Large),
-        "iint" => ("\u{222C}", OpKind::Large),
-        "iiint" => ("\u{222D}", OpKind::Large),
-        "oint" => ("\u{222E}", OpKind::Large),
+        // Integrals: large, but `\sum`-style limits are opt-in.
+        "int" => ("\u{222B}", OpKind::Integral),
+        "iint" => ("\u{222C}", OpKind::Integral),
+        "iiint" => ("\u{222D}", OpKind::Integral),
+        "iiiint" => ("\u{2A0C}", OpKind::Integral),
+        "oint" => ("\u{222E}", OpKind::Integral),
+        "oiint" => ("\u{222F}", OpKind::Integral),
+        "oiiint" => ("\u{2230}", OpKind::Integral),
+        "smallint" => ("\u{222B}", OpKind::Large),
         "bigcup" => ("\u{22C3}", OpKind::Large),
         "bigcap" => ("\u{22C2}", OpKind::Large),
+        "bigsqcup" => ("\u{2A06}", OpKind::Large),
+        "biguplus" => ("\u{2A04}", OpKind::Large),
         "bigoplus" => ("\u{2A01}", OpKind::Large),
         "bigotimes" => ("\u{2A02}", OpKind::Large),
         "bigodot" => ("\u{2A00}", OpKind::Large),
@@ -1532,12 +2157,16 @@ fn op_symbol(name: &str) -> Option<(&'static str, OpKind)> {
         "inf" => ("inf", OpKind::Limit),
         "max" => ("max", OpKind::Limit),
         "min" => ("min", OpKind::Limit),
+        "argmax" => ("arg max", OpKind::Limit),
+        "argmin" => ("arg min", OpKind::Limit),
+        "Pr" => ("Pr", OpKind::Limit),
         // Function names: scripts always to the side.
         "det" => ("det", OpKind::Func),
         "gcd" => ("gcd", OpKind::Func),
         "deg" => ("deg", OpKind::Func),
         "dim" => ("dim", OpKind::Func),
         "ker" => ("ker", OpKind::Func),
+        "hom" => ("hom", OpKind::Func),
         "arg" => ("arg", OpKind::Func),
         "log" => ("log", OpKind::Func),
         "ln" => ("ln", OpKind::Func),
@@ -1555,6 +2184,8 @@ fn op_symbol(name: &str) -> Option<(&'static str, OpKind)> {
         "sinh" => ("sinh", OpKind::Func),
         "cosh" => ("cosh", OpKind::Func),
         "tanh" => ("tanh", OpKind::Func),
+        "coth" => ("coth", OpKind::Func),
+        "sgn" => ("sgn", OpKind::Func),
         _ => return None,
     })
 }
@@ -1746,6 +2377,85 @@ fn named_symbol(name: &str) -> Option<NamedSym> {
         "uparrow" => rel("\u{2191}"),
         "downarrow" => rel("\u{2193}"),
         "updownarrow" => rel("\u{2195}"),
+        "gets" => rel("\u{2190}"),
+        "hookrightarrow" => rel("\u{21AA}"),
+        "hookleftarrow" => rel("\u{21A9}"),
+        "longmapsto" => rel("\u{27FC}"),
+        "rightsquigarrow" | "leadsto" => rel("\u{21DD}"),
+        "twoheadrightarrow" => rel("\u{21A0}"),
+        "nrightarrow" => rel("\u{219B}"),
+        "nleftarrow" => rel("\u{219A}"),
+        "upharpoonright" => rel("\u{21BE}"),
+        "downharpoonright" => rel("\u{21C2}"),
+        "doteq" => rel("\u{2250}"),
+        "triangleq" => rel("\u{225C}"),
+        "coloneqq" => rel("\u{2254}"),
+        "fallingdotseq" => rel("\u{2252}"),
+        "risingdotseq" => rel("\u{2253}"),
+        "lesssim" => rel("\u{2272}"),
+        "gtrsim" => rel("\u{2273}"),
+        "leqslant" => rel("\u{2A7D}"),
+        "geqslant" => rel("\u{2A7E}"),
+        "nleq" => rel("\u{2270}"),
+        "ngeq" => rel("\u{2271}"),
+        "subsetneq" => rel("\u{228A}"),
+        "supsetneq" => rel("\u{228B}"),
+        "sqsubseteq" => rel("\u{2291}"),
+        "sqsupseteq" => rel("\u{2292}"),
+        "asymp" => rel("\u{224D}"),
+        "bowtie" => rel("\u{22C8}"),
+        "smile" => rel("\u{2323}"),
+        "frown" => rel("\u{2322}"),
+        "Vdash" => rel("\u{22A9}"),
+        "vDash" => rel("\u{22A8}"),
+        "nvdash" => rel("\u{22AC}"),
+        "therefore" => rel("\u{2234}"),
+        "because" => rel("\u{2235}"),
+        // ---- more binary operators ----
+        "ominus" => bin("\u{2296}"),
+        "oslash" => bin("\u{2298}"),
+        "uplus" => bin("\u{228E}"),
+        "sqcup" => bin("\u{2294}"),
+        "sqcap" => bin("\u{2293}"),
+        "wr" => bin("\u{2240}"),
+        "amalg" => bin("\u{2A3F}"),
+        "diamond" => bin("\u{22C4}"),
+        "bigcirc" => bin("\u{25EF}"),
+        "triangleleft" => bin("\u{25C1}"),
+        "triangleright" => bin("\u{25B7}"),
+        "setminus" | "smallsetminus" => bin("\u{2216}"),
+        "circledast" => bin("\u{229B}"),
+        "circledcirc" => bin("\u{229A}"),
+        "circleddash" => bin("\u{229D}"),
+        "divideontimes" => bin("\u{22C7}"),
+        "ltimes" => bin("\u{22C9}"),
+        "rtimes" => bin("\u{22CA}"),
+        // ---- more ordinary symbols ----
+        "complement" => ord("\u{2201}"),
+        "Box" => ord("\u{25A1}"),
+        "Diamond" => ord("\u{25C7}"),
+        "lozenge" => ord("\u{25CA}"),
+        "blacksquare" => ord("\u{25A0}"),
+        "blacktriangle" => ord("\u{25B2}"),
+        "vartriangle" => ord("\u{25B3}"),
+        "blacktriangledown" => ord("\u{25BC}"),
+        "clubsuit" => ord("\u{2663}"),
+        "diamondsuit" => ord("\u{2662}"),
+        "heartsuit" => ord("\u{2661}"),
+        "spadesuit" => ord("\u{2660}"),
+        "mho" => ord("\u{2127}"),
+        "eth" => ord("\u{00F0}"),
+        "beth" => ord("\u{2136}"),
+        "gimel" => ord("\u{2137}"),
+        "daleth" => ord("\u{2138}"),
+        "backprime" => ord("\u{2035}"),
+        "digamma" => it("\u{03DD}"),
+        "checkmark" => ord("\u{2713}"),
+        "circledR" => ord("\u{00AE}"),
+        "circledS" => ord("\u{24C8}"),
+        "yen" => ord("\u{00A5}"),
+        "pounds" => ord("\u{00A3}"),
+        "degree" => ord("\u{00B0}"),
         _ => return None,
     })
 }
@@ -1921,5 +2631,110 @@ mod tests {
         let src = format!("x{}{}", "{".repeat(500), "}".repeat(500));
         let out = parse(tokenize(&src));
         assert!(!out.warnings.is_empty());
+    }
+
+    #[test]
+    fn operatorname_star_is_folded_into_the_command_name() {
+        let t = tokenize(r"\operatorname*{argmax}_{x}");
+        assert!(
+            t.iter()
+                .any(|tok| matches!(tok, Token::Command(c) if c == "operatorname*"))
+        );
+        assert!(t.contains(&Token::Group("argmax".to_owned())));
+    }
+
+    #[test]
+    fn text_commands_keep_their_argument_verbatim() {
+        let t = tokenize(r"\textbf{加粗 if } and \color{red}");
+        assert!(t.contains(&Token::Group("加粗 if ".to_owned())));
+        assert!(t.contains(&Token::Group("red".to_owned())));
+    }
+
+    #[test]
+    fn array_spec_understands_stars_widths_and_gaps() {
+        let out = parse(tokenize(
+            r"\begin{array}{@{}*{2}{c|}p{2cm}@{}}a\end{array}",
+        ));
+        let Node::Environ {
+            spec: Some(spec), ..
+        } = out.root
+        else {
+            panic!("没有解析成带列格式的环境：{:?}", out.root);
+        };
+        assert_eq!(
+            spec.aligns,
+            vec![ColAlign::Center, ColAlign::Center, ColAlign::Left]
+        );
+        // `*{2}{c|}` repeats the rule after each repeated column.
+        assert_eq!(spec.vlines, vec![false, true, true, false]);
+        assert_eq!(spec.gaps.first().copied(), Some(Some(0.0)));
+        assert!(
+            (spec.min_widths[2] - 56.9).abs() < 0.2,
+            "p{{2cm}} 应约为 56.9pt，实际 {}",
+            spec.min_widths[2]
+        );
+    }
+
+    #[test]
+    fn hline_becomes_a_row_of_its_own() {
+        let out = parse(tokenize(r"\begin{array}{c}a\\\hline b\end{array}"));
+        let Node::Environ { rows, gaps, .. } = out.root else {
+            panic!("不是环境：{:?}", out.root);
+        };
+        assert_eq!(rows.len(), 3, "a / \\hline / b 应是三行");
+        assert!(matches!(rows[1].as_slice(), [Node::Rule]));
+        assert_eq!(gaps.len(), rows.len());
+    }
+
+    #[test]
+    fn bracket_row_gap_is_recorded_in_points() {
+        let out = parse(tokenize(r"\begin{matrix}a\\[6pt]b\end{matrix}"));
+        let Node::Environ { gaps, .. } = out.root else {
+            panic!("不是环境：{:?}", out.root);
+        };
+        assert_eq!(gaps.len(), 2);
+        assert!((gaps[0] - 6.0).abs() < 0.01, "实际 {}", gaps[0]);
+        // The `[6pt]` must not leak into the content as literal text.
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn color_and_negation_build_their_nodes() {
+        let out = parse(tokenize(r"\not\in + \textcolor{red}{x}"));
+        let Node::Row(items) = out.root else {
+            panic!("不是行：{:?}", out.root);
+        };
+        assert!(matches!(items[0], Node::Negate { .. }));
+        assert!(items.iter().any(|n| matches!(n, Node::Color { .. })));
+    }
+
+    #[test]
+    fn new_commands_do_not_warn() {
+        for src in [
+            r"\overset{a}{b}",
+            r"\underset{a}{b}",
+            r"\stackrel{a}{b}",
+            r"\overbrace{x}^{n}",
+            r"\underbrace{x}_{n}",
+            r"\boxed{x}",
+            r"\phantom{x}",
+            r"\hphantom{x}",
+            r"\vphantom{x}",
+            r"\mathrel{=}",
+            r"\operatorname*{argmax}",
+            r"\boldsymbol{\alpha}",
+            r"\mkern2mu",
+            r"\negthinspace",
+            r"\hspace*{1em}",
+            r"\color{#00ff00}x",
+            r"\substack{a\\b}",
+        ] {
+            let out = parse(tokenize(src));
+            assert!(
+                out.warnings.is_empty(),
+                "{src:?} 产生了警告：{:?}",
+                out.warnings
+            );
+        }
     }
 }

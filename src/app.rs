@@ -2654,7 +2654,7 @@ title: MarkdownPad 特性示例
 
 ## 2. LaTeX 公式
 
-行内公式：$E = mc^2$，以及 $a^2 + b^2 = c^2$。
+行内公式：$E = mc^2$，$a^2 + b^2 = c^2$，以及 $\textcolor{#c0392b}{x} \not\in \varnothing$。
 
 块级公式由本地排版引擎绘制（离线可用）：
 
@@ -2666,6 +2666,33 @@ $$
 \begin{pmatrix} a & b \\ c & d \end{pmatrix}
 \begin{pmatrix} x \\ y \end{pmatrix}
 = \begin{pmatrix} ax + by \\ cx + dy \end{pmatrix}
+$$
+
+$$
+\boxed{\sum_{k=1}^{n} k = \frac{n(n+1)}{2}}
+\qquad
+\overbrace{a + b + \cdots + z}^{26}
+$$
+
+$$
+\operatorname*{argmin}_{\theta}\; \mathcal{L}(\theta)
+= \sum_{i=1}^{n} \left( y_i - h_\theta(x_i) \right)^2
+$$
+
+$$
+f(x) = \begin{cases}
+x^2 & x \ge 0 \\
+-x  & x < 0
+\end{cases}
+\qquad
+\begin{array}{c|c}
+\hline
+\text{符号} & \text{含义} \\
+\hline
+\forall & \text{任意} \\
+\exists & \text{存在} \\
+\hline
+\end{array}
 $$
 
 ## 3. 提醒框（四种风格）
@@ -3231,9 +3258,12 @@ mod tests {
             report.contains("paint paragraph"),
             "report lacks what the renderer painted:\n{report}"
         );
+        // Derived from the sample rather than hard-coded: adding a block to the
+        // sample must not turn this into a false failure.
+        let expected = format!("blocks        {}", app.doc.blocks.len());
         assert!(
-            report.contains("blocks        45"),
-            "report lacks the block count:\n{report}"
+            report.contains(&expected),
+            "report lacks the block count ({expected}):\n{report}"
         );
     }
 
