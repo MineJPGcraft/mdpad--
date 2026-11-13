@@ -25,8 +25,8 @@ use crate::diagram::model::{
     Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Gantt, Graph, GroupKind, LineStyle,
     Journey, JourneyStep, Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Period, Pie,
     BlockCell, BlockDiagram, CommitKind, GitCommit, GitGraph, Packet, PacketField, Quadrant,
-    QuadrantPoint, Radar, Sankey, SankeyLink, SeqStep, Sequence, Slice, Task, Timeline, XYChart,
-    XYSeries, XYSeriesKind, civil_from_days, days_from_civil, parse_color,
+    QuadrantPoint, Radar, Sankey, SankeyLink, SeqStep, Sequence, Slice, Task, Timeline, TreeItem,
+    Treemap, XYChart, XYSeries, XYSeriesKind, civil_from_days, days_from_civil, parse_color,
 };
 use crate::gfx::Rgba;
 
@@ -80,6 +80,7 @@ pub fn parse(src: &str) -> Diagram {
         Header::GitGraph => Diagram::GitGraph(gitgraph_parse(&lines[1..], title)),
         Header::Block => Diagram::Block(block_parse(&lines[1..], title)),
         Header::Radar => Diagram::Radar(radar_parse(&lines[1..], title)),
+        Header::Treemap => Diagram::Treemap(treemap_parse(src, title)),
         Header::Unknown(name) => {
             let mut graph = if looks_like_edge(first) {
                 flowchart_graph(&lines, Direction::TopDown, None, title)
@@ -437,6 +438,7 @@ enum Header {
     GitGraph,
     Block,
     Radar,
+    Treemap,
     Unknown(String),
 }
 
@@ -474,6 +476,7 @@ fn detect_header(first: &str) -> Header {
         "gitgraph" => Header::GitGraph,
         "block-beta" | "block" => Header::Block,
         "radar-beta" | "radar" => Header::Radar,
+        "treemap-beta" | "treemap" => Header::Treemap,
         "xychart-beta" | "xychart" | "xychart-beta-vertical" => Header::XYChart(
             rest.split_whitespace().any(|w| w.eq_ignore_ascii_case("horizontal")),
         ),
@@ -3888,6 +3891,125 @@ fn radar_parse(lines: &[String], title: Option<String>) -> Radar {
     radar
 }
 
+// ---------------------------------------------------------------------------
+// treemap-beta
+// ---------------------------------------------------------------------------
+
+/// `"label": 12` or `"label"` — returns the label and an optional weight.
+fn treemap_entry(text: &str) -> (String, Option<f32>) {
+    let t = text.trim();
+    let (head, value) = match t.rfind(':') {
+        Some(colon) => {
+            let tail = t[colon + 1..].trim();
+            match tail.parse::<f32>() {
+                Ok(v) => (t[..colon].trim(), Some(v)),
+                Err(_) => (t, None),
+            }
+        }
+        None => (t, None),
+    };
+    let label = head.trim().trim_matches('"').trim_matches('\'').to_owned();
+    (label, value)
+}
+
+/// `treemap-beta` — indentation-nested rectangles sized by weight.
+fn treemap_parse(src: &str, title: Option<String>) -> Treemap {
+    let mut treemap = Treemap {
+        title,
+        ..Treemap::default()
+    };
+    // (indent, label, value) in source order; the level is derived afterwards so
+    // two-space, four-space and tab indentation all work.
+    let mut flat: Vec<(usize, String, Option<f32>)> = Vec::new();
+
+    for raw in src.lines() {
+        let code = strip_comment(raw);
+        let trimmed = code.trim();
+        if trimmed.is_empty() || trimmed.starts_with("%%") {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("treemap") {
+            continue;
+        }
+        if let Some(rest) = lower.strip_prefix("title") {
+            let _ = rest;
+            let title = strip_quotes(
+                trimmed
+                    .split_once(char::is_whitespace)
+                    .map(|(_, r)| r)
+                    .unwrap_or("")
+                    .trim(),
+            );
+            if !title.is_empty() {
+                treemap.title = Some(title);
+            }
+            continue;
+        }
+        let indent = code.chars().take_while(|c| c.is_whitespace()).count();
+        let (label, value) = treemap_entry(trimmed);
+        if label.is_empty() {
+            continue;
+        }
+        flat.push((indent, label, value));
+    }
+
+    // Rank the indents: each distinct width becomes one nesting level.
+    let mut indents: Vec<usize> = flat.iter().map(|(i, _, _)| *i).collect();
+    indents.sort_unstable();
+    indents.dedup();
+    let flat: Vec<(usize, String, Option<f32>)> = flat
+        .into_iter()
+        .map(|(indent, label, value)| {
+            let depth = indents.iter().position(|i| *i == indent).unwrap_or(0);
+            (depth, label, value)
+        })
+        .collect();
+
+    // Fold the flat list into a tree with a stack of open ancestors.
+    let mut stack: Vec<(usize, TreeItem)> = Vec::new();
+    let mut roots: Vec<TreeItem> = Vec::new();
+    for (depth, label, value) in flat {
+        let item = TreeItem {
+            label,
+            value: value.unwrap_or(0.0),
+            children: Vec::new(),
+        };
+        while stack.last().is_some_and(|(d, _)| *d >= depth) {
+            let Some((_, done)) = stack.pop() else {
+                break;
+            };
+            match stack.last_mut() {
+                Some((_, parent)) => parent.children.push(done),
+                None => roots.push(done),
+            }
+        }
+        stack.push((depth, item));
+    }
+    while let Some((_, done)) = stack.pop() {
+        match stack.last_mut() {
+            Some((_, parent)) => parent.children.push(done),
+            None => roots.push(done),
+        }
+    }
+
+    // A section without explicit weight takes its children's sum (handled by
+    // `weight()`); a leaf without one gets a nominal 1 so it still shows.
+    fn fill(mut item: TreeItem) -> TreeItem {
+        if item.children.is_empty() && item.value <= 0.0 {
+            item.value = 1.0;
+        }
+        item.children = item.children.into_iter().map(fill).collect();
+        item
+    }
+    treemap.items = roots.into_iter().map(fill).collect();
+
+    if treemap.items.is_empty() {
+        treemap.warnings.push("treemap 没有区块".to_owned());
+    }
+    treemap
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5000,5 +5122,47 @@ mod tests {
             panic!("expected a radar chart")
         };
         assert!(r.warnings.iter().any(|w| w.contains("没有轴")));
+    }    // -- treemap-beta ------------------------------------------------------
+
+    #[test]
+    fn treemap_builds_nested_blocks_from_indentation() {
+        let d = parse(
+            "treemap-beta\n\
+             \x20 \"需求\"\n\
+             \x20   \"分析\": 12\n\
+             \x20   \"设计\": 8\n\
+             \x20 \"开发\": 20",
+        );
+        let Diagram::Treemap(t) = d else {
+            panic!("expected a treemap")
+        };
+        assert_eq!(t.items.len(), 2);
+        assert_eq!(t.items[0].label, "需求");
+        assert_eq!(t.items[0].children.len(), 2);
+        assert_eq!(t.items[0].children[0].label, "分析");
+        assert_eq!(t.items[0].children[0].value, 12.0);
+        // A section weighs as much as its children.
+        assert_eq!(t.items[0].weight(), 20.0);
+        assert_eq!(t.items[1].weight(), 20.0);
+        assert!(t.warnings.is_empty(), "{:?}", t.warnings);
+    }
+
+    #[test]
+    fn treemap_gives_valueless_leaves_a_nominal_weight() {
+        let d = parse("treemap-beta\n \"甲\"\n \"乙\"");
+        let Diagram::Treemap(t) = d else {
+            panic!("expected a treemap")
+        };
+        assert_eq!(t.items.len(), 2);
+        assert!(t.items.iter().all(|i| i.weight() > 0.0));
+    }
+
+    #[test]
+    fn an_empty_treemap_warns() {
+        let d = parse("treemap-beta\n");
+        let Diagram::Treemap(t) = d else {
+            panic!("expected a treemap")
+        };
+        assert!(t.warnings.iter().any(|w| w.contains("没有区块")));
     }
 }

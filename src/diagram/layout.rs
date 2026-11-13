@@ -29,8 +29,8 @@ use crate::diagram::model::{
     series_color, Arrow, Diagram, Direction, Edge, Gantt, Graph, GroupKind, LineStyle, Node,
     NodeShape, NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
     ActNode, Activity, BlockCell, BlockDiagram, CommitKind, GitGraph, Journey, LoopKind, Packet,
-    Quadrant, Radar, Sankey, Task, Terminal, Timeline, XYChart, XYSeriesKind, days_from_civil,
-    format_day,
+    Quadrant, Radar, Sankey, Task, Terminal, Timeline, TreeItem, Treemap, XYChart, XYSeriesKind,
+    days_from_civil, format_day, tree_weight,
 };
 use crate::gfx::{Anchor, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -99,6 +99,7 @@ pub fn layout(
         Diagram::Activity(a) => layout_activity(a, diagram, &ctx),
         Diagram::Block(b) => layout_block(b, diagram, &ctx),
         Diagram::Radar(r) => layout_radar(r, diagram, &ctx),
+        Diagram::Treemap(t) => layout_treemap(t, diagram, &ctx),
     }
 }
 
@@ -3370,6 +3371,127 @@ fn layout_radar(radar: &Radar, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
     finish(prims, ctx, None, warnings, summary)
 }
 
+
+// ===========================================================================
+// Treemaps
+// ===========================================================================
+
+/// `treemap-beta` — nested rectangles whose area is proportional to weight.
+///
+/// The split is slice-and-dice (alternating axes per level) rather than the
+/// squarified algorithm: it keeps aspect ratios from collapsing on deep trees and
+/// needs no iteration, at the cost of long thin leaves in unbalanced data.
+fn layout_treemap(treemap: &Treemap, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    if treemap.items.is_empty() {
+        push_warning(&mut warnings, "treemap 没有区块".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut top = 0.0f32;
+    if let Some(title) = treemap.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        prims.push(Prim::anchored_text(
+            [0.0, 0.0],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::LeftTop,
+        ));
+        top = lh + 10.0;
+    }
+
+    let canvas = (ctx.base * 22.0).clamp(220.0, 520.0);
+    let root = Rect::from_min_size([0.0, top], [canvas, canvas * 0.68]);
+    let label_font = ctx.small();
+    place_tree(
+        &treemap.items,
+        root,
+        0,
+        &mut prims,
+        ctx,
+        label_font,
+    );
+
+    finish(prims, ctx, None, warnings, summary)
+}
+
+/// Recursively split `rect` between `items`, alternating the split axis.
+fn place_tree(
+    items: &[TreeItem],
+    rect: Rect,
+    depth: usize,
+    prims: &mut Vec<Prim>,
+    ctx: &Ctx,
+    label_font: Font,
+) {
+    let total = tree_weight(items);
+    if total <= 0.0 || rect.width() < 2.0 || rect.height() < 2.0 {
+        return;
+    }
+    let horizontal = !depth.is_multiple_of(2);
+    let mut cursor = if horizontal { rect.min[0] } else { rect.min[1] };
+    let span = if horizontal { rect.width() } else { rect.height() };
+
+    for (i, item) in items.iter().enumerate() {
+        let weight = item.weight();
+        if weight <= 0.0 {
+            continue;
+        }
+        let share = (weight / total).clamp(0.0, 1.0);
+        let size = span * share;
+        let cell = if horizontal {
+            Rect::from_min_size([cursor, rect.min[1]], [size, rect.height()])
+        } else {
+            Rect::from_min_size([rect.min[0], cursor], [rect.width(), size])
+        };
+        cursor += size;
+
+        let color = series_color(i + depth * 3);
+        let fill = if depth == 0 {
+            color.with_alpha(150)
+        } else {
+            color.with_alpha(90)
+        };
+        prims.push(Prim::filled_rect(cell, 2.0, fill));
+        prims.push(Prim::stroked_rect(
+            cell,
+            2.0,
+            draw::stroke(1.0, ctx.theme.node_stroke.fade(0.35)),
+        ));
+
+        // Label in the top-left corner, ellipsised to the cell.
+        let inner = cell.expand(-3.0);
+        if inner.width() > 12.0 && inner.height() > 8.0 {
+            let text = fit_text(ctx, &item.label, label_font, inner.width().max(6.0));
+            if !text.is_empty() {
+                prims.push(Prim::anchored_text(
+                    [inner.min[0] + 2.0, inner.min[1] + ctx.lh(label_font) * 0.5],
+                    text,
+                    label_font,
+                    ctx.theme.node_text,
+                    Anchor::LeftCenter,
+                ));
+            }
+        }
+
+        if !item.children.is_empty() {
+            // Sections reserve a strip for their own label, otherwise the first
+            // child would paint over it.
+            let strip = ctx.lh(label_font) + 3.0;
+            let child_area = if inner.height() > strip * 2.0 {
+                Rect::new(inner.min[0], inner.min[1] + strip, inner.max[0], inner.max[1])
+            } else {
+                inner
+            };
+            place_tree(&item.children, child_area, depth + 1, prims, ctx, label_font);
+        }
+    }
+}
+
 // ===========================================================================
 // Sequence diagrams
 // ===========================================================================
@@ -4701,7 +4823,7 @@ mod tests {
             }
         }
 
-        let cases: [(&str, &str); 16] = [
+        let cases: [(&str, &str); 18] = [
             (
                 "gantt",
                 "gantt\n section Design\n 需求分析 :done, a1, 2024-01-01, 5d\n 方案设计 :a2, after a1, 3d\n section Build\n 编码 :active, b1, after a2, 10d\n 里程碑 :milestone, m1, 2024-01-30, 0d",
@@ -4719,7 +4841,15 @@ mod tests {
                 "kanban\n  todo[待办]\n    t1[写解析器]\n    t2[补测试]\n  doing[进行中]\n    d1[修布局]",
             ),
             (
-                "block",
+                "treemap",
+                "treemap-beta\n title 工作量\n \"需求\"\n   \"分析\": 12\n   \"设计\": 8\n \"开发\"\n   \"前端\": 14\n   \"后端\": 26\n \"测试\": 10",
+            ),
+            (
+                "deployment",
+                "@startuml\nnode \"Web 服务器\" {\n artifact app.jar\n}\ndatabase \"主库\" as db\ncloud \"CDN\"\napp.jar --> db\n@enduml",
+            ),
+            (
+            "block",
                 "block-beta\n columns 3\n a[\"甲\"] b[\"乙\"] c[\"丙\"]\n d space space\n e --> f",
             ),
             (
@@ -5757,6 +5887,85 @@ mod tests {
             warnings: Vec::new(),
         };
         let r = run(&Diagram::Radar(radar));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
+    }    // -- treemap-beta ------------------------------------------------------
+
+    fn treemap_fixture() -> Treemap {
+        Treemap {
+            title: Some("工作量".to_owned()),
+            items: vec![
+                TreeItem {
+                    label: "需求".to_owned(),
+                    value: 0.0,
+                    children: vec![
+                        TreeItem {
+                            label: "分析".to_owned(),
+                            value: 12.0,
+                            children: Vec::new(),
+                        },
+                        TreeItem {
+                            label: "设计".to_owned(),
+                            value: 8.0,
+                            children: Vec::new(),
+                        },
+                    ],
+                },
+                TreeItem {
+                    label: "开发".to_owned(),
+                    value: 20.0,
+                    children: Vec::new(),
+                },
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn treemap_splits_area_by_weight() {
+        let r = run(&Diagram::Treemap(treemap_fixture()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["工作量", "需求", "开发", "分析", "设计"] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        // Equal weights → the two top-level blocks split the canvas in half.
+        let tops: Vec<Rect> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Rect {
+                    rect,
+                    fill: Some(_),
+                    ..
+                } => Some(*rect),
+                _ => None,
+            })
+            .collect();
+        assert!(tops.len() >= 4, "两块 + 两个子块");
+        let widest = tops.iter().map(|c| c.width()).fold(0.0f32, f32::max);
+        let tallest = tops.iter().map(|c| c.height()).fold(0.0f32, f32::max);
+        assert!(widest > 20.0 && tallest > 20.0);
+    }
+
+    #[test]
+    fn an_empty_treemap_shows_the_placeholder_card() {
+        let r = run(&Diagram::Treemap(Treemap::default()));
         assert_clean(&r);
         let texts: Vec<&str> = r
             .prims

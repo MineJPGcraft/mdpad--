@@ -171,6 +171,7 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 - **timeline** — `section` 分带、`2002 : LinkedIn : Google` 一句多事件、卡片沿轴线上下交替、无事件的时期也占一列。
 - **quadrantChart** — `x-axis 低 --> 高` / `y-axis` 轴标题、`quadrant-1..4` 四象限名（右上→左上→左下→右下）、`名称: [x, y]` 数据点（自动夹到 0–1）、点标签在靠近右边界时自动翻到左侧。
 - **gitGraph** — `commit id:/tag:/type:` 三种类型（NORMAL / REVERSE / HIGHLIGHT）、`branch` / `checkout` / `switch`（新分支从当前 HEAD 起算，与 `checkout -b` 一致）、`merge`（双亲连线）、`cherry-pick`；每条分支一条泳道，底部带分支图例。
+- **treemap-beta** — 缩进嵌套 + `"标签": 数值`，按权重切分矩形，父级独占一条标签带。
 - **block-beta** — `columns N` 网格、`id["标签"]` 格子、`space` / `space:2` 占位、
   `a --> b` 格间箭头；样式指令会给出忽略告警。
 - **radar-beta** — `axis a["标签"], b[…], …`（至少 3 轴）、`curve 名["标签"]{v1, v2, …}`、
@@ -194,6 +195,7 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 - **类图** — `abstract class` / `interface` / `enum` / 立体标记，
   成员按字段与方法分格，继承/依赖/组合/聚合全套关系，多重性，
   `package`/`namespace` 嵌套。
+- **部署图** — `node {}` / `folder` / `frame` 分组，`artifact` / `database` / `cloud` / `queue` / `storage` / `file` / `card` / `agent` / `stack` 元素，存储类画成圆柱。
 - **WBS / mindmap** — `@startwbs` / `@startmindmap`，`*` 层数即层级，
   `left side` / `right side` 标记被忽略；左→右树形排布。
 - **甘特图** — `@startgantt`：`Project starts 日期`、`[任务] lasts N days`、
@@ -211,7 +213,7 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 「不画」一栏是明确不做的部分及原因——它们描述的东西这套渲染器没有对应模型，
 与其假装支持，不如给出告警。
 
-**Mermaid（18 种）**
+**Mermaid（19 种）**
 
 | 图种 | 状态 | 关键语法 |
 |---|---|---|
@@ -234,10 +236,10 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 | gitGraph | ✅ | commit/branch/checkout/merge/cherry-pick、泳道、图例 |
 | block-beta | ✅ | columns 网格、space 占位、格间箭头 |
 | radar-beta | ✅ | 多轴、多曲线叠加、max |
-| treemap-beta | ⬜ 待补 | 需要矩形分割算法（squarified treemap） |
+| treemap-beta | ✅ | 缩进嵌套（2/4 空格或 Tab 均可）、`"标签": 数值` 权重、slice-and-dice 分割、分区独占标签条 |
 | architecture-beta / C4 / zenuml | ❌ 不画 | 部署拓扑/容器视图；没有对应的分层与图标模型 |
 
-**PlantUML（8 种 + 3 种复用）**
+**PlantUML（10 种 + 3 种复用）**
 
 | 图种 | 状态 | 关键语法 |
 |---|---|---|
@@ -250,7 +252,7 @@ Rust 生态没有成熟的 LaTeX 排版库，所以排版引擎是自己写的
 | wbs | ✅ | `*` 层数树 |
 | mindmap | ✅ | `*` 层数树、left/right side |
 | gantt | ✅ | lasts/starts at/ends/`--` 分节（与 Mermaid gantt 共用布局） |
-| deployment | ◐ 部分 | 由 component/package 语法覆盖，缺少 `node {}` 分组的专用外观 |
+| deployment | ✅ | `node {}` / `folder` / `frame` 分组、`artifact` / `database` / `cloud` / `queue` / `storage` / `file` / `card` / `agent` / `stack` 等部署元素（store 类画圆柱） |
 | archimate / salt / ditaa / timing / json / yaml | ❌ 不画 | 企业架构建模、UI 线框、ASCII 图、时序波形；模型差异过大 |
 
 

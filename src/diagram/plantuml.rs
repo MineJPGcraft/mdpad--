@@ -72,6 +72,7 @@ pub fn parse(src: &str) -> Diagram {
         | Some(DiagramKind::Wbs)
         | Some(DiagramKind::Block)
         | Some(DiagramKind::Radar)
+        | Some(DiagramKind::Treemap)
         | None => Diagram::Graph(parse_fallback(&lines, &pre)),
     };
     match &mut diagram {
@@ -88,7 +89,8 @@ pub fn parse(src: &str) -> Diagram {
         | Diagram::GitGraph(_)
         | Diagram::Activity(_)
         | Diagram::Block(_)
-        | Diagram::Radar(_) => {}
+        | Diagram::Radar(_)
+        | Diagram::Treemap(_) => {}
     }
     diagram
 }
@@ -1716,7 +1718,10 @@ fn handle_flow_line(
         return i;
     }
 
-    if matches!(first, "package" | "rectangle") || (first == "node" && rest.contains('{')) {
+    if matches!(first, "package" | "rectangle" | "folder" | "frame")
+        || (matches!(first, "node" | "cloud" | "database" | "storage" | "queue")
+            && rest.contains('{'))
+    {
         let (head, after) = split_brace(rest);
         let (id, label) = parse_decl_text(head);
         if id.is_empty() {
@@ -1738,7 +1743,26 @@ fn handle_flow_line(
         return i;
     }
 
-    if matches!(first, "usecase" | "component" | "node" | "actor") {
+    if matches!(
+        first,
+        "usecase"
+            | "component"
+            | "node"
+            | "actor"
+            | "artifact"
+            | "database"
+            | "cloud"
+            | "queue"
+            | "storage"
+            | "file"
+            | "card"
+            | "agent"
+            | "stack"
+            | "boundary"
+            | "control"
+            | "entity"
+            | "collections"
+    ) {
         let (head, _) = split_brace(rest);
         let (id, label) = parse_decl_text(head);
         if id.is_empty() {
@@ -1748,8 +1772,12 @@ fn handle_flow_line(
         }
         let idx = graph_node(g, &id, cur);
         g.nodes[idx].label = label;
-        if first == "actor" {
-            g.nodes[idx].style = NodeStyle::Actor;
+        match first {
+            "actor" => g.nodes[idx].style = NodeStyle::Actor,
+            "database" | "storage" | "queue" | "stack" => {
+                g.nodes[idx].shape = NodeShape::Cylinder;
+            }
+            _ => {}
         }
         return i;
     }
@@ -3441,7 +3469,24 @@ class A
         assert_eq!(g.sections.len(), 2);
         assert_eq!(g.sections[1], "第二阶段");
         assert_eq!(g.tasks[1].section, 1);
+    }    #[test]
+    fn deployment_diagram_uses_nodes_artifacts_and_stores() {
+        let d = parse(
+            "@startuml\n\
+             node \"Web 服务器\" {\n\
+             \x20 artifact app.jar\n\
+             }\n\
+             database \"主库\" as db\n\
+             cloud \"CDN\"\n\
+             app.jar --> db\n\
+             @enduml",
+        );
+        let g = as_graph(&d);
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+        assert_eq!(g.clusters.len(), 1, "node 应变成集群");
+        let db = g.nodes.iter().find(|n| n.id == "db").expect("db");
+        assert_eq!(db.shape, NodeShape::Cylinder, "数据库应画成圆柱");
+        assert!(g.nodes.iter().any(|n| n.label == "CDN"));
+        assert!(g.edges.iter().any(|e| e.from == "app.jar" && e.to == "db"));
     }
 }
-
-

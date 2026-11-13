@@ -36,6 +36,7 @@ pub enum DiagramKind {
     Wbs,
     Block,
     Radar,
+    Treemap,
 }
 
 impl DiagramKind {
@@ -62,6 +63,7 @@ impl DiagramKind {
             Self::Wbs => "wbs",
             Self::Block => "block",
             Self::Radar => "radar",
+            Self::Treemap => "treemap",
         }
     }
 }
@@ -964,6 +966,42 @@ pub struct Radar {
 }
 
 // ---------------------------------------------------------------------------
+// Treemaps (`treemap-beta`)
+// ---------------------------------------------------------------------------
+
+/// One rectangle of a treemap: a leaf has a value, a section has children.
+#[derive(Clone, Debug)]
+pub struct TreeItem {
+    pub label: String,
+    /// Leaf weight; a section's weight is the sum of its children.
+    pub value: f32,
+    pub children: Vec<TreeItem>,
+}
+
+impl TreeItem {
+    pub fn weight(&self) -> f32 {
+        if self.children.is_empty() {
+            self.value.max(0.0)
+        } else {
+            self.children.iter().map(|c| c.weight()).sum::<f32>().max(0.0)
+        }
+    }
+}
+
+/// A parsed `treemap-beta` block.
+#[derive(Clone, Debug, Default)]
+pub struct Treemap {
+    pub title: Option<String>,
+    pub items: Vec<TreeItem>,
+    pub warnings: Vec<String>,
+}
+
+/// Total weight of a tree, used for the layout's proportional split.
+pub fn tree_weight(items: &[TreeItem]) -> f32 {
+    items.iter().map(|i| i.weight()).sum()
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -983,6 +1021,7 @@ pub enum Diagram {
     Activity(Activity),
     Block(BlockDiagram),
     Radar(Radar),
+    Treemap(Treemap),
 }
 
 impl Diagram {
@@ -1004,6 +1043,7 @@ impl Diagram {
             Self::Activity(_) => DiagramKind::Activity,
             Self::Block(_) => DiagramKind::Block,
             Self::Radar(_) => DiagramKind::Radar,
+            Self::Treemap(_) => DiagramKind::Treemap,
         }
     }
 
@@ -1023,6 +1063,7 @@ impl Diagram {
             Self::Activity(a) => a.title.as_deref(),
             Self::Block(b) => b.title.as_deref(),
             Self::Radar(r) => r.title.as_deref(),
+            Self::Treemap(t) => t.title.as_deref(),
         }
     }
 
@@ -1043,6 +1084,7 @@ impl Diagram {
             Self::Activity(a) => &a.warnings,
             Self::Block(b) => &b.warnings,
             Self::Radar(r) => &r.warnings,
+            Self::Treemap(t) => &t.warnings,
         }
     }
 
@@ -1062,6 +1104,7 @@ impl Diagram {
             Self::Activity(a) => a.is_blank(),
             Self::Block(b) => b.cells.is_empty(),
             Self::Radar(r) => r.curves.is_empty(),
+            Self::Treemap(t) => t.items.is_empty(),
         }
     }
 
@@ -1115,6 +1158,7 @@ impl Diagram {
             Self::Activity(a) => format!("activity · {} 个顶层节点", a.nodes.len()),
             Self::Block(b) => format!("block · {} 个格子", b.cells.len()),
             Self::Radar(r) => format!("radar · {} 条曲线 · {} 个轴", r.curves.len(), r.axes.len()),
+            Self::Treemap(t) => format!("treemap · {} 个顶层区块", t.items.len()),
         }
     }
 }
