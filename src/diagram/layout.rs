@@ -28,8 +28,9 @@ use super::{draw, DiagramTheme};
 use crate::diagram::model::{
     series_color, Arrow, Diagram, Direction, Edge, Gantt, Graph, GroupKind, LineStyle, Node,
     NodeShape, NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
-    ActNode, Activity, CommitKind, GitGraph, Journey, LoopKind, Packet, Quadrant, Sankey, Task,
-    Terminal, Timeline, XYChart, XYSeriesKind, days_from_civil, format_day,
+    ActNode, Activity, BlockCell, BlockDiagram, CommitKind, GitGraph, Journey, LoopKind, Packet,
+    Quadrant, Radar, Sankey, Task, Terminal, Timeline, XYChart, XYSeriesKind, days_from_civil,
+    format_day,
 };
 use crate::gfx::{Anchor, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -96,6 +97,8 @@ pub fn layout(
         Diagram::Sankey(k) => layout_sankey(k, diagram, &ctx),
         Diagram::GitGraph(g) => layout_gitgraph(g, diagram, &ctx),
         Diagram::Activity(a) => layout_activity(a, diagram, &ctx),
+        Diagram::Block(b) => layout_block(b, diagram, &ctx),
+        Diagram::Radar(r) => layout_radar(r, diagram, &ctx),
     }
 }
 
@@ -3125,6 +3128,248 @@ fn draw_radius(kind: LoopKind) -> f32 {
     }
 }
 
+
+// ===========================================================================
+// Block diagrams
+// ===========================================================================
+
+/// `block-beta` — a grid of labelled cells.
+fn layout_block(block: &BlockDiagram, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    if block.cells.is_empty() {
+        push_warning(&mut warnings, "block 没有格子".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let font = ctx.small();
+    let columns = block.columns.clamp(1, 12);
+    let cell_w = (ctx.base * 5.6).clamp(64.0, 120.0);
+    let cell_h = ctx.lh(font) + 18.0;
+    let gap = 10.0;
+    let grid_w = columns as f32 * cell_w + (columns as f32 - 1.0) * gap;
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut top = 0.0f32;
+    if let Some(title) = block.title.as_deref() {
+        let title_font = ctx.title();
+        let lh = ctx.lh(title_font);
+        prims.push(Prim::anchored_text(
+            [0.0, 0.0],
+            title.to_owned(),
+            title_font,
+            ctx.theme.node_text,
+            Anchor::LeftTop,
+        ));
+        top = lh + 10.0;
+    }
+
+    // Assign every cell a grid slot, wrapping at `columns`.
+    let mut slots: Vec<Option<(usize, usize)>> = vec![None; block.cells.len()];
+    let mut col = 0usize;
+    let mut row = 0usize;
+    for (i, cell) in block.cells.iter().enumerate() {
+        let span = match cell {
+            BlockCell::Item { .. } => 1,
+            BlockCell::Space { span } => (*span).max(1),
+        };
+        if col + span > columns {
+            col = 0;
+            row += 1;
+        }
+        if matches!(cell, BlockCell::Item { .. }) {
+            slots[i] = Some((col, row));
+        }
+        col += span;
+        if col >= columns {
+            col = 0;
+            row += 1;
+        }
+    }
+
+    let mut centers: Vec<Option<[f32; 2]>> = vec![None; block.cells.len()];
+    for (i, cell) in block.cells.iter().enumerate() {
+        let Some((c, r)) = slots[i] else { continue };
+        let x = c as f32 * (cell_w + gap);
+        let y = top + r as f32 * (cell_h + gap);
+        let rect = Rect::from_min_size([x, y], [cell_w, cell_h]);
+        if let BlockCell::Item { label } = cell {
+            let accent = series_color(i);
+            prims.push(Prim::filled_rect(
+                rect,
+                6.0,
+                ctx.theme.node_fill.lerp(accent, 0.12),
+            ));
+            prims.push(Prim::stroked_rect(
+                rect,
+                6.0,
+                draw::stroke(1.1, accent.lerp(ctx.theme.node_stroke, 0.5)),
+            ));
+            let lines = wrap_lines(&split_lines(label), font, rect.width() - 12.0, ctx);
+            draw_centered(
+                &mut prims,
+                &lines,
+                font,
+                ctx.theme.node_text,
+                rect.center()[0],
+                rect.center()[1] - ctx.lh(font) * lines.len() as f32 * 0.5,
+                ctx,
+            );
+            centers[i] = Some(rect.center());
+        }
+    }
+
+    // Arrows between cells, drawn centre to centre and trimmed a little.
+    for (from, to) in &block.edges {
+        let (Some(a), Some(b)) = (
+            centers.get(*from).and_then(|c| *c),
+            centers.get(*to).and_then(|c| *c),
+        ) else {
+            continue;
+        };
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1.0 {
+            continue;
+        }
+        let unit = [dx / len, dy / len];
+        let start = [a[0] + unit[0] * 10.0, a[1] + unit[1] * 10.0];
+        let end = [b[0] - unit[0] * 12.0, b[1] - unit[1] * 12.0];
+        prims.push(Prim::line(start, end, draw::stroke(1.3, ctx.theme.edge)));
+        prims.extend(draw::arrow_head(
+            end,
+            [dx, dy],
+            Arrow::Filled,
+            ctx.theme.edge,
+            draw::ARROW_SIZE,
+        ));
+    }
+
+    let width_hint = grid_w;
+    let _ = width_hint;
+    finish(prims, ctx, None, warnings, summary)
+}
+
+// ===========================================================================
+// Radar charts
+// ===========================================================================
+
+/// `radar-beta` — one polygon per curve around a shared set of axes.
+fn layout_radar(radar: &Radar, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    let n = radar.axes.len();
+    if n < 3 || radar.curves.is_empty() {
+        push_warning(&mut warnings, "radar 需要至少 3 个轴和 1 条曲线".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let label_font = ctx.small();
+    let radius = (ctx.base * 9.0).clamp(90.0, 200.0);
+    let ring_steps = 4usize;
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut top = 0.0f32;
+    if let Some(title) = radar.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        prims.push(Prim::anchored_text(
+            [0.0, 0.0],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::LeftTop,
+        ));
+        top = lh + 10.0;
+    }
+
+    let center = [radius + ctx.base * 2.0, top + radius + ctx.base * 1.2];
+    let angle_of = |i: usize| -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::TAU / n as f32;
+    let point_at = |i: usize, t: f32| {
+        let a = angle_of(i);
+        [center[0] + a.cos() * radius * t, center[1] + a.sin() * radius * t]
+    };
+
+    // Rings.
+    for step in 1..=ring_steps {
+        let t = step as f32 / ring_steps as f32;
+        let ring: Vec<[f32; 2]> = (0..n).map(|i| point_at(i, t)).collect();
+        prims.push(Prim::path(
+            ring,
+            true,
+            None,
+            Some(draw::stroke(1.0, ctx.theme.node_stroke.fade(0.18))),
+        ));
+    }
+    // Spokes + axis labels.
+    for i in 0..n {
+        let end = point_at(i, 1.0);
+        prims.push(Prim::line(
+            center,
+            end,
+            draw::stroke(1.0, ctx.theme.node_stroke.fade(0.3)),
+        ));
+        let a = angle_of(i);
+        let label_at = [
+            center[0] + a.cos() * (radius + ctx.base * 0.9),
+            center[1] + a.sin() * (radius + ctx.base * 0.5),
+        ];
+        let anchor = if a.cos() > 0.3 {
+            Anchor::LeftCenter
+        } else if a.cos() < -0.3 {
+            Anchor::RightCenter
+        } else {
+            Anchor::Center
+        };
+        prims.push(Prim::anchored_text(
+            label_at,
+            radar.axes[i].clone(),
+            label_font,
+            ctx.theme.node_text,
+            anchor,
+        ));
+    }
+
+    // Curves.
+    for (ci, (name, values)) in radar.curves.iter().enumerate() {
+        let color = series_color(ci);
+        let pts: Vec<[f32; 2]> = (0..n)
+            .map(|i| {
+                let v = values.get(i).copied().unwrap_or(0.0) / radar.max.max(1e-6);
+                point_at(i, v.clamp(0.0, 1.0))
+            })
+            .collect();
+        prims.push(Prim::path(
+            pts.clone(),
+            true,
+            Some(color.with_alpha(60)),
+            Some(draw::stroke(1.8, color)),
+        ));
+        for p in &pts {
+            prims.push(Prim::circle(*p, 2.8, Some(color), None));
+        }
+        if !name.trim().is_empty() {
+            // Legend chip under the chart.
+            let y = center[1] + radius + ctx.base * 1.6 + ci as f32 * (ctx.lh(label_font) + 4.0);
+            prims.push(Prim::circle(
+                [center[0] - ctx.base * 2.5, y],
+                3.5,
+                Some(color),
+                None,
+            ));
+            prims.push(Prim::anchored_text(
+                [center[0] - ctx.base * 2.5 + 8.0, y],
+                name.clone(),
+                label_font,
+                ctx.theme.node_text,
+                Anchor::LeftCenter,
+            ));
+        }
+    }
+
+    finish(prims, ctx, None, warnings, summary)
+}
+
 // ===========================================================================
 // Sequence diagrams
 // ===========================================================================
@@ -4456,7 +4701,7 @@ mod tests {
             }
         }
 
-        let cases: [(&str, &str); 14] = [
+        let cases: [(&str, &str); 16] = [
             (
                 "gantt",
                 "gantt\n section Design\n 需求分析 :done, a1, 2024-01-01, 5d\n 方案设计 :a2, after a1, 3d\n section Build\n 编码 :active, b1, after a2, 10d\n 里程碑 :milestone, m1, 2024-01-30, 0d",
@@ -4474,7 +4719,15 @@ mod tests {
                 "kanban\n  todo[待办]\n    t1[写解析器]\n    t2[补测试]\n  doing[进行中]\n    d1[修布局]",
             ),
             (
-                "puml_wbs",
+                "block",
+                "block-beta\n columns 3\n a[\"甲\"] b[\"乙\"] c[\"丙\"]\n d space space\n e --> f",
+            ),
+            (
+                "radar",
+                "radar-beta\n title 技能\n axis a[\"编码\"], b[\"设计\"], c[\"测试\"], d[\"沟通\"]\n curve me[\"我\"]{4, 3, 2, 5}\n curve you[\"对手\"]{2, 5, 4, 3}\n max 5",
+            ),
+            (
+            "puml_wbs",
                 "@startwbs\n* 商业计划\n** 市场\n*** 线上活动\n*** 线下活动\n** 研发\n*** 模型\n@endwbs",
             ),
             (
@@ -5402,6 +5655,108 @@ mod tests {
     #[test]
     fn an_empty_activity_shows_the_placeholder_card() {
         let r = run(&Diagram::Activity(Activity::default()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
+    }    // -- block-beta / radar-beta -------------------------------------------
+
+    #[test]
+    fn block_lays_cells_out_in_a_grid() {
+        let block = BlockDiagram {
+            title: Some("网格".to_owned()),
+            columns: 2,
+            cells: vec![
+                BlockCell::Item {
+                    label: "甲".to_owned(),
+                },
+                BlockCell::Item {
+                    label: "乙".to_owned(),
+                },
+                BlockCell::Item {
+                    label: "丙".to_owned(),
+                },
+            ],
+            edges: vec![(0, 2)],
+            warnings: Vec::new(),
+        };
+        let r = run(&Diagram::Block(block));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["网格", "甲", "乙", "丙"] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        // Wrapped after two columns: 丙 sits below 甲.
+        let pos_of = |needle: &str| -> [f32; 2] {
+            r.prims
+                .iter()
+                .find_map(|p| match p {
+                    Prim::Text { text, pos, .. } if text == needle => Some(*pos),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("缺少 {needle}"))
+        };
+        assert!(pos_of("丙")[1] > pos_of("甲")[1]);
+        assert!((pos_of("丙")[0] - pos_of("甲")[0]).abs() < 1.0);
+    }
+
+    #[test]
+    fn radar_draws_axes_rings_and_curves() {
+        let radar = Radar {
+            title: Some("技能".to_owned()),
+            axes: vec!["编码".to_owned(), "设计".to_owned(), "测试".to_owned()],
+            curves: vec![
+                ("我".to_owned(), vec![3.0, 4.0, 2.0]),
+                ("对手".to_owned(), vec![2.0, 2.0, 5.0]),
+            ],
+            max: 5.0,
+            warnings: Vec::new(),
+        };
+        let r = run(&Diagram::Radar(radar));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["技能", "编码", "设计", "测试", "我", "对手"] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        // 4 rings + 2 curves are closed paths.
+        let closed = r
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Path { closed: true, .. }))
+            .count();
+        assert_eq!(closed, 6, "4 个环 + 2 条曲线");
+    }
+
+    #[test]
+    fn radar_needs_three_axes() {
+        let radar = Radar {
+            title: None,
+            axes: vec!["a".to_owned(), "b".to_owned()],
+            curves: vec![("x".to_owned(), vec![1.0, 2.0])],
+            max: 5.0,
+            warnings: Vec::new(),
+        };
+        let r = run(&Diagram::Radar(radar));
         assert_clean(&r);
         let texts: Vec<&str> = r
             .prims

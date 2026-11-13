@@ -70,6 +70,8 @@ pub fn parse(src: &str) -> Diagram {
         | Some(DiagramKind::Sankey)
         | Some(DiagramKind::GitGraph)
         | Some(DiagramKind::Wbs)
+        | Some(DiagramKind::Block)
+        | Some(DiagramKind::Radar)
         | None => Diagram::Graph(parse_fallback(&lines, &pre)),
     };
     match &mut diagram {
@@ -84,7 +86,9 @@ pub fn parse(src: &str) -> Diagram {
         | Diagram::Packet(_)
         | Diagram::Sankey(_)
         | Diagram::GitGraph(_)
-        | Diagram::Activity(_) => {}
+        | Diagram::Activity(_)
+        | Diagram::Block(_)
+        | Diagram::Radar(_) => {}
     }
     diagram
 }

@@ -24,9 +24,9 @@ use std::collections::BTreeSet;
 use crate::diagram::model::{
     Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Gantt, Graph, GroupKind, LineStyle,
     Journey, JourneyStep, Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Period, Pie,
-    CommitKind, GitCommit, GitGraph, Packet, PacketField, Quadrant, QuadrantPoint, Sankey,
-    SankeyLink, SeqStep, Sequence, Slice, Task, Timeline, XYChart, XYSeries, XYSeriesKind,
-    civil_from_days, days_from_civil, parse_color,
+    BlockCell, BlockDiagram, CommitKind, GitCommit, GitGraph, Packet, PacketField, Quadrant,
+    QuadrantPoint, Radar, Sankey, SankeyLink, SeqStep, Sequence, Slice, Task, Timeline, XYChart,
+    XYSeries, XYSeriesKind, civil_from_days, days_from_civil, parse_color,
 };
 use crate::gfx::Rgba;
 
@@ -78,6 +78,8 @@ pub fn parse(src: &str) -> Diagram {
         Header::Packet => Diagram::Packet(packet_parse(&lines[1..], title)),
         Header::Sankey => Diagram::Sankey(sankey_parse(&lines[1..], title)),
         Header::GitGraph => Diagram::GitGraph(gitgraph_parse(&lines[1..], title)),
+        Header::Block => Diagram::Block(block_parse(&lines[1..], title)),
+        Header::Radar => Diagram::Radar(radar_parse(&lines[1..], title)),
         Header::Unknown(name) => {
             let mut graph = if looks_like_edge(first) {
                 flowchart_graph(&lines, Direction::TopDown, None, title)
@@ -433,6 +435,8 @@ enum Header {
     Packet,
     Sankey,
     GitGraph,
+    Block,
+    Radar,
     Unknown(String),
 }
 
@@ -468,6 +472,8 @@ fn detect_header(first: &str) -> Header {
         "packet" | "packet-beta" => Header::Packet,
         "sankey-beta" | "sankey" => Header::Sankey,
         "gitgraph" => Header::GitGraph,
+        "block-beta" | "block" => Header::Block,
+        "radar-beta" | "radar" => Header::Radar,
         "xychart-beta" | "xychart" | "xychart-beta-vertical" => Header::XYChart(
             rest.split_whitespace().any(|w| w.eq_ignore_ascii_case("horizontal")),
         ),
@@ -3670,6 +3676,218 @@ fn gitgraph_parse(lines: &[String], title: Option<String>) -> GitGraph {
     graph
 }
 
+// ---------------------------------------------------------------------------
+// block-beta
+// ---------------------------------------------------------------------------
+
+/// `id`, `id["label"]`, `id("label")`, `space`, `space:2`, or an arrow token.
+enum BlockToken {
+    Cell(String),
+    Space(usize),
+    Arrow,
+}
+
+fn block_token(text: &str) -> BlockToken {
+    if let Some(rest) = text.strip_prefix("space") {
+        let span = rest
+            .strip_prefix(':')
+            .and_then(|n| n.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        return BlockToken::Space(span);
+    }
+    if text.contains("--") || text.contains("==") || text.starts_with('<') {
+        return BlockToken::Arrow;
+    }
+    // Strip any shape suffix to keep the label.
+    let label = match text.find('[') {
+        Some(open) => text[open..]
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned(),
+        None => match text.find('(') {
+            Some(open) => text[open..]
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .to_owned(),
+            None => text.to_owned(),
+        },
+    };
+    BlockToken::Cell(label.trim().trim_matches('"').to_owned())
+}
+
+/// `block-beta` — a grid of labelled cells with optional arrows.
+fn block_parse(lines: &[String], title: Option<String>) -> BlockDiagram {
+    let mut block = BlockDiagram {
+        title,
+        ..BlockDiagram::default()
+    };
+
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("columns") {
+            let _ = rest;
+            if let Some(n) = t.split_whitespace().nth(1).and_then(|v| v.parse::<u32>().ok()) {
+                block.columns = (n as usize).clamp(1, 12);
+            }
+            continue;
+        }
+        if lower.starts_with("classdef")
+            || lower.starts_with("class ")
+            || lower.starts_with("style ")
+            || lower.starts_with("style_")
+        {
+            block
+                .warnings
+                .push(format!("block 样式指令已忽略: {}", truncate(t, 30)));
+            continue;
+        }
+        if lower.starts_with("block:") || lower == "end" || lower.starts_with("block ") {
+            // Nested blocks are flattened: their label becomes a cell.
+            if lower.starts_with("block:") {
+                let label = block_token(t.trim_start_matches("block:"));
+                if let BlockToken::Cell(text) = label {
+                    block.cells.push(BlockCell::Item { label: text });
+                }
+            }
+            continue;
+        }
+
+        let mut last: Option<usize> = None;
+        let mut pending_arrow = false;
+        for token in t.split_whitespace() {
+            match block_token(token) {
+                BlockToken::Arrow => pending_arrow = true,
+                BlockToken::Space(span) => {
+                    block.cells.push(BlockCell::Space { span });
+                    last = None;
+                    pending_arrow = false;
+                }
+                BlockToken::Cell(label) => {
+                    block.cells.push(BlockCell::Item {
+                        label: if label.is_empty() {
+                            token.to_owned()
+                        } else {
+                            label
+                        },
+                    });
+                    let index = block.cells.len() - 1;
+                    if pending_arrow && let Some(from) = last {
+                        block.edges.push((from, index));
+                    }
+                    pending_arrow = false;
+                    last = Some(index);
+                }
+            }
+        }
+    }
+
+    if block.cells.is_empty() {
+        block.warnings.push("block 没有格子".to_owned());
+    }
+    block
+}
+
+// ---------------------------------------------------------------------------
+// radar-beta
+// ---------------------------------------------------------------------------
+
+/// `axis a["编码"], b["设计"]` — collect the quoted or bare labels.
+fn radar_axes(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(|part| {
+            let part = part.trim();
+            match (part.find('['), part.rfind(']')) {
+                (Some(open), Some(close)) if close > open => {
+                    strip_quotes(part[open + 1..close].trim())
+                }
+                _ => strip_quotes(part),
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// `curve id["名称"]{3, 4, 2}` → (名称, values).
+fn radar_curve(text: &str) -> Option<(String, Vec<f32>)> {
+    let open = text.find('{')?;
+    let close = text.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+    let values: Vec<f32> = text[open + 1..close]
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    let head = text[..open].trim();
+    let name = match (head.find('['), head.rfind(']')) {
+        (Some(a), Some(b)) if b > a => strip_quotes(head[a + 1..b].trim()),
+        _ => strip_quotes(head),
+    };
+    Some((name, values))
+}
+
+/// `radar-beta` — axes around a centre, one polygon per curve.
+fn radar_parse(lines: &[String], title: Option<String>) -> Radar {
+    let mut radar = Radar {
+        title,
+        max: 5.0,
+        ..Radar::default()
+    };
+
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("axis") {
+            let _ = rest;
+            let body = t.split_once(char::is_whitespace).map(|(_, r)| r).unwrap_or("");
+            radar.axes.extend(radar_axes(body));
+            continue;
+        }
+        if lower.starts_with("curve") {
+            let body = t.split_once(char::is_whitespace).map(|(_, r)| r).unwrap_or("");
+            match radar_curve(body) {
+                Some(curve) => radar.curves.push(curve),
+                None => radar
+                    .warnings
+                    .push(format!("无法解析的 radar 曲线: {}", truncate(t, 30))),
+            }
+            continue;
+        }
+        if lower.starts_with("max") {
+            if let Some(v) = t.split_whitespace().nth(1).and_then(|v| v.parse().ok()) {
+                radar.max = v;
+            }
+            continue;
+        }
+        if lower.starts_with("min") || lower.starts_with("ticks") || lower.starts_with("showlegend")
+        {
+            continue;
+        }
+        radar
+            .warnings
+            .push(format!("无法识别的 radar 语句: {}", truncate(t, 30)));
+    }
+
+    if radar.axes.is_empty() {
+        radar.warnings.push("radar 没有轴".to_owned());
+    }
+    if radar.max <= 0.0 {
+        radar.max = 5.0;
+    }
+    radar
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4716,5 +4934,71 @@ mod tests {
         };
         assert!(g.commits.is_empty());
         assert!(g.warnings.iter().any(|w| w.contains("没有提交")));
+    }    // -- block-beta / radar-beta -------------------------------------------
+
+    #[test]
+    fn block_parses_columns_cells_spaces_and_arrows() {
+        let d = parse(
+            "block-beta\n\
+             \x20 columns 3\n\
+             \x20 a[\"甲\"] b[\"乙\"] c[\"丙\"]\n\
+             \x20 d space space\n\
+             \x20 e --> f",
+        );
+        let Diagram::Block(b) = d else {
+            panic!("expected a block diagram")
+        };
+        assert_eq!(b.columns, 3);
+        // 5 items + 2 spaces
+        assert_eq!(b.cells.len(), 8);
+        match &b.cells[0] {
+            BlockCell::Item { label } => assert_eq!(label, "甲"),
+            other => panic!("expected an item, got {other:?}"),
+        }
+        assert!(matches!(b.cells[4], BlockCell::Space { span: 1 }));
+        // `e --> f` is an edge between the last two items.
+        assert_eq!(b.edges.len(), 1);
+        assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+    }
+
+    #[test]
+    fn block_span_uses_the_requested_width() {
+        let d = parse("block-beta\n columns 4\n a space:3 b");
+        let Diagram::Block(b) = d else {
+            panic!("expected a block diagram")
+        };
+        assert!(matches!(b.cells[1], BlockCell::Space { span: 3 }));
+        assert_eq!(b.cells.len(), 3);
+    }
+
+    #[test]
+    fn radar_parses_axes_curves_and_max() {
+        let d = parse(
+            "radar-beta\n\
+             \x20 title 技能\n\
+             \x20 axis a[\"编码\"], b[\"设计\"], c[\"测试\"]\n\
+             \x20 curve me[\"我\"]{3, 4, 2}\n\
+             \x20 curve you{5, 2, 4}\n\
+             \x20 max 5",
+        );
+        let Diagram::Radar(r) = d else {
+            panic!("expected a radar chart")
+        };
+        assert_eq!(r.title.as_deref(), Some("技能"));
+        assert_eq!(r.axes, vec!["编码", "设计", "测试"]);
+        assert_eq!(r.curves.len(), 2);
+        assert_eq!(r.curves[0].0, "我");
+        assert_eq!(r.curves[0].1, vec![3.0, 4.0, 2.0]);
+        assert_eq!(r.max, 5.0);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn radar_warns_when_it_has_no_axes() {
+        let d = parse("radar-beta\n curve a{1,2,3}");
+        let Diagram::Radar(r) = d else {
+            panic!("expected a radar chart")
+        };
+        assert!(r.warnings.iter().any(|w| w.contains("没有轴")));
     }
 }

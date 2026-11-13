@@ -34,6 +34,8 @@ pub enum DiagramKind {
     GitGraph,
     Activity,
     Wbs,
+    Block,
+    Radar,
 }
 
 impl DiagramKind {
@@ -58,6 +60,8 @@ impl DiagramKind {
             Self::GitGraph => "gitGraph",
             Self::Activity => "activity",
             Self::Wbs => "wbs",
+            Self::Block => "block",
+            Self::Radar => "radar",
         }
     }
 }
@@ -909,6 +913,57 @@ impl Activity {
 }
 
 // ---------------------------------------------------------------------------
+// Block diagrams (`block-beta`)
+// ---------------------------------------------------------------------------
+
+/// One cell of a block grid.
+#[derive(Clone, Debug)]
+pub enum BlockCell {
+    Item { label: String },
+    /// `space` / `space:2` — empty columns.
+    Space { span: usize },
+}
+
+/// A parsed `block-beta` block.
+#[derive(Clone, Debug)]
+pub struct BlockDiagram {
+    pub title: Option<String>,
+    /// `columns N`, defaulting to 3 like Mermaid.
+    pub columns: usize,
+    pub cells: Vec<BlockCell>,
+    /// Cell indices joined by an arrow.
+    pub edges: Vec<(usize, usize)>,
+    pub warnings: Vec<String>,
+}
+
+impl Default for BlockDiagram {
+    fn default() -> Self {
+        Self {
+            title: None,
+            columns: 3,
+            cells: Vec::new(),
+            edges: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Radar charts (`radar-beta`)
+// ---------------------------------------------------------------------------
+
+/// A parsed `radar-beta` block.
+#[derive(Clone, Debug, Default)]
+pub struct Radar {
+    pub title: Option<String>,
+    pub axes: Vec<String>,
+    /// One series: a name and one value per axis.
+    pub curves: Vec<(String, Vec<f32>)>,
+    pub max: f32,
+    pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -926,6 +981,8 @@ pub enum Diagram {
     Sankey(Sankey),
     GitGraph(GitGraph),
     Activity(Activity),
+    Block(BlockDiagram),
+    Radar(Radar),
 }
 
 impl Diagram {
@@ -945,6 +1002,8 @@ impl Diagram {
             Self::Sankey(_) => DiagramKind::Sankey,
             Self::GitGraph(_) => DiagramKind::GitGraph,
             Self::Activity(_) => DiagramKind::Activity,
+            Self::Block(_) => DiagramKind::Block,
+            Self::Radar(_) => DiagramKind::Radar,
         }
     }
 
@@ -962,6 +1021,8 @@ impl Diagram {
             Self::Sankey(k) => k.title.as_deref(),
             Self::GitGraph(g) => g.title.as_deref(),
             Self::Activity(a) => a.title.as_deref(),
+            Self::Block(b) => b.title.as_deref(),
+            Self::Radar(r) => r.title.as_deref(),
         }
     }
 
@@ -980,6 +1041,8 @@ impl Diagram {
             Self::Sankey(k) => &k.warnings,
             Self::GitGraph(g) => &g.warnings,
             Self::Activity(a) => &a.warnings,
+            Self::Block(b) => &b.warnings,
+            Self::Radar(r) => &r.warnings,
         }
     }
 
@@ -997,6 +1060,8 @@ impl Diagram {
             Self::Sankey(k) => k.links.is_empty(),
             Self::GitGraph(g) => g.commits.is_empty(),
             Self::Activity(a) => a.is_blank(),
+            Self::Block(b) => b.cells.is_empty(),
+            Self::Radar(r) => r.curves.is_empty(),
         }
     }
 
@@ -1048,6 +1113,8 @@ impl Diagram {
                 g.branches.len()
             ),
             Self::Activity(a) => format!("activity · {} 个顶层节点", a.nodes.len()),
+            Self::Block(b) => format!("block · {} 个格子", b.cells.len()),
+            Self::Radar(r) => format!("radar · {} 条曲线 · {} 个轴", r.curves.len(), r.axes.len()),
         }
     }
 }
