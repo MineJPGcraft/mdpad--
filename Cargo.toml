@@ -3,7 +3,7 @@ name = "mdpad--"
 version = "0.1.0"
 edition = "2024"
 description = "MarkdownPad - a pure-Rust offline WYSIWYG Markdown / MDX / Markdoc editor"
-authors = ["Zachary_QwQ <1400619125@qq.com>"]
+authors = ["MCJPG"]
 readme = "README.md"
 
 [dependencies]
