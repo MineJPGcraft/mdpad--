@@ -29,6 +29,8 @@ pub enum DiagramKind {
     Journey,
     Quadrant,
     XYChart,
+    Packet,
+    Sankey,
 }
 
 impl DiagramKind {
@@ -48,6 +50,8 @@ impl DiagramKind {
             Self::Journey => "journey",
             Self::Quadrant => "quadrant",
             Self::XYChart => "xychart",
+            Self::Packet => "packet",
+            Self::Sankey => "sankey",
         }
     }
 }
@@ -722,6 +726,71 @@ pub struct XYChart {
 }
 
 // ---------------------------------------------------------------------------
+// Packet diagrams (`packet-beta`)
+// ---------------------------------------------------------------------------
+
+/// One labelled bit range.
+#[derive(Clone, Debug)]
+pub struct PacketField {
+    /// First bit, inclusive.
+    pub start: u32,
+    /// Last bit, inclusive.
+    pub end: u32,
+    pub label: String,
+}
+
+/// A parsed `packet-beta` block.
+#[derive(Clone, Debug, Default)]
+pub struct Packet {
+    pub title: Option<String>,
+    pub fields: Vec<PacketField>,
+    pub warnings: Vec<String>,
+}
+
+impl Packet {
+    /// Highest bit used by any field, at least 31 so a single header still reads
+    /// as one 32-bit word.
+    pub fn max_bit(&self) -> u32 {
+        self.fields.iter().map(|f| f.end).max().unwrap_or(31).max(31)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sankey diagrams (`sankey-beta`)
+// ---------------------------------------------------------------------------
+
+/// One `source,target,value` flow.
+#[derive(Clone, Debug)]
+pub struct SankeyLink {
+    pub source: String,
+    pub target: String,
+    pub value: f32,
+}
+
+/// A parsed `sankey-beta` block.
+#[derive(Clone, Debug, Default)]
+pub struct Sankey {
+    pub title: Option<String>,
+    pub links: Vec<SankeyLink>,
+    pub warnings: Vec<String>,
+}
+
+impl Sankey {
+    /// Node names in first-seen order.
+    pub fn nodes(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for link in &self.links {
+            for name in [&link.source, &link.target] {
+                if !out.iter().any(|n| n == name) {
+                    out.push(name.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Root
 // ---------------------------------------------------------------------------
 
@@ -735,6 +804,8 @@ pub enum Diagram {
     Journey(Journey),
     Quadrant(Quadrant),
     XYChart(XYChart),
+    Packet(Packet),
+    Sankey(Sankey),
 }
 
 impl Diagram {
@@ -750,6 +821,8 @@ impl Diagram {
             Self::Journey(_) => DiagramKind::Journey,
             Self::Quadrant(_) => DiagramKind::Quadrant,
             Self::XYChart(_) => DiagramKind::XYChart,
+            Self::Packet(_) => DiagramKind::Packet,
+            Self::Sankey(_) => DiagramKind::Sankey,
         }
     }
 
@@ -763,6 +836,8 @@ impl Diagram {
             Self::Journey(j) => j.title.as_deref(),
             Self::Quadrant(q) => q.title.as_deref(),
             Self::XYChart(c) => c.title.as_deref(),
+            Self::Packet(p) => p.title.as_deref(),
+            Self::Sankey(k) => k.title.as_deref(),
         }
     }
 
@@ -777,6 +852,8 @@ impl Diagram {
             Self::Journey(j) => &j.warnings,
             Self::Quadrant(q) => &q.warnings,
             Self::XYChart(c) => &c.warnings,
+            Self::Packet(p) => &p.warnings,
+            Self::Sankey(k) => &k.warnings,
         }
     }
 
@@ -790,6 +867,8 @@ impl Diagram {
             Self::Journey(j) => j.steps.is_empty(),
             Self::Quadrant(q) => q.points.is_empty(),
             Self::XYChart(c) => c.series.iter().all(|s| s.values.is_empty()),
+            Self::Packet(p) => p.fields.is_empty(),
+            Self::Sankey(k) => k.links.is_empty(),
         }
     }
 
@@ -828,6 +907,12 @@ impl Diagram {
                 "xychart · {} 条序列 · {} 个数据点",
                 c.series.len(),
                 c.series.iter().map(|s| s.values.len()).sum::<usize>()
+            ),
+            Self::Packet(p) => format!("packet · {} 个字段", p.fields.len()),
+            Self::Sankey(k) => format!(
+                "sankey · {} 条流量 · {} 个节点",
+                k.links.len(),
+                k.nodes().len()
             ),
         }
     }

@@ -24,8 +24,8 @@ use std::collections::BTreeSet;
 use crate::diagram::model::{
     Arrow, Cluster, Diagram, DiagramKind, Direction, Edge, Gantt, Graph, GroupKind, LineStyle,
     Journey, JourneyStep, Node, NodeShape, NodeStyle, NotePosition, ParticipantKind, Period, Pie,
-    Quadrant, QuadrantPoint, SeqStep, Sequence, Slice, Task, Timeline, XYChart, XYSeries,
-    XYSeriesKind, civil_from_days, days_from_civil, parse_color,
+    Packet, PacketField, Quadrant, QuadrantPoint, Sankey, SankeyLink, SeqStep, Sequence, Slice,
+    Task, Timeline, XYChart, XYSeries, XYSeriesKind, civil_from_days, days_from_civil, parse_color,
 };
 use crate::gfx::Rgba;
 
@@ -74,6 +74,8 @@ pub fn parse(src: &str) -> Diagram {
         Header::XYChart(horizontal) => {
             Diagram::XYChart(xychart_parse(&lines[1..], title, horizontal))
         }
+        Header::Packet => Diagram::Packet(packet_parse(&lines[1..], title)),
+        Header::Sankey => Diagram::Sankey(sankey_parse(&lines[1..], title)),
         Header::Unknown(name) => {
             let mut graph = if looks_like_edge(first) {
                 flowchart_graph(&lines, Direction::TopDown, None, title)
@@ -426,6 +428,8 @@ enum Header {
     Journey,
     Quadrant,
     XYChart(bool),
+    Packet,
+    Sankey,
     Unknown(String),
 }
 
@@ -458,6 +462,8 @@ fn detect_header(first: &str) -> Header {
         "timeline" => Header::Timeline,
         "journey" => Header::Journey,
         "quadrantchart" => Header::Quadrant,
+        "packet" | "packet-beta" => Header::Packet,
+        "sankey-beta" | "sankey" => Header::Sankey,
         "xychart-beta" | "xychart" | "xychart-beta-vertical" => Header::XYChart(
             rest.split_whitespace().any(|w| w.eq_ignore_ascii_case("horizontal")),
         ),
@@ -3294,6 +3300,166 @@ fn xychart_parse(lines: &[String], title: Option<String>, horizontal: bool) -> X
     chart
 }
 
+// ---------------------------------------------------------------------------
+// packet-beta
+// ---------------------------------------------------------------------------
+
+/// `packet-beta` — fields addressed by bit range or by relative width.
+///
+/// Both Mermaid forms are accepted:
+///
+/// ```text
+/// 0-15: "Source Port"
+/// +16: "Destination Port"
+/// ```
+fn packet_parse(lines: &[String], title: Option<String>) -> Packet {
+    let mut packet = Packet {
+        title,
+        ..Packet::default()
+    };
+    // Running bit cursor for the `+width` form.
+    let mut next_bit: u32 = 0;
+
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = first_word(t).to_ascii_lowercase();
+        if lower == "title" {
+            let title = strip_quotes(after_first_word(t).trim());
+            if !title.is_empty() {
+                packet.title = Some(title);
+            }
+            continue;
+        }
+        let Some((range, label)) = t.split_once(':') else {
+            packet
+                .warnings
+                .push(format!("无法识别的 packet 语句: {}", truncate(t, 40)));
+            continue;
+        };
+        let range = range.trim();
+        let label = strip_quotes(label.trim());
+        if label.is_empty() {
+            packet
+                .warnings
+                .push(format!("packet 字段缺少名称: {}", truncate(t, 40)));
+            continue;
+        }
+        let (start, end) = if let Some(width) = range.strip_prefix('+') {
+            let width: u32 = width.trim().parse().unwrap_or(0);
+            if width == 0 {
+                packet
+                    .warnings
+                    .push(format!("packet 字段宽度无效: {}", truncate(t, 40)));
+                continue;
+            }
+            let start = next_bit;
+            (start, start + width - 1)
+        } else if let Some((a, b)) = range.split_once('-') {
+            let start: u32 = a.trim().parse().unwrap_or(0);
+            let end: u32 = b.trim().parse().unwrap_or(start);
+            (start.min(end), start.max(end))
+        } else {
+            // A bare number means a single bit.
+            match range.parse::<u32>() {
+                Ok(bit) => (bit, bit),
+                Err(_) => {
+                    packet
+                        .warnings
+                        .push(format!("packet 位范围无效: {}", truncate(t, 40)));
+                    continue;
+                }
+            }
+        };
+        next_bit = end + 1;
+        packet.fields.push(PacketField { start, end, label });
+    }
+
+    if packet.fields.is_empty() {
+        packet.warnings.push("packet 没有字段".to_owned());
+    }
+    packet
+}
+
+// ---------------------------------------------------------------------------
+// sankey-beta
+// ---------------------------------------------------------------------------
+
+/// Split one CSV line, honouring double-quoted fields.
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                out.push(field.trim().to_owned());
+                field.clear();
+            }
+            _ => field.push(ch),
+        }
+    }
+    out.push(field.trim().to_owned());
+    out
+}
+
+/// `sankey-beta` — `source,target,value` rows.
+fn sankey_parse(lines: &[String], title: Option<String>) -> Sankey {
+    let mut sankey = Sankey {
+        title,
+        ..Sankey::default()
+    };
+
+    for line in lines {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("%%") {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("title ") {
+            let title = strip_quotes(rest.trim());
+            if !title.is_empty() {
+                sankey.title = Some(title);
+            }
+            continue;
+        }
+        let fields = split_csv_line(t);
+        if fields.len() < 3 {
+            sankey
+                .warnings
+                .push(format!("sankey 行缺少字段: {}", truncate(t, 40)));
+            continue;
+        }
+        let value: f32 = match fields[2].trim().parse::<f32>() {
+            Ok(v) if v.is_finite() && v > 0.0 => v,
+            _ => {
+                sankey
+                    .warnings
+                    .push(format!("sankey 流量无效: {}", truncate(t, 40)));
+                continue;
+            }
+        };
+        if fields[0].is_empty() || fields[1].is_empty() {
+            sankey
+                .warnings
+                .push(format!("sankey 端点为空: {}", truncate(t, 40)));
+            continue;
+        }
+        sankey.links.push(SankeyLink {
+            source: fields[0].clone(),
+            target: fields[1].clone(),
+            value,
+        });
+    }
+
+    if sankey.links.is_empty() {
+        sankey.warnings.push("sankey 没有流量".to_owned());
+    }
+    sankey
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4195,5 +4361,92 @@ mod tests {
             panic!("expected an xychart")
         };
         assert!(c.warnings.iter().any(|w| w.contains("没有数据序列")));
+    }
+    // -- packet-beta --------------------------------------------------------
+
+    #[test]
+    fn packet_parses_ranges_and_relative_widths() {
+        let d = parse(
+            "packet-beta\n\
+             \x20 title TCP 头\n\
+             \x20 0-15: \"源端口\"\n\
+             \x20 +16: \"目的端口\"\n\
+             \x20 1: \"标志位\"",
+        );
+        let Diagram::Packet(p) = d else {
+            panic!("expected a packet")
+        };
+        assert_eq!(p.title.as_deref(), Some("TCP 头"));
+        assert_eq!(p.fields.len(), 3);
+        assert_eq!((p.fields[0].start, p.fields[0].end), (0, 15));
+        assert_eq!(p.fields[0].label, "源端口");
+        // `+16` continues from the previous field's end.
+        assert_eq!((p.fields[1].start, p.fields[1].end), (16, 31));
+        // A bare number is a single bit.
+        assert_eq!((p.fields[2].start, p.fields[2].end), (1, 1));
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn packet_reports_malformed_fields() {
+        let d = parse("packet-beta\n 0-15\n +0: x\n 3-1: ok");
+        let Diagram::Packet(p) = d else {
+            panic!("expected a packet")
+        };
+        // `0-15` has no colon at all.
+        assert!(p.warnings.iter().any(|w| w.contains("无法识别")));
+        // `+0` is a zero-width field.
+        assert!(p.warnings.iter().any(|w| w.contains("宽度无效")));
+        // A reversed range is normalised rather than rejected.
+        assert_eq!((p.fields[0].start, p.fields[0].end), (1, 3));
+    }
+
+    #[test]
+    fn an_empty_packet_warns() {
+        let d = parse("packet-beta\n title 空");
+        let Diagram::Packet(p) = d else {
+            panic!("expected a packet")
+        };
+        assert!(p.warnings.iter().any(|w| w.contains("没有字段")));
+    }
+
+    #[test]
+    fn sankey_parses_csv_rows_and_quoted_names() {
+        let d = parse(
+            "sankey-beta\n\
+             \x20 农业 \"废弃物\",生物转换,124.7\n\
+             \x20 生物转换,液体燃料,8.1\n\
+             \x20 液体燃料,交通,8.1",
+        );
+        let Diagram::Sankey(k) = d else {
+            panic!("expected a sankey")
+        };
+        assert_eq!(k.links.len(), 3);
+        assert_eq!(k.links[0].source, "农业 废弃物");
+        assert_eq!(k.links[0].target, "生物转换");
+        assert!((k.links[0].value - 124.7).abs() < 1e-3);
+        assert_eq!(k.nodes(), vec!["农业 废弃物", "生物转换", "液体燃料", "交通"]);
+        assert!(k.warnings.is_empty(), "{:?}", k.warnings);
+    }
+
+    #[test]
+    fn sankey_rejects_bad_rows() {
+        let d = parse("sankey-beta\n 只有一列\n A,B,不是数字\n ,B,1\n A,B,-3");
+        let Diagram::Sankey(k) = d else {
+            panic!("expected a sankey")
+        };
+        assert!(k.links.is_empty());
+        assert!(k.warnings.iter().any(|w| w.contains("缺少字段")));
+        assert!(k.warnings.iter().any(|w| w.contains("流量无效")));
+        assert!(k.warnings.iter().any(|w| w.contains("端点为")));
+    }
+
+    #[test]
+    fn an_empty_sankey_warns() {
+        let d = parse("sankey-beta\n");
+        let Diagram::Sankey(k) = d else {
+            panic!("expected a sankey")
+        };
+        assert!(k.warnings.iter().any(|w| w.contains("没有流量")));
     }
 }

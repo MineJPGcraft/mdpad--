@@ -28,7 +28,8 @@ use super::{draw, DiagramTheme};
 use crate::diagram::model::{
     series_color, Arrow, Diagram, Direction, Edge, Gantt, Graph, GroupKind, LineStyle, Node,
     NodeShape, NodeStyle, NotePosition, Participant, ParticipantKind, Pie, SeqStep, Sequence,
-    Journey, Quadrant, Task, Timeline, XYChart, XYSeriesKind, days_from_civil, format_day,
+    Journey, Packet, Quadrant, Sankey, Task, Timeline, XYChart, XYSeriesKind, days_from_civil,
+    format_day,
 };
 use crate::gfx::{Anchor, Font, Measure, Prim, Rect, Rgba, Slant, Stroke, Weight};
 
@@ -91,6 +92,8 @@ pub fn layout(
         Diagram::Journey(j) => layout_journey(j, diagram, &ctx),
         Diagram::Quadrant(q) => layout_quadrant(q, diagram, &ctx),
         Diagram::XYChart(c) => layout_xychart(c, diagram, &ctx),
+        Diagram::Packet(p) => layout_packet(p, diagram, &ctx),
+        Diagram::Sankey(k) => layout_sankey(k, diagram, &ctx),
     }
 }
 
@@ -2309,6 +2312,289 @@ fn format_tick(v: f32) -> String {
     }
 }
 
+
+// ===========================================================================
+// Packet diagrams
+// ===========================================================================
+
+/// Bits drawn per row before the diagram wraps.
+const PACKET_ROW_BITS: u32 = 32;
+
+/// `packet-beta` — a bit-field strip, wrapping every 32 bits.
+fn layout_packet(packet: &Packet, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    if packet.fields.is_empty() {
+        push_warning(&mut warnings, "packet 没有字段".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let bit_font = ctx.small();
+    let label_font = ctx.small();
+    let total_bits = packet.max_bit() + 1;
+    let rows = total_bits.div_ceil(PACKET_ROW_BITS).max(1);
+    let row_width = (ctx.base * 22.0).clamp(240.0, 620.0);
+    let bit_w = row_width / PACKET_ROW_BITS as f32;
+    let bit_h = ctx.lh(bit_font);
+    let label_h = ctx.lh(label_font);
+    let row_h = bit_h + label_h + 10.0;
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut y = 0.0f32;
+    if let Some(title) = packet.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        prims.push(Prim::anchored_text(
+            [0.0, y],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::LeftTop,
+        ));
+        y += lh + 8.0;
+    }
+
+    // Bit ruler above the strip.
+    for row in 0..rows {
+        let row_top = y + row as f32 * row_h;
+        let first_bit = row * PACKET_ROW_BITS;
+        // Ruler: marks every 8 bits so 32-bit words stay readable.
+        for b in (0..PACKET_ROW_BITS).step_by(8) {
+            let x = b as f32 * bit_w;
+            let bit_index = first_bit + b;
+            if bit_index > packet.max_bit() {
+                break;
+            }
+            prims.push(Prim::anchored_text(
+                [x, row_top],
+                bit_index.to_string(),
+                bit_font,
+                ctx.theme.node_text.fade(0.6),
+                Anchor::LeftTop,
+            ));
+        }
+        // Field cells clipped to this row.
+        for (i, field) in packet.fields.iter().enumerate() {
+            let from = field.start.max(first_bit);
+            let to = field.end.min(first_bit + PACKET_ROW_BITS - 1);
+            if from > to {
+                continue;
+            }
+            let x0 = (from - first_bit) as f32 * bit_w;
+            let x1 = (to - first_bit + 1) as f32 * bit_w;
+            let rect = Rect::from_min_size(
+                [x0, row_top + bit_h + 2.0],
+                [(x1 - x0).max(2.0), label_h + 6.0],
+            );
+            let accent = series_color(i);
+            prims.push(Prim::filled_rect(
+                rect,
+                3.0,
+                ctx.theme.node_fill.lerp(accent, 0.16),
+            ));
+            prims.push(Prim::stroked_rect(
+                rect,
+                3.0,
+                draw::stroke(1.0, accent.lerp(ctx.theme.node_stroke, 0.45)),
+            ));
+            // Label, clipped to the cell so long names never spill over.
+            let text = fit_text(ctx, &field.label, label_font, rect.width() - 6.0);
+            prims.push(Prim::anchored_text(
+                [rect.center()[0], rect.center()[1]],
+                text,
+                label_font,
+                ctx.theme.node_text,
+                Anchor::Center,
+            ));
+        }
+        // Row baseline.
+        prims.push(Prim::line(
+            [0.0, row_top + row_h - 4.0],
+            [row_width, row_top + row_h - 4.0],
+            draw::stroke(1.0, ctx.theme.node_stroke.fade(0.35)),
+        ));
+    }
+
+    finish(prims, ctx, None, warnings, summary)
+}
+
+/// Shorten `text` with an ellipsis until it measures inside `max_w`.
+fn fit_text(ctx: &Ctx, text: &str, font: Font, max_w: f32) -> String {
+    if max_w <= 0.0 || ctx.w(text, font) <= max_w {
+        return text.to_owned();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    while !chars.is_empty() {
+        chars.pop();
+        let candidate: String = chars.iter().collect::<String>() + "…";
+        if ctx.w(&candidate, font) <= max_w {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
+
+// ===========================================================================
+// Sankey diagrams
+// ===========================================================================
+
+/// `sankey-beta` — nodes as bars, flows as ribbons whose thickness is the value.
+fn layout_sankey(sankey: &Sankey, diagram: &Diagram, ctx: &Ctx) -> DiagramRender {
+    let summary = diagram.summary();
+    let mut warnings: Vec<String> = Vec::new();
+    if sankey.links.is_empty() {
+        push_warning(&mut warnings, "sankey 没有流量".to_owned());
+        return empty_render(ctx, summary, warnings);
+    }
+
+    let nodes = sankey.nodes();
+    let index = |name: &str| nodes.iter().position(|n| n == name);
+    let label_font = ctx.small();
+    let node_w = (ctx.base * 0.7).clamp(8.0, 16.0);
+    let layer_gap = (ctx.base * 6.0).clamp(80.0, 160.0);
+    let gap = 10.0;
+
+    // Depth: longest path from a source. The relaxation is bounded by the node
+    // count so a cycle cannot loop forever.
+    let mut depth: Vec<usize> = vec![0; nodes.len()];
+    for _ in 0..nodes.len() {
+        let mut changed = false;
+        for link in &sankey.links {
+            let (Some(a), Some(b)) = (index(&link.source), index(&link.target)) else {
+                continue;
+            };
+            if depth[b] < depth[a] + 1 && depth[a] + 1 < nodes.len() {
+                depth[b] = depth[a] + 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Flow through each node: the larger of what comes in and what goes out.
+    let mut inflow: Vec<f32> = vec![0.0; nodes.len()];
+    let mut outflow: Vec<f32> = vec![0.0; nodes.len()];
+    for link in &sankey.links {
+        if let Some(a) = index(&link.source) {
+            outflow[a] += link.value;
+        }
+        if let Some(b) = index(&link.target) {
+            inflow[b] += link.value;
+        }
+    }
+    let magnitude: Vec<f32> = (0..nodes.len())
+        .map(|i| inflow[i].max(outflow[i]).max(0.01))
+        .collect();
+
+    let layers = depth.iter().copied().max().unwrap_or(0) + 1;
+    let tallest: f32 = (0..layers)
+        .map(|layer| {
+            let heights: f32 = (0..nodes.len())
+                .filter(|i| depth[*i] == layer)
+                .map(|i| magnitude[i])
+                .sum();
+            let count = (0..nodes.len()).filter(|i| depth[*i] == layer).count();
+            heights + gap * count as f32
+        })
+        .fold(0.0f32, f32::max);
+    let budget = (ctx.base * 22.0).clamp(200.0, 560.0);
+    let scale = (budget / tallest.max(0.01)).clamp(0.5, 60.0);
+
+    // Labels live in a gutter to the left of their own column.
+    let mut label_w: f32 = 0.0;
+    for name in &nodes {
+        label_w = label_w.max(ctx.w(name, label_font));
+    }
+    let label_w = label_w.min(ctx.base * 10.0) + 10.0;
+
+    let mut node_x: Vec<f32> = vec![0.0; nodes.len()];
+    let mut node_y: Vec<f32> = vec![0.0; nodes.len()];
+    let mut node_h: Vec<f32> = vec![0.0; nodes.len()];
+    for layer in 0..layers {
+        let mut y = 0.0f32;
+        for i in 0..nodes.len() {
+            if depth[i] != layer {
+                continue;
+            }
+            let h = (magnitude[i] * scale).max(6.0);
+            node_x[i] = label_w + layer as f32 * (layer_gap + label_w);
+            node_y[i] = y;
+            node_h[i] = h;
+            y += h + gap;
+        }
+    }
+
+    let mut prims: Vec<Prim> = Vec::new();
+    let mut top = 0.0f32;
+    if let Some(title) = sankey.title.as_deref() {
+        let font = ctx.title();
+        let lh = ctx.lh(font);
+        prims.push(Prim::anchored_text(
+            [0.0, 0.0],
+            title.to_owned(),
+            font,
+            ctx.theme.node_text,
+            Anchor::LeftTop,
+        ));
+        top = lh + 12.0;
+    }
+
+    // Ribbons: each node hands slices out from its top and collects them top-down.
+    let mut out_cursor: Vec<f32> = node_y.iter().map(|y| *y + top).collect();
+    let mut in_cursor: Vec<f32> = node_y.iter().map(|y| *y + top).collect();
+    for (i, link) in sankey.links.iter().enumerate() {
+        let (Some(a), Some(b)) = (index(&link.source), index(&link.target)) else {
+            continue;
+        };
+        let thickness = (link.value * scale).max(1.0);
+        let mut x0 = node_x[a] + node_w;
+        let mut x1 = node_x[b];
+        // A cycle can put the target left of the source; draw it either way.
+        if x1 < x0 {
+            x0 = node_x[b] + node_w;
+            x1 = node_x[a];
+        }
+        let y0 = out_cursor[a];
+        let y1 = in_cursor[b];
+        let color = series_color(i);
+        prims.push(Prim::path(
+            vec![
+                [x0, y0],
+                [x1, y1],
+                [x1, y1 + thickness],
+                [x0, y0 + thickness],
+            ],
+            true,
+            Some(color.with_alpha(115)),
+            Some(draw::stroke(0.8, color.with_alpha(200))),
+        ));
+        out_cursor[a] += thickness;
+        in_cursor[b] += thickness;
+    }
+
+    // Node bars, then their labels in the left gutter of each column.
+    for (i, name) in nodes.iter().enumerate() {
+        let rect = Rect::from_min_size(
+            [node_x[i], node_y[i] + top],
+            [node_w, node_h[i]],
+        );
+        prims.push(Prim::filled_rect(
+            rect,
+            2.0,
+            ctx.theme.node_stroke.fade(0.85),
+        ));
+        // A pill behind the label: sankey ribbons run under the labels of
+        // intermediate columns and plain text becomes unreadable there.
+        let center = [node_x[i] - 6.0 - ctx.w(name, label_font) * 0.5, rect.center()[1]];
+        prims.extend(label_pill(name, center, ctx));
+    }
+
+    finish(prims, ctx, None, warnings, summary)
+}
+
 // ===========================================================================
 // Sequence diagrams
 // ===========================================================================
@@ -3640,7 +3926,7 @@ mod tests {
             }
         }
 
-        let cases: [(&str, &str); 8] = [
+        let cases: [(&str, &str); 10] = [
             (
                 "gantt",
                 "gantt\n section Design\n 需求分析 :done, a1, 2024-01-01, 5d\n 方案设计 :a2, after a1, 3d\n section Build\n 编码 :active, b1, after a2, 10d\n 里程碑 :milestone, m1, 2024-01-30, 0d",
@@ -3658,7 +3944,15 @@ mod tests {
                 "kanban\n  todo[待办]\n    t1[写解析器]\n    t2[补测试]\n  doing[进行中]\n    d1[修布局]",
             ),
             (
-                "xychart",
+                "sankey",
+                "sankey-beta\n 输入,处理,60\n 输入,丢弃,20\n 处理,输出,45\n 处理,再加工,15\n 再加工,输出,15",
+            ),
+            (
+            "packet",
+                "packet-beta\n title TCP 头\n 0-15: \"源端口\"\n 16-31: \"目的端口\"\n 32-63: \"序列号\"\n 64-95: \"确认号\"\n 96-99: \"数据偏移\"",
+            ),
+            (
+            "xychart",
                 "xychart-beta\n title \"销售\"\n x-axis [一月, 二月, 三月, 四月]\n y-axis \"金额\" 0 --> 100\n bar [20, 50, 80, 60]\n line \"趋势\" [25, 45, 90, 70]",
             ),
             (
@@ -4191,5 +4485,196 @@ mod tests {
         assert!(step >= 1.0, "{step}");
         let (step, lo, hi) = axis_ticks(0.0, 1.0, 5);
         assert!(step > 0.0 && lo <= 0.0 && hi >= 1.0);
+    }
+    // -- packet-beta --------------------------------------------------------
+
+    fn packet_fixture() -> Packet {
+        Packet {
+            title: Some("TCP 头".to_owned()),
+            fields: vec![
+                crate::diagram::model::PacketField {
+                    start: 0,
+                    end: 15,
+                    label: "源端口".to_owned(),
+                },
+                crate::diagram::model::PacketField {
+                    start: 16,
+                    end: 31,
+                    label: "目的端口".to_owned(),
+                },
+                crate::diagram::model::PacketField {
+                    start: 32,
+                    end: 63,
+                    label: "序列号".to_owned(),
+                },
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn packet_draws_a_ruler_and_field_cells() {
+        let r = run(&Diagram::Packet(packet_fixture()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["TCP 头", "源端口", "目的端口", "序列号", "0", "16", "24"] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        // 64 bits over two rows: six cells (2 + 2 + 2 halves).
+        let cells = r
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Rect { stroke: Some(_), .. }))
+            .count();
+        assert_eq!(cells, 3, "第一行两个字段，第二行一个 32 位字段");
+    }
+
+    #[test]
+    fn packet_wraps_after_32_bits() {
+        let r = run(&Diagram::Packet(packet_fixture()));
+        // The second row of fields must sit below the first.
+        let y_of = |needle: &str| -> f32 {
+            r.prims
+                .iter()
+                .find_map(|p| match p {
+                    Prim::Text { text, pos, .. } if text == needle => Some(pos[1]),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("缺少 {needle}"))
+        };
+        assert!(y_of("序列号") > y_of("源端口"));
+    }
+
+    #[test]
+    fn long_packet_labels_are_ellipsised() {
+        let packet = Packet {
+            title: None,
+            fields: vec![crate::diagram::model::PacketField {
+                start: 0,
+                end: 1,
+                label: "一个非常非常长的字段名称会溢出单元格".to_owned(),
+            }],
+            warnings: Vec::new(),
+        };
+        let r = run(&Diagram::Packet(packet));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.ends_with('…')),
+            "应被截断: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_packet_shows_the_placeholder_card() {
+        let r = run(&Diagram::Packet(Packet::default()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
+    }
+
+    fn sankey_fixture() -> Sankey {
+        Sankey {
+            title: None,
+            links: vec![
+                crate::diagram::model::SankeyLink {
+                    source: "输入".to_owned(),
+                    target: "处理".to_owned(),
+                    value: 60.0,
+                },
+                crate::diagram::model::SankeyLink {
+                    source: "输入".to_owned(),
+                    target: "丢弃".to_owned(),
+                    value: 20.0,
+                },
+                crate::diagram::model::SankeyLink {
+                    source: "处理".to_owned(),
+                    target: "输出".to_owned(),
+                    value: 60.0,
+                },
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sankey_draws_ribbons_and_node_labels() {
+        let r = run(&Diagram::Sankey(sankey_fixture()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in ["输入", "处理", "丢弃", "输出"] {
+            assert!(texts.contains(&expected), "缺少 {expected}: {texts:?}");
+        }
+        let ribbons = r
+            .prims
+            .iter()
+            .filter(|p| matches!(p, Prim::Path { closed: true, .. }))
+            .count();
+        assert_eq!(ribbons, 3, "每条流量一条带");
+    }
+
+    #[test]
+    fn sankey_ribbon_thickness_follows_the_value() {
+        let r = run(&Diagram::Sankey(sankey_fixture()));
+        let mut heights: Vec<f32> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Path { points, closed: true, .. } if points.len() == 4 => {
+                    Some((points[3][1] - points[0][1]).abs())
+                }
+                _ => None,
+            })
+            .collect();
+        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // 20 / 60 = 1/3 of the thickness of the other two.
+        assert_eq!(heights.len(), 3);
+        assert!(
+            (heights[0] * 3.0 - heights[2]).abs() < 1.5,
+            "带宽应与流量成比例: {heights:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_sankey_shows_the_placeholder_card() {
+        let r = run(&Diagram::Sankey(Sankey::default()));
+        assert_clean(&r);
+        let texts: Vec<&str> = r
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"空图表"), "{texts:?}");
     }
 }

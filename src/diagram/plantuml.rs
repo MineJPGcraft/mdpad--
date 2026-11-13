@@ -53,6 +53,8 @@ pub fn parse(src: &str) -> Diagram {
         | Some(DiagramKind::Journey)
         | Some(DiagramKind::Quadrant)
         | Some(DiagramKind::XYChart)
+        | Some(DiagramKind::Packet)
+        | Some(DiagramKind::Sankey)
         | None => Diagram::Graph(parse_fallback(&lines, &pre)),
     };
     match &mut diagram {
@@ -63,7 +65,9 @@ pub fn parse(src: &str) -> Diagram {
         | Diagram::Timeline(_)
         | Diagram::Journey(_)
         | Diagram::Quadrant(_)
-        | Diagram::XYChart(_) => {}
+        | Diagram::XYChart(_)
+        | Diagram::Packet(_)
+        | Diagram::Sankey(_) => {}
     }
     diagram
 }
